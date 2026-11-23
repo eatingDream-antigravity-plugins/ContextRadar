@@ -16,9 +16,22 @@ on:
         description: "Release tag to build and upload (defaults to v<plugin.json version>)"
         required: false
         type: string
+      platforms:
+        description: "Target platforms to build"
+        required: false
+        default: all
+        type: choice
+        options:
+          - all
+          - macos
+          - linux
 
 permissions:
   contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   prepare-release:
@@ -47,6 +60,10 @@ jobs:
           else
             TAG="v$(node -p "require('./plugin.json').version")"
           fi
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+            echo "error: invalid release tag '$TAG' (expected vX.Y.Z)" >&2
+            exit 1
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
       - name: Create GitHub Release if missing
         env:
@@ -57,72 +74,111 @@ jobs:
             gh release create "$TAG" --title "$TAG" --generate-notes
           fi
 
-  build-and-upload:
-    name: Build (${{ matrix.target }})
+  build-linux:
+    name: Build (x86_64-unknown-linux-gnu)
     needs: prepare-release
-    runs-on: ${{ matrix.os }}
+    if: ${{ inputs.platforms != 'macos' }}
+    runs-on: ubuntu-latest
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.prepare-release.outputs.tag }}
+      TARGET: x86_64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: "20"
       - name: Add Rust target
-        run: rustup target add "${{ matrix.target }}"
+        run: rustup target add "${TARGET}"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
-          key: ${{ matrix.target }}
+          key: linux-x86_64
       - name: Pack and verify MCP App panel
         run: |
           npm --prefix "${RUNNER_TEMP}/esbuild" install --no-save esbuild
           ESBUILD_PATH="${RUNNER_TEMP}/esbuild/node_modules/esbuild" node panel/pack.mjs
           node --test panel/panel.test.mjs
-      - name: Build release binary
-        env:
-          MACOSX_DEPLOYMENT_TARGET: "11.0"
+      - name: Run Rust test suite
+        run: cargo test --locked
+      - name: Build, verify, and upload Linux tarball
         run: |
-          RUSTFLAGS="--remap-path-prefix=$HOME=/build" cargo build --release --locked --target "${{ matrix.target }}"
-      - name: Assemble Antigravity plugin tarball & SHA-256
-        env:
-          TAG: ${{ needs.prepare-release.outputs.tag }}
-          TARGET: ${{ matrix.target }}
-        run: |
+          RUSTFLAGS="--remap-path-prefix=${HOME}=/build" cargo build --release --locked --target "${TARGET}"
+          bin="target/${TARGET}/release/context-radar-mcp"
+          if strings "$bin" | grep -F "${HOME}" >/dev/null 2>&1; then
+            echo "error: runner HOME path leaked into release binary" >&2
+            exit 1
+          fi
           STAGE="${RUNNER_TEMP}/stage-${TARGET}"
           rm -rf "$STAGE"
           mkdir -p "$STAGE/bin" "$STAGE/panel/dist" "$STAGE/rules" "$STAGE/skills/context-radar" "$STAGE/assets"
-
-          install -m 0755 "target/${TARGET}/release/context-radar-mcp" "$STAGE/bin/context-radar-mcp"
+          install -m 0755 "$bin" "$STAGE/bin/context-radar-mcp"
           cp panel/dist/panel.html "$STAGE/panel/dist/panel.html"
           cp plugin.json mcp_config.json hooks.json LICENSE README.md settings.example.json settings.schema.json "$STAGE/"
           cp rules/AGENTS.md "$STAGE/rules/AGENTS.md"
           cp skills/context-radar/SKILL.md "$STAGE/skills/context-radar/SKILL.md"
           cp assets/logo.svg "$STAGE/assets/logo.svg"
-
           ARCHIVE="context-radar-mcp-${TAG}-${TARGET}.tar.gz"
           tar -C "$STAGE" -czf "$ARCHIVE" .
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
-          else
-            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
-          fi
-          ls -lh "$ARCHIVE" "${ARCHIVE}.sha256"
+          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
           cat "${ARCHIVE}.sha256"
-      - name: Upload release assets
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.prepare-release.outputs.tag }}
-          TARGET: ${{ matrix.target }}
-        run: |
-          ARCHIVE="context-radar-mcp-${TAG}-${TARGET}.tar.gz"
           gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
+
+  build-macos:
+    name: Build (macOS arm64 + x86_64)
+    needs: prepare-release
+    if: ${{ inputs.platforms != 'linux' }}
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.prepare-release.outputs.tag }}
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare-release.outputs.tag }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "20"
+      - name: Add macOS Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          key: macos-universal
+      - name: Pack and verify MCP App panel
+        run: |
+          npm --prefix "${RUNNER_TEMP}/esbuild" install --no-save esbuild
+          ESBUILD_PATH="${RUNNER_TEMP}/esbuild/node_modules/esbuild" node panel/pack.mjs
+          node --test panel/panel.test.mjs
+      - name: Run Rust test suite
+        run: cargo test --locked
+      - name: Build, verify, and upload macOS tarballs
+        run: |
+          for TARGET in aarch64-apple-darwin x86_64-apple-darwin; do
+            echo "=== Building ${TARGET} ==="
+            RUSTFLAGS="--remap-path-prefix=${HOME}=/build" cargo build --release --locked --target "${TARGET}"
+            bin="target/${TARGET}/release/context-radar-mcp"
+            if strings "$bin" | grep -F "${HOME}" >/dev/null 2>&1; then
+              echo "error: runner HOME path leaked into release binary (${TARGET})" >&2
+              exit 1
+            fi
+            STAGE="${RUNNER_TEMP}/stage-${TARGET}"
+            rm -rf "$STAGE"
+            mkdir -p "$STAGE/bin" "$STAGE/panel/dist" "$STAGE/rules" "$STAGE/skills/context-radar" "$STAGE/assets"
+            install -m 0755 "$bin" "$STAGE/bin/context-radar-mcp"
+            cp panel/dist/panel.html "$STAGE/panel/dist/panel.html"
+            cp plugin.json mcp_config.json hooks.json LICENSE README.md settings.example.json settings.schema.json "$STAGE/"
+            cp rules/AGENTS.md "$STAGE/rules/AGENTS.md"
+            cp skills/context-radar/SKILL.md "$STAGE/skills/context-radar/SKILL.md"
+            cp assets/logo.svg "$STAGE/assets/logo.svg"
+            ARCHIVE="context-radar-mcp-${TAG}-${TARGET}.tar.gz"
+            COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "$ARCHIVE" .
+            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+            cat "${ARCHIVE}.sha256"
+            gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
+          done
