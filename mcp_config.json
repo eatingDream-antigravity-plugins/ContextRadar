@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "context-radar-mcp": {
+      "command": "/usr/bin/env",
+      "args": [
+        "${PLUGIN_ROOT}/bin/context-radar-mcp",
+        "daemon",
+        "--data-dir",
+        "${PLUGIN_DATA}"
+      ]
+    }
+  }
+}

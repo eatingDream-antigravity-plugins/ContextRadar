@@ -1,0 +1,1419 @@
+//! Session/turn telemetry aggregation, 3-way cold-cache attribution, and multi-level snapshot cache.
+
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
+use serde::Serialize;
+
+use crate::engine::budget::resolve_budget_tier;
+use crate::engine::grants::{PanelPrefs, RelayGrant};
+use crate::engine::rates::RateTable;
+use crate::ledger::index_db::DbVersionSig;
+use crate::ledger::sqlite_ro::{stat_db_stamp, FileStamp, LedgerReader};
+use crate::ledger::{is_safe_id, SummaryRecord, TurnSample};
+use crate::settings::{
+    default_data_root, default_plugin_data_dir, expand_tilde, SettingsWatcher,
+    DEFAULT_CONTEXT_LIMIT, DISABLE_DISK_CACHE_ENV, INDEX_CACHE_PATH_ENV,
+};
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct ColdCacheBreakdown {
+    pub turn_start_cold: usize,
+    pub mid_loop_cold: usize,
+    pub post_compact_cold: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColdCacheKind {
+    None,
+    TurnStart,
+    MidLoop,
+    PostCompact,
+}
+
+impl ColdCacheKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::TurnStart => "turn_start_cold",
+            Self::MidLoop => "mid_loop_cold",
+            Self::PostCompact => "post_compact_cold",
+        }
+    }
+
+    pub fn label_and_reason(self) -> (&'static str, &'static str) {
+        match self {
+            Self::None => ("", ""),
+            Self::TurnStart => (
+                "跨回合冷",
+                "跨回合唤醒首步 cr=0：服务端副本漂移或 >5m TTL 过期",
+            ),
+            Self::MidLoop => (
+                "途中破缓",
+                "同回合工具链中途 cr=0：中途触发子目录规则注入破前缀或副本切换",
+            ),
+            Self::PostCompact => ("压后重建", "CHECKPOINT 压缩后首步必然重建缓存"),
+        }
+    }
+}
+
+#[inline]
+pub fn now_epoch_sec() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+#[inline]
+fn round_dp(v: f64, decimals: i32) -> f64 {
+    let f = 10f64.powi(decimals);
+    (v * f).round() / f
+}
+
+pub fn parse_iso_ts(raw: &str) -> f64 {
+    let text = raw.trim();
+    if text.is_empty() {
+        return 0.0;
+    }
+    if let Ok(dt) = DateTime::parse_from_rfc3339(text) {
+        if dt.year() < 2000 {
+            return 0.0;
+        }
+        return (dt.timestamp() as f64) + (dt.timestamp_subsec_nanos() as f64) * 1e-9;
+    }
+    // Try space-separated / timezone-less timestamps from SQLite datetime columns
+    let normalized = text.replace(' ', "T");
+    if let Ok(dt) = DateTime::parse_from_rfc3339(&format!("{normalized}Z")) {
+        if dt.year() < 2000 {
+            return 0.0;
+        }
+        return (dt.timestamp() as f64) + (dt.timestamp_subsec_nanos() as f64) * 1e-9;
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f"))
+    {
+        if ndt.year() < 2000 {
+            return 0.0;
+        }
+        let dt = ndt.and_utc();
+        return (dt.timestamp() as f64) + (dt.timestamp_subsec_nanos() as f64) * 1e-9;
+    }
+    0.0
+}
+
+pub fn format_utc_iso(ts_sec: f64) -> String {
+    if !ts_sec.is_finite() || ts_sec <= 0.0 {
+        return String::new();
+    }
+    let secs = ts_sec.trunc() as i64;
+    let nanos = ((ts_sec.fract().max(0.0)) * 1_000_000_000.0).min(999_999_999.0) as u32;
+    DateTime::<Utc>::from_timestamp(secs, nanos)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
+}
+
+pub fn is_subagent_active(
+    summary: Option<&SummaryRecord>,
+    last_ts: f64,
+    now_ts: f64,
+    silent_timeout_sec: f64,
+) -> bool {
+    let Some(s) = summary else { return false };
+    if s.killed {
+        return false;
+    }
+    if s.status == "CASCADE_RUN_STATUS_RUNNING" {
+        return true;
+    }
+    if s.not_fully_idle {
+        if last_ts > 0.0 && (now_ts - last_ts) > silent_timeout_sec {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+pub fn classify_cold_cache_turns(
+    turns: &[TurnSample],
+    transcript_step_types: Option<&HashMap<i64, String>>,
+) -> Vec<ColdCacheKind> {
+    let mut sorted_indices: Vec<i64> = transcript_step_types
+        .map(|m| {
+            let mut ks: Vec<i64> = m.keys().copied().collect();
+            ks.sort_unstable();
+            ks
+        })
+        .unwrap_or_default();
+    sorted_indices.dedup();
+
+    let has_t_steps = transcript_step_types.map(|m| !m.is_empty()).unwrap_or(false);
+    let mut results = Vec::with_capacity(turns.len());
+
+    for (i, t) in turns.iter().enumerate() {
+        if !t.is_cold_cache() {
+            results.push(ColdCacheKind::None);
+            continue;
+        }
+
+        let prev_t = if i > 0 { Some(&turns[i - 1]) } else { None };
+        let prev_step = prev_t.map(|p| p.step_idx).unwrap_or(-1);
+
+        let mut saw_ckpt_between = false;
+        let mut saw_user_or_sys_between = false;
+        if let Some(tmap) = transcript_step_types {
+            if !sorted_indices.is_empty() {
+                let lo = sorted_indices.partition_point(|&x| x <= prev_step);
+                let hi = sorted_indices.partition_point(|&x| x <= t.step_idx - 1);
+                for &idx in &sorted_indices[lo..hi] {
+                    if let Some(st) = tmap.get(&idx) {
+                        if st == "CHECKPOINT" {
+                            saw_ckpt_between = true;
+                        } else if st == "USER_INPUT" || st == "SYSTEM_MESSAGE" {
+                            saw_user_or_sys_between = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if t.after_checkpoint
+            || prev_t.map(|p| p.is_checkpoint).unwrap_or(false)
+            || saw_ckpt_between
+        {
+            results.push(ColdCacheKind::PostCompact);
+        } else if prev_t.is_none()
+            || t.after_turn_start == Some(true)
+            || saw_user_or_sys_between
+        {
+            results.push(ColdCacheKind::TurnStart);
+        } else if t.after_turn_start == Some(false) || has_t_steps {
+            results.push(ColdCacheKind::MidLoop);
+        } else {
+            let gap = match prev_t {
+                Some(p) if t.timestamp > 0.0 && p.timestamp > 0.0 => t.timestamp - p.timestamp,
+                _ => 0.0,
+            };
+            if gap >= 300.0 {
+                results.push(ColdCacheKind::TurnStart);
+            } else {
+                results.push(ColdCacheKind::MidLoop);
+            }
+        }
+    }
+    results
+}
+
+fn median_u64(vals: &mut [u64]) -> u64 {
+    if vals.is_empty() {
+        return 0;
+    }
+    vals.sort_unstable();
+    let n = vals.len();
+    if n % 2 == 1 {
+        vals[n / 2]
+    } else {
+        (((vals[n / 2 - 1] as f64) + (vals[n / 2] as f64)) / 2.0).round() as u64
+    }
+}
+
+fn median_f64(vals: &mut [f64]) -> f64 {
+    if vals.is_empty() {
+        return 0.0;
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = vals.len();
+    if n % 2 == 1 {
+        vals[n / 2]
+    } else {
+        (vals[n / 2 - 1] + vals[n / 2]) / 2.0
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionTelemetry {
+    pub id: String,
+    pub conversation_id: String,
+    pub short_id: String,
+    pub title: String,
+    pub agent_name: String,
+    pub parent_id: String,
+    pub is_subagent: bool,
+    pub is_running: bool,
+    pub not_fully_idle: bool,
+    pub is_active: bool,
+    pub run_state: String,
+    pub killed: bool,
+    pub archived: bool,
+    pub pinned: bool,
+    pub status: String,
+    pub workspace: String,
+    pub workspace_name: String,
+    pub model: String,
+    pub model_display: String,
+    pub model_short: String,
+    pub profile_label: String,
+    pub min_compact_tokens: u64,
+    pub recommend_compact_tokens: u64,
+    pub urgent_compact_tokens: u64,
+    pub just_compacted: bool,
+    pub pre_compact_tokens: u64,
+    pub checkpoint_count: usize,
+    pub turns_since_compact: usize,
+    pub recent_cold_rebuild: bool,
+    pub latest_context_tokens: u64,
+    pub peak_context_tokens: u64,
+    pub context_limit: u64,
+    pub context_pct: f64,
+    pub level: String,
+    pub suggest_compact: bool,
+    pub turns: usize,
+    pub cache_hit_rate: f64,
+    pub latest_cache_hit_rate: f64,
+    pub cold_cache_count: usize,
+    pub cold_cache_breakdown: ColdCacheBreakdown,
+    pub turn_start_cold_count: usize,
+    pub mid_loop_cold_count: usize,
+    pub post_compact_cold_count: usize,
+    pub median_ttft_ms: u64,
+    pub median_stream_tps: f64,
+    pub total_input_tokens: u64,
+    pub total_cache_read_tokens: u64,
+    pub total_output_tokens: u64,
+    pub cost_usd: f64,
+    pub cost_cny: f64,
+    pub currency_symbol: String,
+    pub summary_modified_ts: f64,
+    pub sidebar_sort_ts: f64,
+    pub last_active_ts: f64,
+    pub last_active_iso: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub subagents: Vec<SessionTelemetry>,
+    pub running_subagent_count: usize,
+    pub history_subagent_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_last_active_ts: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_cost_cny: Option<f64>,
+}
+
+pub fn build_session_telemetry(
+    cid: &str,
+    summary: Option<&SummaryRecord>,
+    turns: &[TurnSample],
+    eff_mtime: f64,
+    fx_rate: f64,
+    rates: &mut RateTable,
+    now_ts: f64,
+    transcript_step_types: Option<&HashMap<i64, String>>,
+) -> SessionTelemetry {
+    let cfg = rates.current_settings();
+    let (_, currency_sym) = rates.get_currency();
+
+    let latest = turns.last();
+    let mut checkpoint_count = 0usize;
+    let mut last_ckpt_pos: Option<usize> = None;
+    for (i, t) in turns.iter().enumerate() {
+        if t.is_checkpoint {
+            checkpoint_count += 1;
+            last_ckpt_pos = Some(i);
+        }
+    }
+    let turns_since_compact = match last_ckpt_pos {
+        Some(pos) => turns.len().saturating_sub(1).saturating_sub(pos),
+        None => turns.len(),
+    };
+    let just_compacted = latest.map(|t| t.is_checkpoint).unwrap_or(false);
+
+    let (pre_compact_tokens, latest_ctx) = if just_compacted {
+        let lt = latest.unwrap();
+        let est = cfg.context.est_post_compact_base + lt.output_tokens.clamp(2_500, 16_000);
+        (lt.context_tokens(), est)
+    } else {
+        let pre = last_ckpt_pos.map(|p| turns[p].context_tokens()).unwrap_or(0);
+        let cur = latest.map(|t| t.context_tokens()).unwrap_or(0);
+        (pre, cur)
+    };
+
+    let peak_ctx = turns.iter().map(|t| t.context_tokens()).max().unwrap_or(0);
+    let model_id = latest.map(|t| t.model.as_str()).unwrap_or("unknown");
+    let model_disp = latest.map(|t| t.model_display.as_str()).unwrap_or("未知模型");
+    let price = rates.resolve_rate(model_id, model_disp);
+    let ctx_limit = if price.context_limit > 0 {
+        price.context_limit
+    } else if cfg.context.default_limit > 0 {
+        cfg.context.default_limit
+    } else {
+        DEFAULT_CONTEXT_LIMIT
+    };
+    let prof = resolve_budget_tier(model_id, model_disp, &cfg);
+
+    let mut total_in = 0u64;
+    let mut total_cr = 0u64;
+    let mut total_cw = 0u64;
+    let mut total_out = 0u64;
+    let mut ttfts: Vec<u64> = Vec::new();
+    let mut tps_vals: Vec<f64> = Vec::new();
+    let mut total_usd = 0.0f64;
+
+    for t in turns {
+        total_in = total_in.saturating_add(t.input_tokens);
+        total_cr = total_cr.saturating_add(t.cache_read);
+        total_cw = total_cw.saturating_add(t.cache_write);
+        total_out = total_out.saturating_add(t.output_tokens);
+        if !t.is_checkpoint {
+            if t.ttft_ms > 0 {
+                ttfts.push(t.ttft_ms);
+            }
+            let tps = t.stream_tps();
+            if tps > 0.0 {
+                tps_vals.push(tps);
+            }
+        }
+        total_usd += rates.calculate_cost_usd(
+            &t.model,
+            t.input_tokens,
+            t.cache_read,
+            t.cache_write,
+            t.output_tokens,
+            &t.model_display,
+        );
+    }
+    let total_prompt = total_in.saturating_add(total_cr).saturating_add(total_cw);
+    let cache_hit = if total_prompt > 0 {
+        (total_cr as f64) / (total_prompt as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let cold_kinds = classify_cold_cache_turns(turns, transcript_step_types);
+    let mut cold_breakdown = ColdCacheBreakdown::default();
+    for k in &cold_kinds {
+        match k {
+            ColdCacheKind::TurnStart => cold_breakdown.turn_start_cold += 1,
+            ColdCacheKind::MidLoop => cold_breakdown.mid_loop_cold += 1,
+            ColdCacheKind::PostCompact => cold_breakdown.post_compact_cold += 1,
+            ColdCacheKind::None => {}
+        }
+    }
+    let cold_cache_count = cold_breakdown.turn_start_cold
+        + cold_breakdown.mid_loop_cold
+        + cold_breakdown.post_compact_cold;
+
+    let post_ckpt_start = match last_ckpt_pos {
+        Some(pos) => (pos + 2).min(turns.len()),
+        None => 1.min(turns.len()),
+    };
+    let post_ckpt_turns = &turns[post_ckpt_start..];
+    let recent_start = post_ckpt_turns.len().saturating_sub(3);
+    let recent_cold_rebuild = post_ckpt_turns[recent_start..]
+        .iter()
+        .any(|t| t.is_cold_cache() && t.context_tokens() >= 60_000);
+
+    let med_ttft = median_u64(&mut ttfts);
+    let med_tps = round_dp(median_f64(&mut tps_vals), 1);
+    let total_cny = total_usd * fx_rate;
+
+    let crit_line = (prof.recommend_ctx + 40_000).max(cfg.context.critical_threshold);
+    let (level, suggest_compact) = if just_compacted {
+        ("ok", false)
+    } else if latest_ctx >= crit_line {
+        ("critical", latest_ctx >= prof.recommend_ctx)
+    } else if latest_ctx >= prof.min_ctx {
+        ("warn", latest_ctx >= prof.recommend_ctx)
+    } else {
+        ("ok", latest_ctx >= prof.recommend_ctx)
+    };
+
+    let killed = summary.map(|s| s.killed).unwrap_or(false);
+    let is_running = summary
+        .map(|s| s.status == "CASCADE_RUN_STATUS_RUNNING" && !s.killed)
+        .unwrap_or(false);
+    let not_fully_idle = summary.map(|s| s.not_fully_idle && !s.killed).unwrap_or(false);
+    let is_subagent = summary.map(|s| s.is_subagent()).unwrap_or(false);
+    let agent_name = summary.map(|s| s.agent_name.clone()).unwrap_or_default();
+    let parent_id = summary
+        .map(|s| s.parent_conversation_id.clone())
+        .unwrap_or_default();
+    let archived = summary.map(|s| s.archived).unwrap_or(false);
+    let pinned = summary.map(|s| s.pinned).unwrap_or(false);
+    let workspace = summary.map(|s| s.workspace.clone()).unwrap_or_default();
+    let workspace_name = if workspace.is_empty() {
+        String::new()
+    } else {
+        Path::new(workspace.trim_end_matches('/'))
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    let short_id: String = cid.chars().take(8).collect();
+    let title = if let Some(s) = summary.filter(|s| !s.title.is_empty()) {
+        s.title.clone()
+    } else if !agent_name.is_empty() {
+        agent_name.clone()
+    } else if let Some(s) = summary.filter(|s| !s.preview.is_empty()) {
+        s.preview.chars().take(48).collect()
+    } else {
+        format!("会话 {short_id}")
+    };
+
+    let summary_mod_ts = summary
+        .map(|s| parse_iso_ts(&s.last_modified_time))
+        .unwrap_or(0.0);
+    let turn_ts = latest
+        .filter(|t| t.timestamp > 0.0)
+        .map(|t| t.timestamp)
+        .unwrap_or(eff_mtime);
+    let last_ts = if summary_mod_ts > 0.0 {
+        summary_mod_ts.max(turn_ts)
+    } else {
+        turn_ts
+    };
+    let last_iso = format_utc_iso(last_ts);
+
+    let is_active = if is_subagent {
+        is_subagent_active(summary, last_ts, now_ts, cfg.context.subagent_silent_timeout_sec)
+    } else {
+        is_running || not_fully_idle
+    };
+
+    let run_state = if killed {
+        "killed"
+    } else if is_running {
+        "running"
+    } else if is_active {
+        "active"
+    } else {
+        "idle"
+    };
+
+    let model_short = rates.short_model_label(model_disp, model_id);
+    let ctx_pct = if ctx_limit > 0 {
+        round_dp((latest_ctx as f64) / (ctx_limit as f64) * 100.0, 1)
+    } else {
+        0.0
+    };
+
+    SessionTelemetry {
+        id: cid.to_string(),
+        conversation_id: cid.to_string(),
+        short_id,
+        title,
+        agent_name,
+        parent_id,
+        is_subagent,
+        is_running,
+        not_fully_idle,
+        is_active,
+        run_state: run_state.to_string(),
+        killed,
+        archived,
+        pinned,
+        status: summary.map(|s| s.status.clone()).unwrap_or_default(),
+        workspace,
+        workspace_name,
+        model: model_id.to_string(),
+        model_display: model_disp.to_string(),
+        model_short,
+        profile_label: prof.label,
+        min_compact_tokens: prof.min_ctx,
+        recommend_compact_tokens: prof.recommend_ctx,
+        urgent_compact_tokens: prof.urgent_ctx,
+        just_compacted,
+        pre_compact_tokens,
+        checkpoint_count,
+        turns_since_compact,
+        recent_cold_rebuild,
+        latest_context_tokens: latest_ctx,
+        peak_context_tokens: peak_ctx,
+        context_limit: ctx_limit,
+        context_pct: ctx_pct,
+        level: level.to_string(),
+        suggest_compact,
+        turns: turns.len(),
+        cache_hit_rate: round_dp(cache_hit, 1),
+        latest_cache_hit_rate: latest.map(|t| round_dp(t.cache_hit_rate(), 1)).unwrap_or(0.0),
+        cold_cache_count,
+        turn_start_cold_count: cold_breakdown.turn_start_cold,
+        mid_loop_cold_count: cold_breakdown.mid_loop_cold,
+        post_compact_cold_count: cold_breakdown.post_compact_cold,
+        cold_cache_breakdown: cold_breakdown,
+        median_ttft_ms: med_ttft,
+        median_stream_tps: med_tps,
+        total_input_tokens: total_in,
+        total_cache_read_tokens: total_cr,
+        total_output_tokens: total_out,
+        cost_usd: round_dp(total_usd, 4),
+        cost_cny: round_dp(total_cny, 2),
+        currency_symbol: currency_sym,
+        summary_modified_ts: round_dp(summary_mod_ts, 3),
+        sidebar_sort_ts: round_dp(last_ts, 3),
+        last_active_ts: round_dp(last_ts, 3),
+        last_active_iso: last_iso,
+        subagents: Vec::new(),
+        running_subagent_count: 0,
+        history_subagent_count: 0,
+        effective_last_active_ts: None,
+        group_cost_cny: None,
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnViewRow {
+    pub turn: usize,
+    pub step_idx: i64,
+    pub is_checkpoint: bool,
+    pub time_iso: String,
+    pub model: String,
+    pub model_display: String,
+    pub context_tokens: u64,
+    pub input_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_hit_rate: f64,
+    pub is_cold_cache: bool,
+    pub cold_cache_kind: String,
+    pub cold_cache_label: String,
+    pub cold_cache_reason: String,
+    pub ttft_ms: u64,
+    pub total_ms: u64,
+    pub stream_tps: f64,
+    pub cost_usd: f64,
+    pub cost_cny: f64,
+    pub currency_symbol: String,
+}
+
+pub fn format_turn_rows(
+    turns: &[TurnSample],
+    limit: usize,
+    fx_rate: f64,
+    rates: &mut RateTable,
+    transcript_step_types: Option<&HashMap<i64, String>>,
+) -> Vec<TurnViewRow> {
+    let cold_kinds = classify_cold_cache_turns(turns, transcript_step_types);
+    let (_, currency_sym) = rates.get_currency();
+    let start = turns.len().saturating_sub(limit);
+    let mut rows = Vec::with_capacity(turns.len() - start);
+    for (t, &c_kind) in turns[start..].iter().zip(cold_kinds[start..].iter()).rev() {
+        let usd = rates.calculate_cost_usd(
+            &t.model,
+            t.input_tokens,
+            t.cache_read,
+            t.cache_write,
+            t.output_tokens,
+            &t.model_display,
+        );
+        let (c_label, c_reason) = c_kind.label_and_reason();
+        rows.push(TurnViewRow {
+            turn: t.turn_index,
+            step_idx: t.step_idx,
+            is_checkpoint: t.is_checkpoint,
+            time_iso: format_utc_iso(t.timestamp),
+            model: t.model.clone(),
+            model_display: t.model_display.clone(),
+            context_tokens: t.context_tokens(),
+            input_tokens: t.input_tokens,
+            cache_read_tokens: t.cache_read,
+            cache_write_tokens: t.cache_write,
+            output_tokens: t.output_tokens,
+            cache_hit_rate: round_dp(t.cache_hit_rate(), 1),
+            is_cold_cache: t.is_cold_cache(),
+            cold_cache_kind: c_kind.as_str().to_string(),
+            cold_cache_label: c_label.to_string(),
+            cold_cache_reason: c_reason.to_string(),
+            ttft_ms: t.ttft_ms,
+            total_ms: t.total_ms,
+            stream_tps: round_dp(t.stream_tps(), 1),
+            cost_usd: round_dp(usd, 4),
+            cost_cny: round_dp(usd * fx_rate, 3),
+            currency_symbol: currency_sym.clone(),
+        });
+    }
+    rows
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotThresholds {
+    pub warn: u64,
+    pub compact: u64,
+    pub critical: u64,
+    pub max: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotSummary {
+    pub total_db_files: usize,
+    pub archived_hidden_count: usize,
+    pub history_subagents_hidden_count: usize,
+    pub shown_main_count: usize,
+    pub shown_subagent_count: usize,
+    pub running_main_count: usize,
+    pub running_subagent_count: usize,
+    pub compact_needed_count: usize,
+    pub critical_count: usize,
+    pub total_cost_cny: f64,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OverviewSnapshot {
+    pub mode: String,
+    pub unchanged: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub stale: bool,
+    pub digest: String,
+    pub server_ms: u64,
+    pub generated_at: String,
+    pub generated_ts: f64,
+    pub fx_rate: f64,
+    pub fx_source: String,
+    pub currency_code: String,
+    pub currency_symbol: String,
+    pub show_history_subagents: bool,
+    pub thresholds: SnapshotThresholds,
+    pub summary: SnapshotSummary,
+    pub sessions: Vec<SessionTelemetry>,
+    pub orphan_subagents: Vec<SessionTelemetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<PanelPrefs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_grant: Option<RelayGrant>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionTurnsPayload {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub conversation_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionTelemetry>,
+    pub total_turns: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cold_cache_breakdown: Option<ColdCacheBreakdown>,
+    pub turns: Vec<TurnViewRow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MetricsCacheKey {
+    db_stamp: Option<(u64, u64, DbVersionSig)>,
+    summary: Option<SummaryRecord>,
+    fx_micros: i64,
+    settings_gen: u64,
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+/// Deterministic 16-hex content digest ignoring volatile clock fields (`generated_at`/`server_ms`).
+pub fn compute_snapshot_digest(snap: &OverviewSnapshot) -> String {
+    #[derive(Serialize)]
+    struct StableView<'a> {
+        fx_rate: f64,
+        currency_code: &'a str,
+        currency_symbol: &'a str,
+        show_history_subagents: bool,
+        thresholds: &'a SnapshotThresholds,
+        summary: &'a SnapshotSummary,
+        sessions: &'a [SessionTelemetry],
+        orphan_subagents: &'a [SessionTelemetry],
+        settings: &'a Option<PanelPrefs>,
+        pending_grant: &'a Option<RelayGrant>,
+    }
+
+    let stable = StableView {
+        fx_rate: snap.fx_rate,
+        currency_code: &snap.currency_code,
+        currency_symbol: &snap.currency_symbol,
+        show_history_subagents: snap.show_history_subagents,
+        thresholds: &snap.thresholds,
+        summary: &snap.summary,
+        sessions: &snap.sessions,
+        orphan_subagents: &snap.orphan_subagents,
+        settings: &snap.settings,
+        pending_grant: &snap.pending_grant,
+    };
+    let bytes = serde_json::to_vec(&stable).unwrap_or_default();
+    let h = fnv1a_64(&bytes);
+    format!("{h:016x}")
+}
+
+fn resolve_disk_cache_path(
+    data_root: &Path,
+    plugin_data_dir: Option<&Path>,
+    rates: &mut RateTable,
+    explicit: Option<Option<PathBuf>>,
+) -> Option<PathBuf> {
+    if let Ok(dis) = env::var(DISABLE_DISK_CACHE_ENV) {
+        let low = dis.trim().to_ascii_lowercase();
+        if matches!(low.as_str(), "1" | "true" | "yes") {
+            return None;
+        }
+    }
+    if let Some(ov) = explicit {
+        return ov;
+    }
+    let cfg = rates.current_settings();
+    if !cfg.context.enable_disk_cache {
+        return None;
+    }
+    if let Ok(env_p) = env::var(INDEX_CACHE_PATH_ENV) {
+        let trimmed = env_p.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(expand_tilde(trimmed)));
+        }
+    }
+    if !cfg.context.disk_cache_path.is_empty() {
+        return Some(PathBuf::from(&cfg.context.disk_cache_path));
+    }
+    let base = plugin_data_dir
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| default_plugin_data_dir(data_root));
+    Some(base.join("index_cache.sqlite"))
+}
+
+pub struct TelemetryEngine {
+    pub ledger: LedgerReader,
+    pub rates: RateTable,
+    metrics_cache: HashMap<String, (MetricsCacheKey, SessionTelemetry)>,
+}
+
+impl TelemetryEngine {
+    pub fn new(
+        data_root: Option<PathBuf>,
+        rates: Option<RateTable>,
+        explicit_disk_cache: Option<Option<PathBuf>>,
+    ) -> Self {
+        Self::new_with_plugin_data(data_root, None, rates, explicit_disk_cache)
+    }
+
+    pub fn new_with_plugin_data(
+        data_root: Option<PathBuf>,
+        plugin_data_dir: Option<PathBuf>,
+        rates: Option<RateTable>,
+        explicit_disk_cache: Option<Option<PathBuf>>,
+    ) -> Self {
+        let root = data_root.unwrap_or_else(default_data_root);
+        let mut rate_table =
+            rates.unwrap_or_else(|| RateTable::new(SettingsWatcher::new(None), None, None));
+        let disk_path = resolve_disk_cache_path(
+            &root,
+            plugin_data_dir.as_deref(),
+            &mut rate_table,
+            explicit_disk_cache,
+        );
+        let ledger = LedgerReader::new(root, disk_path);
+        Self {
+            ledger,
+            rates: rate_table,
+            metrics_cache: HashMap::new(),
+        }
+    }
+
+    pub fn close(&mut self) {
+        self.ledger.close();
+    }
+
+    fn transcript_types_if_needed(
+        &mut self,
+        cid: &str,
+        turns: &[TurnSample],
+    ) -> Option<HashMap<i64, String>> {
+        if turns
+            .iter()
+            .any(|t| t.is_cold_cache() && t.after_turn_start.is_none())
+        {
+            let root = self.ledger.data_root.clone();
+            Some(self.ledger.journal_cache.get_step_types(&root, cid))
+        } else {
+            None
+        }
+    }
+
+    fn build_metrics_cached(
+        &mut self,
+        cid: &str,
+        summary: Option<&SummaryRecord>,
+        turns: &[TurnSample],
+        stamp: Option<&FileStamp>,
+        fx_rate: f64,
+        ref_now: f64,
+    ) -> SessionTelemetry {
+        let cfg = self.rates.current_settings();
+        let cache_key = MetricsCacheKey {
+            db_stamp: stamp.map(|s| (s.dev, s.ino, s.sig.clone())),
+            summary: summary.cloned(),
+            fx_micros: (fx_rate * 1_000_000.0).round() as i64,
+            settings_gen: cfg.generation,
+        };
+        if let Some((prev_key, prev_tel)) = self.metrics_cache.get(cid) {
+            if *prev_key == cache_key {
+                let mut out = prev_tel.clone();
+                if out.is_subagent {
+                    let is_act = is_subagent_active(
+                        summary,
+                        out.last_active_ts,
+                        ref_now,
+                        cfg.context.subagent_silent_timeout_sec,
+                    );
+                    out.is_active = is_act;
+                    out.run_state = if out.killed {
+                        "killed"
+                    } else if out.is_running {
+                        "running"
+                    } else if is_act {
+                        "active"
+                    } else {
+                        "idle"
+                    }
+                    .to_string();
+                }
+                return out;
+            }
+        }
+
+        let t_types = self.transcript_types_if_needed(cid, turns);
+        let eff_mtime = stamp.map(|s| s.eff_mtime).unwrap_or(0.0);
+        let tel = build_session_telemetry(
+            cid,
+            summary,
+            turns,
+            eff_mtime,
+            fx_rate,
+            &mut self.rates,
+            ref_now,
+            t_types.as_ref(),
+        );
+        self.metrics_cache
+            .insert(cid.to_string(), (cache_key, tel.clone()));
+        tel
+    }
+
+    pub fn get_turn_and_checkpoint_counts(&mut self, cid: &str) -> (usize, usize) {
+        if cid.is_empty() || !is_safe_id(cid) {
+            return (0, 0);
+        }
+        let turns = self.ledger.read_turns(cid, None);
+        let ckpts = turns.iter().filter(|t| t.is_checkpoint).count();
+        (turns.len(), ckpts)
+    }
+
+    pub fn get_running_subagent_count(&mut self, parent_cid: &str, now_override: Option<f64>) -> usize {
+        if parent_cid.is_empty() || !is_safe_id(parent_cid) {
+            return 0;
+        }
+        let ref_now = now_override.unwrap_or_else(now_epoch_sec);
+        let silent_sec = self.rates.current_settings().context.subagent_silent_timeout_sec;
+        let candidates: Vec<(String, SummaryRecord)> = self
+            .ledger
+            .read_summaries()
+            .iter()
+            .filter(|(_, s)| s.parent_conversation_id == parent_cid && s.is_subagent())
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        let mut count = 0usize;
+        for (cid, s) in candidates {
+            let Some(stamp) = stat_db_stamp(&self.ledger.db_path(&cid)) else {
+                continue;
+            };
+            let eff_ts = parse_iso_ts(&s.last_modified_time).max(stamp.eff_mtime);
+            if is_subagent_active(Some(&s), eff_ts, ref_now, silent_sec) {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn resolve_session_fast(
+        &mut self,
+        cid: &str,
+        now_override: Option<f64>,
+    ) -> Option<SessionTelemetry> {
+        let ref_now = now_override.unwrap_or_else(now_epoch_sec);
+        let (fx_rate, _) = self.rates.get_fx_rate();
+        let summaries = self.ledger.read_summaries();
+        let target = cid.trim();
+
+        let mut resolved_cid = String::new();
+        let mut prefetched: Option<FileStamp> = None;
+
+        if !target.is_empty() {
+            if is_safe_id(target) {
+                if let Some(st) = stat_db_stamp(&self.ledger.db_path(target)) {
+                    resolved_cid = target.to_string();
+                    prefetched = Some(st);
+                }
+            }
+            if resolved_cid.is_empty() {
+                let mut matches: Vec<(bool, f64, String, FileStamp)> = Vec::new();
+                for (scid, srec) in summaries.iter() {
+                    if is_safe_id(scid) && scid.starts_with(target) {
+                        if let Some(st) = stat_db_stamp(&self.ledger.db_path(scid)) {
+                            let is_act = !srec.killed
+                                && (srec.status == "CASCADE_RUN_STATUS_RUNNING"
+                                    || srec.not_fully_idle);
+                            let ts = parse_iso_ts(&srec.last_modified_time).max(st.eff_mtime);
+                            matches.push((is_act, ts, scid.clone(), st));
+                        }
+                    }
+                }
+                if !matches.is_empty() {
+                    matches.sort_by(|a, b| {
+                        b.0.cmp(&a.0)
+                            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                            .then_with(|| a.2.cmp(&b.2))
+                    });
+                    let (_, _, best_cid, best_st) = matches.remove(0);
+                    resolved_cid = best_cid;
+                    prefetched = Some(best_st);
+                }
+            }
+            if resolved_cid.is_empty() {
+                if let Ok(entries) = fs::read_dir(&self.ledger.conv_dir) {
+                    for entry in entries.flatten() {
+                        let fname = entry.file_name();
+                        let Some(name) = fname.to_str() else { continue };
+                        if let Some(cand) = name.strip_suffix(".db") {
+                            if is_safe_id(cand) && cand.starts_with(target) {
+                                if let Some(st) = stat_db_stamp(&entry.path()) {
+                                    resolved_cid = cand.to_string();
+                                    prefetched = Some(st);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            let (file_mtimes, file_stamps) = self.ledger.scan_dir();
+            let mut active_mains: Vec<(f64, String)> = Vec::new();
+            let mut all_mains: Vec<(f64, String)> = Vec::new();
+            for (scid, mtime) in &file_mtimes {
+                let s = summaries.get(scid);
+                if s.map(|r| r.is_subagent()).unwrap_or(false) {
+                    continue;
+                }
+                let s_ts = s.map(|r| parse_iso_ts(&r.last_modified_time)).unwrap_or(0.0);
+                let ts = s_ts.max(*mtime);
+                let is_act = s
+                    .map(|r| !r.killed && (r.status == "CASCADE_RUN_STATUS_RUNNING" || r.not_fully_idle))
+                    .unwrap_or(false);
+                if is_act {
+                    active_mains.push((ts, scid.clone()));
+                }
+                all_mains.push((ts, scid.clone()));
+            }
+            let pool = if !active_mains.is_empty() {
+                &mut active_mains
+            } else {
+                &mut all_mains
+            };
+            if !pool.is_empty() {
+                pool.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.1.cmp(&a.1))
+                });
+                resolved_cid = pool[0].1.clone();
+                prefetched = file_stamps.get(&resolved_cid).cloned();
+            }
+        }
+
+        if resolved_cid.is_empty() {
+            return None;
+        }
+
+        let turns = self.ledger.read_turns(&resolved_cid, prefetched.as_ref());
+        let summary = summaries.get(&resolved_cid);
+        let mut tel = self.build_metrics_cached(
+            &resolved_cid,
+            summary,
+            &turns,
+            prefetched.as_ref(),
+            fx_rate,
+            ref_now,
+        );
+        if !tel.is_subagent {
+            let run_subs = self.get_running_subagent_count(&resolved_cid, Some(ref_now));
+            tel.running_subagent_count = run_subs;
+            tel.is_active = tel.is_active || run_subs > 0;
+        }
+        Some(tel)
+    }
+
+    pub fn build_overview_snapshot(
+        &mut self,
+        limit: usize,
+        show_history: bool,
+        include_archived: bool,
+        workspace_filter: &str,
+        now_override: Option<f64>,
+    ) -> OverviewSnapshot {
+        let t0 = Instant::now();
+        let limit = limit.clamp(1, 60);
+        let ref_now = now_override.unwrap_or_else(now_epoch_sec);
+        let ws_filter = workspace_filter.trim().to_ascii_lowercase();
+        let cfg = self.rates.current_settings();
+        let (fx_rate, fx_source) = self.rates.get_fx_rate();
+        let (currency_code, currency_sym) = self.rates.get_currency();
+        let summaries = self.ledger.read_summaries();
+        let (file_mtimes, file_stamps) = self.ledger.scan_dir();
+
+        let archived_hidden_count = summaries
+            .iter()
+            .filter(|(cid, s)| s.archived && file_mtimes.contains_key(*cid) && !s.is_subagent())
+            .count();
+
+        let mut running_ids: HashSet<String> = HashSet::new();
+        for (cid, s) in summaries.iter() {
+            let Some(&mtime) = file_mtimes.get(cid) else { continue };
+            if s.is_subagent() {
+                let eff_ts = parse_iso_ts(&s.last_modified_time).max(mtime);
+                if is_subagent_active(Some(s), eff_ts, ref_now, cfg.context.subagent_silent_timeout_sec) {
+                    running_ids.insert(cid.clone());
+                }
+            } else if !s.killed
+                && (s.status == "CASCADE_RUN_STATUS_RUNNING" || s.not_fully_idle)
+            {
+                running_ids.insert(cid.clone());
+            }
+        }
+
+        let hidden_history_subagent_count = summaries
+            .iter()
+            .filter(|(cid, s)| {
+                file_mtimes.contains_key(*cid)
+                    && s.is_subagent()
+                    && !running_ids.contains(*cid)
+                    && (ws_filter.is_empty()
+                        || s.workspace.to_ascii_lowercase().contains(&ws_filter))
+            })
+            .count();
+
+        let mut priority_ids: HashSet<String> = running_ids.clone();
+        for cid in &running_ids {
+            if let Some(s) = summaries.get(cid) {
+                if !s.parent_conversation_id.is_empty()
+                    && file_mtimes.contains_key(&s.parent_conversation_id)
+                {
+                    priority_ids.insert(s.parent_conversation_id.clone());
+                }
+            }
+        }
+
+        let mut sorted_cids: Vec<String> = file_mtimes.keys().cloned().collect();
+        sorted_cids.sort_by(|a, b| {
+            let ma = file_mtimes.get(a).copied().unwrap_or(0.0);
+            let mb = file_mtimes.get(b).copied().unwrap_or(0.0);
+            mb.partial_cmp(&ma)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
+        });
+
+        let mut candidate_order: Vec<String> = Vec::with_capacity(sorted_cids.len());
+        let mut prio_sorted: Vec<String> = priority_ids.iter().cloned().collect();
+        prio_sorted.sort();
+        candidate_order.extend(prio_sorted);
+        for c in sorted_cids {
+            if !priority_ids.contains(&c) {
+                candidate_order.push(c);
+            }
+        }
+
+        let mut selected_mains: Vec<String> = Vec::new();
+        let mut selected_subs: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+
+        for cid in candidate_order {
+            if seen.contains(&cid) {
+                continue;
+            }
+            let s = summaries.get(&cid);
+            if !ws_filter.is_empty() {
+                let matched = s
+                    .map(|r| r.workspace.to_ascii_lowercase().contains(&ws_filter))
+                    .unwrap_or(false);
+                if !matched {
+                    continue;
+                }
+            }
+            let is_sub = s.map(|r| r.is_subagent()).unwrap_or(false);
+            if is_sub {
+                if !show_history && !running_ids.contains(&cid) {
+                    continue;
+                }
+                if selected_subs.len() < limit * 3 || running_ids.contains(&cid) {
+                    selected_subs.push(cid.clone());
+                    seen.insert(cid);
+                }
+            } else {
+                if s.map(|r| r.archived).unwrap_or(false)
+                    && !include_archived
+                    && !running_ids.contains(&cid)
+                {
+                    continue;
+                }
+                if selected_mains.len() < limit || priority_ids.contains(&cid) {
+                    selected_mains.push(cid.clone());
+                    seen.insert(cid);
+                }
+            }
+            if selected_mains.len() >= limit && selected_subs.len() >= limit * 3 {
+                break;
+            }
+        }
+
+        for cid in selected_subs.clone() {
+            if let Some(s) = summaries.get(&cid) {
+                let pid = &s.parent_conversation_id;
+                if !pid.is_empty() && file_mtimes.contains_key(pid) && !seen.contains(pid) {
+                    let parent_arch = summaries.get(pid).map(|p| p.archived).unwrap_or(false);
+                    if parent_arch && !include_archived && !running_ids.contains(&cid) {
+                        continue;
+                    }
+                    selected_mains.push(pid.clone());
+                    seen.insert(pid.clone());
+                }
+            }
+        }
+
+        let mut metrics_by_id: HashMap<String, SessionTelemetry> = HashMap::new();
+        for cid in selected_mains.iter().chain(selected_subs.iter()) {
+            let stamp = file_stamps.get(cid);
+            let turns = self.ledger.read_turns(cid, stamp);
+            if turns.is_empty() && !running_ids.contains(cid) {
+                continue;
+            }
+            let tel = self.build_metrics_cached(
+                cid,
+                summaries.get(cid),
+                &turns,
+                stamp,
+                fx_rate,
+                ref_now,
+            );
+            metrics_by_id.insert(cid.clone(), tel);
+        }
+
+        let mut children_map: HashMap<String, Vec<SessionTelemetry>> = HashMap::new();
+        let mut orphans: Vec<SessionTelemetry> = Vec::new();
+        for cid in &selected_subs {
+            let Some(m) = metrics_by_id.get(cid).cloned() else { continue };
+            if !show_history && !m.is_active {
+                continue;
+            }
+            let attach_parent = !m.parent_id.is_empty()
+                && metrics_by_id
+                    .get(&m.parent_id)
+                    .map(|p| !p.is_subagent)
+                    .unwrap_or(false);
+            if attach_parent {
+                children_map.entry(m.parent_id.clone()).or_default().push(m);
+            } else if m.is_active || show_history {
+                orphans.push(m);
+            }
+        }
+
+        let mut sessions: Vec<SessionTelemetry> = Vec::new();
+        for cid in &selected_mains {
+            let Some(mut m) = metrics_by_id.get(cid).cloned() else { continue };
+            let mut subs = children_map.remove(cid).unwrap_or_default();
+            subs.sort_by(|a, b| {
+                b.is_active
+                    .cmp(&a.is_active)
+                    .then_with(|| {
+                        b.sidebar_sort_ts
+                            .partial_cmp(&a.sidebar_sort_ts)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            let run_subs = subs.iter().filter(|x| x.is_active).count();
+            let hist_subs = subs.len() - run_subs;
+            let eff_ts = subs
+                .iter()
+                .map(|x| x.last_active_ts)
+                .fold(m.last_active_ts, f64::max);
+            let sort_ts = m.summary_modified_ts.max(eff_ts);
+            let group_cost = m.cost_cny + subs.iter().map(|x| x.cost_cny).sum::<f64>();
+
+            m.running_subagent_count = run_subs;
+            m.history_subagent_count = hist_subs;
+            m.is_active = m.is_active || run_subs > 0;
+            m.effective_last_active_ts = Some(round_dp(eff_ts, 3));
+            m.sidebar_sort_ts = round_dp(sort_ts, 3);
+            m.group_cost_cny = Some(round_dp(group_cost, 2));
+            m.subagents = subs;
+            sessions.push(m);
+        }
+
+        sessions.sort_by(|a, b| {
+            b.pinned
+                .cmp(&a.pinned)
+                .then_with(|| {
+                    b.sidebar_sort_ts
+                        .partial_cmp(&a.sidebar_sort_ts)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        orphans.sort_by(|a, b| {
+            b.last_active_ts
+                .partial_cmp(&a.last_active_ts)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        let shown_subagent_count: usize =
+            sessions.iter().map(|s| s.subagents.len()).sum::<usize>() + orphans.len();
+        let running_main_count = sessions.iter().filter(|s| s.is_active).count();
+        let mut running_subagent_count = 0usize;
+        let mut compact_needed_count = 0usize;
+        let mut critical_count = 0usize;
+        let mut total_cost_cny = 0.0f64;
+
+        let mut accum = |item: &SessionTelemetry| {
+            if item.is_subagent && item.is_active {
+                running_subagent_count += 1;
+            }
+            if item.suggest_compact {
+                compact_needed_count += 1;
+            }
+            if item.level == "critical" {
+                critical_count += 1;
+            }
+            total_cost_cny += item.cost_cny;
+        };
+        for s in &sessions {
+            accum(s);
+            for sub in &s.subagents {
+                accum(sub);
+            }
+        }
+        for o in &orphans {
+            accum(o);
+        }
+
+        let mut snap = OverviewSnapshot {
+            mode: "snapshot".to_string(),
+            unchanged: false,
+            stale: false,
+            digest: String::new(),
+            server_ms: t0.elapsed().as_millis() as u64,
+            generated_at: format_utc_iso(now_epoch_sec()),
+            generated_ts: round_dp(ref_now, 3),
+            fx_rate: round_dp(fx_rate, 4),
+            fx_source,
+            currency_code,
+            currency_symbol: currency_sym,
+            show_history_subagents: show_history,
+            thresholds: SnapshotThresholds {
+                warn: cfg.context.warn_threshold,
+                compact: cfg.context.compact_threshold,
+                critical: cfg.context.critical_threshold,
+                max: cfg.context.default_limit,
+            },
+            summary: SnapshotSummary {
+                total_db_files: file_mtimes.len(),
+                archived_hidden_count: if include_archived { 0 } else { archived_hidden_count },
+                history_subagents_hidden_count: if show_history {
+                    0
+                } else {
+                    hidden_history_subagent_count
+                },
+                shown_main_count: sessions.len(),
+                shown_subagent_count,
+                running_main_count,
+                running_subagent_count,
+                compact_needed_count,
+                critical_count,
+                total_cost_cny: round_dp(total_cost_cny, 2),
+            },
+            sessions,
+            orphan_subagents: orphans,
+            settings: None,
+            pending_grant: None,
+        };
+        snap.digest = compute_snapshot_digest(&snap);
+        snap
+    }
+
+    pub fn get_session_turns(&mut self, cid: &str, limit: usize) -> SessionTurnsPayload {
+        let trimmed = cid.trim();
+        let resolved = if trimmed.is_empty() {
+            match self.resolve_session_fast("", None) {
+                Some(s) => s.id,
+                None => {
+                    return SessionTurnsPayload {
+                        mode: "turns".into(),
+                        error: Some("未找到目标会话".into()),
+                        conversation_id: String::new(),
+                        session: None,
+                        total_turns: 0,
+                        cold_cache_breakdown: None,
+                        turns: Vec::new(),
+                    };
+                }
+            }
+        } else {
+            trimmed.to_string()
+        };
+
+        if !is_safe_id(&resolved) {
+            return SessionTurnsPayload {
+                mode: "turns".into(),
+                error: Some("无效的会话 ID".into()),
+                conversation_id: resolved,
+                session: None,
+                total_turns: 0,
+                cold_cache_breakdown: None,
+                turns: Vec::new(),
+            };
+        }
+
+        let limit = limit.clamp(1, 200);
+        let (fx_rate, _) = self.rates.get_fx_rate();
+        let summaries = self.ledger.read_summaries();
+        let stamp = stat_db_stamp(&self.ledger.db_path(&resolved));
+        let turns = self.ledger.read_turns(&resolved, stamp.as_ref());
+        let t_types = self.transcript_types_if_needed(&resolved, &turns);
+        let session = self.build_metrics_cached(
+            &resolved,
+            summaries.get(&resolved),
+            &turns,
+            stamp.as_ref(),
+            fx_rate,
+            now_epoch_sec(),
+        );
+        let rows = format_turn_rows(&turns, limit, fx_rate, &mut self.rates, t_types.as_ref());
+        let cb = session.cold_cache_breakdown.clone();
+        SessionTurnsPayload {
+            mode: "turns".into(),
+            error: None,
+            conversation_id: resolved,
+            session: Some(session),
+            total_turns: turns.len(),
+            cold_cache_breakdown: Some(cb),
+            turns: rows,
+        }
+    }
+}

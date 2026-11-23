@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://context-radar-mcp.local/schemas/settings.schema.json",
+  "title": "Context Radar MCP User Settings",
+  "description": "External user settings for Context Radar MCP (default path: ~/.config/context-radar-mcp/settings.json; override via CONTEXT_RADAR_CONFIG).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional JSON Schema reference."
+    },
+    "version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Settings schema version (1)."
+    },
+    "context": {
+      "type": "object",
+      "description": "Context window thresholds, post-checkpoint estimation, and index cache settings.",
+      "additionalProperties": false,
+      "properties": {
+        "default_limit": { "type": "integer", "minimum": 1000, "default": 512000 },
+        "warn_threshold": { "type": "integer", "minimum": 1000, "default": 220000 },
+        "compact_threshold": { "type": "integer", "minimum": 1000, "default": 270000 },
+        "critical_threshold": { "type": "integer", "minimum": 1000, "default": 350000 },
+        "est_post_compact_base": { "type": "integer", "minimum": 0, "default": 20500 },
+        "subagent_silent_timeout_sec": { "type": "number", "minimum": 10, "default": 3600 },
+        "enable_disk_cache": { "type": "boolean", "default": true },
+        "disk_cache_path": { "type": "string" }
+      }
+    },
+    "pricing": {
+      "type": "object",
+      "description": "Model pricing overrides, FX conversion, and optional lazy external catalogs.",
+      "additionalProperties": false,
+      "properties": {
+        "currency_code": { "type": "string", "default": "CNY" },
+        "currency_symbol": { "type": "string", "default": "¥" },
+        "fx_rate": { "type": "number", "exclusiveMinimum": 0, "default": 7.2 },
+        "external_fxrate_path": { "type": "string" },
+        "external_models_path": { "type": "string" },
+        "overrides": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["input_per_m", "output_per_m"],
+            "properties": {
+              "match_prefix": { "type": "array", "items": { "type": "string" } },
+              "match_exact": { "type": "array", "items": { "type": "string" } },
+              "match_contains": { "type": "array", "items": { "type": "string" } },
+              "input_per_m": { "type": "number", "minimum": 0 },
+              "cache_read_per_m": { "type": "number", "minimum": 0 },
+              "cache_write_per_m": { "type": "number", "minimum": 0 },
+              "output_per_m": { "type": "number", "minimum": 0 },
+              "context_limit": { "type": "integer", "minimum": 1000 },
+              "source": { "type": "string", "default": "user-override" },
+              "tier_threshold": { "type": "integer", "minimum": 0 },
+              "tier_input": { "type": "number", "minimum": 0 },
+              "tier_cache_read": { "type": "number", "minimum": 0 },
+              "tier_cache_write": { "type": "number", "minimum": 0 },
+              "tier_output": { "type": "number", "minimum": 0 }
+            }
+          }
+        },
+        "models": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["input_per_m", "output_per_m"],
+            "properties": {
+              "input_per_m": { "type": "number", "minimum": 0 },
+              "cache_read_per_m": { "type": "number", "minimum": 0 },
+              "cache_write_per_m": { "type": "number", "minimum": 0 },
+              "output_per_m": { "type": "number", "minimum": 0 },
+              "context_limit": { "type": "integer", "minimum": 1000 },
+              "source": { "type": "string", "default": "user-config" },
+              "tier_threshold": { "type": "integer", "minimum": 0 },
+              "tier_input": { "type": "number", "minimum": 0 },
+              "tier_cache_read": { "type": "number", "minimum": 0 },
+              "tier_cache_write": { "type": "number", "minimum": 0 },
+              "tier_output": { "type": "number", "minimum": 0 }
+            }
+          }
+        },
+        "short_labels": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["contains", "label"],
+            "properties": {
+              "contains": { "type": "string", "minLength": 1 },
+              "label": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "budgets": {
+      "type": "object",
+      "description": "Model x reasoning-effort budget tiers and matching rules.",
+      "additionalProperties": false,
+      "properties": {
+        "default_tier": { "type": "string", "default": "standard" },
+        "tiers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "label",
+              "min_ctx",
+              "recommend_ctx",
+              "urgent_ctx",
+              "min_turns_since_ckpt",
+              "min_remaining_turns"
+            ],
+            "properties": {
+              "label": { "type": "string" },
+              "min_ctx": { "type": "integer", "minimum": 1000 },
+              "recommend_ctx": { "type": "integer", "minimum": 1000 },
+              "urgent_ctx": { "type": "integer", "minimum": 1000 },
+              "min_turns_since_ckpt": { "type": "integer", "minimum": 1 },
+              "min_remaining_turns": { "type": "integer", "minimum": 1 }
+            }
+          }
+        },
+        "rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["tier"],
+            "properties": {
+              "tier": { "type": "string" },
+              "match_any": { "type": "array", "items": { "type": "string" } },
+              "require_all": { "type": "array", "items": { "type": "string" } },
+              "exclude_any": { "type": "array", "items": { "type": "string" } }
+            }
+          }
+        }
+      }
+    },
+    "guards": {
+      "type": "object",
+      "description": "Settings for native SessionStart (boot) and PreToolUse(run_command) (exec_gate) guards.",
+      "additionalProperties": false,
+      "properties": {
+        "boot": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "max_total_bytes": { "type": "integer", "minimum": 128, "maximum": 16384, "default": 3200 },
+            "state_files": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["path"],
+                "properties": {
+                  "workspace_root": { "type": "string" },
+                  "path": { "type": "string" },
+                  "format": { "type": "string", "enum": ["plain", "markdown_bullets", "markdown_state_table"], "default": "plain" },
+                  "prefix": { "type": "string" },
+                  "max_bytes": { "type": "integer", "minimum": 64, "maximum": 8192, "default": 800 },
+                  "section_heading": { "type": "string" },
+                  "table_columns": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "name_col": { "type": "integer", "minimum": 0, "default": 0 },
+                      "min_cols": { "type": "integer", "minimum": 2, "default": 3 },
+                      "ignore_headers": { "type": "array", "items": { "type": "string" } },
+                      "counters": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": ["col", "label"],
+                          "properties": {
+                            "col": { "type": "integer", "minimum": 0 },
+                            "label": { "type": "string" }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  "theme_columns": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "name_col": { "type": "integer", "minimum": 0, "default": 0 },
+                      "min_cols": { "type": "integer", "minimum": 2, "default": 4 },
+                      "ignore_headers": { "type": "array", "items": { "type": "string" } },
+                      "split_sep": { "type": "string", "default": "·" },
+                      "sub_col": { "type": "integer", "minimum": 0, "default": 1 },
+                      "active_col": { "type": "integer", "minimum": 0, "default": 2 },
+                      "repos_col": { "type": "integer", "minimum": 0, "default": 3 }
+                    }
+                  }
+                }
+              }
+            },
+            "extra_rules": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "workspace_root": { "type": "string" },
+                  "tag": { "type": "string" },
+                  "text": { "type": "string" },
+                  "lines": { "type": "array", "items": { "type": "string" } },
+                  "file": { "type": "string" },
+                  "max_bytes": { "type": "integer", "minimum": 64, "maximum": 8192, "default": 1200 }
+                }
+              }
+            }
+          }
+        },
+        "exec_gate": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean", "default": true },
+            "min_sync_wait_ms": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 5000 },
+            "target_sync_wait_ms": { "type": "integer", "minimum": 500, "maximum": 10000, "default": 10000 },
+            "respect_is_daemon": { "type": "boolean", "default": true },
+            "replace_default_exempt_patterns": { "type": "boolean", "default": false },
+            "exempt_patterns": { "type": "array", "items": { "type": "string" } }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,148 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1160 610" width="1160" height="610" role="img" aria-labelledby="title desc" font-family="-apple-system,'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+  <title id="title">Context Radar MCP 架构图</title>
+  <desc id="desc">只读访问 Antigravity SQLite 与会话日志，经由原生 Rust 遥测引擎完成三分类冷缓存归因、预算门禁、保前缀切片提炼与 SWR 内存预热，通过 MCP 守护进程与执行守卫驱动暗色优先的 MCP App 面板。</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 z" fill="#D97757"/>
+    </marker>
+    <marker id="arrow-muted" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,1 L9,5 L0,9 z" fill="#7B766C"/>
+    </marker>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="1160" y2="610" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#171613"/>
+      <stop offset="100%" stop-color="#141311"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Outer Canvas -->
+  <rect x="0.5" y="0.5" width="1159" height="609" rx="18" fill="url(#bg-grad)" stroke="#2E2B26"/>
+
+  <!-- Header -->
+  <text x="580" y="37" text-anchor="middle" font-size="18.5" font-weight="700" fill="#F4F1EA">Context Radar MCP · 原生 Rust 上下文遥测、保前缀提炼与硬门禁接力架构</text>
+  <text x="580" y="58" text-anchor="middle" font-size="12" fill="#A39E93">单文件原生二进制 · 零外部联网 · 宿主 SQLite 严格只读 · &lt;0.5 ms SWR 秒开 · 状态隔离于 ${PLUGIN_DATA}</text>
+
+  <!-- Column 1: 宿主数据源（只读） -->
+  <rect x="24" y="80" width="250" height="372" rx="14" fill="#181A1F" stroke="#6B94D6" stroke-opacity="0.38"/>
+  <text x="149" y="108" text-anchor="middle" font-size="13.5" font-weight="700" fill="#8BB0EA">1 · 宿主数据源（只读）</text>
+
+  <rect x="36" y="124" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="36" y="124" width="4.5" height="68" rx="2.25" fill="#6B94D6"/>
+  <text x="52" y="150" font-size="13.5" font-weight="650" fill="#F4F1EA">Antigravity SQLite</text>
+  <text x="52" y="172" font-size="11" fill="#A39E93">READ_ONLY · PRAGMA query_only</text>
+
+  <rect x="36" y="206" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="36" y="206" width="4.5" height="68" rx="2.25" fill="#6B94D6"/>
+  <text x="52" y="232" font-size="13.5" font-weight="650" fill="#F4F1EA">会话日志与检查点</text>
+  <text x="52" y="254" font-size="11" fill="#A39E93">256 KiB 逆向扫描 CHECKPOINT</text>
+
+  <rect x="36" y="288" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="36" y="288" width="4.5" height="68" rx="2.25" fill="#6B94D6"/>
+  <text x="52" y="314" font-size="13.5" font-weight="650" fill="#F4F1EA">Protobuf 线速游标</text>
+  <text x="52" y="336" font-size="11" fill="#A39E93">零拷贝提前退出 · 模型/步解析</text>
+
+  <rect x="36" y="370" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="36" y="370" width="4.5" height="68" rx="2.25" fill="#6B94D6"/>
+  <text x="52" y="396" font-size="13.5" font-weight="650" fill="#F4F1EA">可选 settings.json</text>
+  <text x="52" y="418" font-size="11" fill="#A39E93">模型费率 · 汇率 · 预算档位 · 守卫</text>
+
+  <!-- Connector 1 -> 2 -->
+  <line x1="278" y1="266" x2="305" y2="266" stroke="#D97757" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Column 2: Rust 遥测与决策引擎 -->
+  <rect x="310" y="80" width="250" height="372" rx="14" fill="#1F1916" stroke="#D97757" stroke-opacity="0.45"/>
+  <text x="435" y="108" text-anchor="middle" font-size="13.5" font-weight="700" fill="#E5896B">2 · Rust 遥测与决策引擎</text>
+
+  <rect x="322" y="124" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="322" y="124" width="4.5" height="68" rx="2.25" fill="#D97757"/>
+  <text x="338" y="150" font-size="13.5" font-weight="650" fill="#F4F1EA">三分类冷缓存归因</text>
+  <text x="338" y="172" font-size="11" fill="#A39E93">跨轮冷启 · 途中冷启 · 压缩后首轮</text>
+
+  <rect x="322" y="206" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="322" y="206" width="4.5" height="68" rx="2.25" fill="#D97757"/>
+  <text x="338" y="232" font-size="13.5" font-weight="650" fill="#F4F1EA">预算分档与回本门禁</text>
+  <text x="338" y="254" font-size="11" fill="#A39E93">模型 × 思考档位 · 冷却与回本轮数</text>
+
+  <rect x="322" y="288" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="322" y="288" width="4.5" height="68" rx="2.25" fill="#D97757"/>
+  <text x="338" y="314" font-size="13.5" font-weight="650" fill="#F4F1EA">保前缀切片提炼器</text>
+  <text x="338" y="336" font-size="11" fill="#A39E93">定位膨胀热点 → 写入 scratch/ 摘要</text>
+
+  <rect x="322" y="370" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="322" y="370" width="4.5" height="68" rx="2.25" fill="#D97757"/>
+  <text x="338" y="396" font-size="13.5" font-weight="650" fill="#F4F1EA">启动预热 + SWR 缓存</text>
+  <text x="338" y="418" font-size="11" fill="#A39E93">&lt;0.5 ms 内存命中 · 单飞异步刷新</text>
+
+  <!-- Connector 2 -> 3 -->
+  <line x1="564" y1="266" x2="591" y2="266" stroke="#D97757" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Column 3: MCP 守护进程与执行守卫 -->
+  <rect x="596" y="80" width="250" height="372" rx="14" fill="#1E1C16" stroke="#D4A14B" stroke-opacity="0.42"/>
+  <text x="721" y="108" text-anchor="middle" font-size="13.5" font-weight="700" fill="#E3B667">3 · MCP 守护进程与守卫</text>
+
+  <rect x="608" y="124" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="608" y="124" width="4.5" height="68" rx="2.25" fill="#D4A14B"/>
+  <text x="624" y="150" font-size="13.5" font-weight="650" fill="#F4F1EA">5 个模型+面板工具</text>
+  <text x="624" y="172" font-size="11" fill="#A39E93">overview · turns · hotspots · handoff</text>
+
+  <rect x="608" y="206" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="608" y="206" width="4.5" height="68" rx="2.25" fill="#D4A14B"/>
+  <text x="624" y="232" font-size="13.5" font-weight="650" fill="#F4F1EA">面板私有状态工具</text>
+  <text x="624" y="254" font-size="11" fill="#A39E93">ui_action · visibility: ["app"]</text>
+
+  <rect x="608" y="288" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="608" y="288" width="4.5" height="68" rx="2.25" fill="#D4A14B"/>
+  <text x="624" y="314" font-size="13.5" font-weight="650" fill="#F4F1EA">guard boot (SessionStart)</text>
+  <text x="624" y="336" font-size="11" fill="#A39E93">工作区受限摘要 · 防符号链接越界</text>
+
+  <rect x="608" y="370" width="226" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="608" y="370" width="4.5" height="68" rx="2.25" fill="#D4A14B"/>
+  <text x="624" y="396" font-size="13.5" font-weight="650" fill="#F4F1EA">guard exec (PreToolUse)</text>
+  <text x="624" y="418" font-size="11" fill="#A39E93">同步等待保底 · 自动豁免常驻进程</text>
+
+  <!-- Connector 3 -> 4 -->
+  <line x1="850" y1="266" x2="877" y2="266" stroke="#D97757" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- Column 4: 暖暗色 MCP App 面板 -->
+  <rect x="882" y="80" width="254" height="372" rx="14" fill="#161D19" stroke="#4E9F72" stroke-opacity="0.42"/>
+  <text x="1009" y="108" text-anchor="middle" font-size="13.5" font-weight="700" fill="#6EC291">4 · 暖暗色 MCP App 面板</text>
+
+  <rect x="894" y="124" width="230" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="894" y="124" width="4.5" height="68" rx="2.25" fill="#4E9F72"/>
+  <text x="910" y="150" font-size="13.5" font-weight="650" fill="#F4F1EA">&lt;45 KiB 单文件 HTML</text>
+  <text x="910" y="172" font-size="11" fill="#A39E93">CSP default-src 'none' · SEP-1865</text>
+
+  <rect x="894" y="206" width="230" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="894" y="206" width="4.5" height="68" rx="2.25" fill="#4E9F72"/>
+  <text x="910" y="232" font-size="13.5" font-weight="650" fill="#F4F1EA">零白屏暗色画布</text>
+  <text x="910" y="254" font-size="11" fill="#A39E93">#141311 首帧锁定 · 透明背景防护</text>
+
+  <rect x="894" y="288" width="230" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="894" y="288" width="4.5" height="68" rx="2.25" fill="#4E9F72"/>
+  <text x="910" y="314" font-size="13.5" font-weight="650" fill="#F4F1EA">主水位表与逐轮柱图</text>
+  <text x="910" y="336" font-size="11" fill="#A39E93">摘要去重 · 弱网 RTT 自适应轮询</text>
+
+  <rect x="894" y="370" width="230" height="68" rx="10" fill="#1C1B18" stroke="#302D28"/>
+  <rect x="894" y="370" width="4.5" height="68" rx="2.25" fill="#4E9F72"/>
+  <text x="910" y="396" font-size="13.5" font-weight="650" fill="#F4F1EA">门禁接力与切棒卡片</text>
+  <text x="910" y="418" font-size="11" fill="#A39E93">一键复制 /compact · target:new</text>
+
+  <!-- Vertical dashed link from Daemon to Storage Isolation -->
+  <line x1="721" y1="452" x2="721" y2="473" stroke="#7B766C" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#arrow-muted)"/>
+  <line x1="435" y1="452" x2="435" y2="473" stroke="#7B766C" stroke-width="1.6" stroke-dasharray="4 3" marker-end="url(#arrow-muted)"/>
+
+  <!-- Bottom Strip -->
+  <rect x="24" y="478" width="1112" height="108" rx="14" fill="#181714" stroke="#38342E" stroke-dasharray="5 4"/>
+  <text x="42" y="502" font-size="12.5" font-weight="700" fill="#E5896B">安全边界、极小常驻提示词占用与自动化发布流水线</text>
+
+  <rect x="40" y="514" width="350" height="58" rx="9" fill="#1C1B18" stroke="#302D28"/>
+  <text x="56" y="537" font-size="13" font-weight="650" fill="#F4F1EA">可写状态严格隔离于 ${PLUGIN_DATA}</text>
+  <text x="56" y="557" font-size="11" fill="#A39E93">一次性防重放 relay_grants.json + 可选索引缓存</text>
+
+  <rect x="406" y="514" width="348" height="58" rx="9" fill="#1C1B18" stroke="#302D28"/>
+  <text x="422" y="537" font-size="13" font-weight="650" fill="#F4F1EA">极简 Agent 注入占用</text>
+  <text x="422" y="557" font-size="11" fill="#A39E93">rules/AGENTS.md（&lt;300 B）+ 按需加载 SKILL.md</text>
+
+  <rect x="770" y="514" width="350" height="58" rx="9" fill="#1C1B18" stroke="#302D28"/>
+  <text x="786" y="537" font-size="13" font-weight="650" fill="#F4F1EA">可复现跨平台发布 CI</text>
+  <text x="786" y="557" font-size="11" fill="#A39E93">SHA 锁定 Actions · gitleaks · --remap-path-prefix</text>
+</svg>

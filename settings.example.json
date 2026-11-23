@@ -1,0 +1,84 @@
+{
+  "$schema": "./settings.schema.json",
+  "version": 1,
+  "context": {
+    "default_limit": 512000,
+    "warn_threshold": 220000,
+    "compact_threshold": 270000,
+    "critical_threshold": 350000,
+    "est_post_compact_base": 20500,
+    "subagent_silent_timeout_sec": 3600,
+    "enable_disk_cache": true
+  },
+  "pricing": {
+    "currency_code": "USD",
+    "currency_symbol": "$",
+    "fx_rate": 1.0,
+    "overrides": [],
+    "models": {
+      "my-custom-pro": {
+        "input_per_m": 3.0,
+        "cache_read_per_m": 0.15,
+        "cache_write_per_m": 3.0,
+        "output_per_m": 15.0,
+        "context_limit": 512000
+      }
+    },
+    "short_labels": [
+      { "contains": "My Custom Pro", "label": "CustomPro" }
+    ]
+  },
+  "budgets": {
+    "default_tier": "standard",
+    "tiers": {
+      "custom_heavy": {
+        "label": "Custom Heavy (512k)",
+        "min_ctx": 260000,
+        "recommend_ctx": 300000,
+        "urgent_ctx": 415000,
+        "min_turns_since_ckpt": 16,
+        "min_remaining_turns": 8
+      }
+    },
+    "rules": [
+      {
+        "match_any": ["my-custom-pro"],
+        "tier": "custom_heavy"
+      }
+    ]
+  },
+  "guards": {
+    "boot": {
+      "enabled": true,
+      "max_total_bytes": 2400,
+      "state_files": [
+        {
+          "workspace_root": "~/Code/my-project",
+          "path": "STATUS.md",
+          "format": "markdown_bullets",
+          "prefix": "[project STATUS.md]",
+          "max_bytes": 800
+        }
+      ],
+      "extra_rules": [
+        {
+          "workspace_root": "~/Code/my-project",
+          "tag": "local-hints",
+          "max_bytes": 600,
+          "lines": [
+            "Prefer running focused module tests before full suites."
+          ]
+        }
+      ]
+    },
+    "exec_gate": {
+      "enabled": true,
+      "min_sync_wait_ms": 5000,
+      "target_sync_wait_ms": 10000,
+      "respect_is_daemon": true,
+      "exempt_patterns": [
+        "(?:^|\\s)ssh\\s+.*-f\\b"
+      ]
+    }
+  }
+}
