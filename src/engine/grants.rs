@@ -80,7 +80,7 @@ fn now_sec() -> f64 {
 
 fn random_hex_16() -> String {
     let mut bytes = [0u8; 8];
-    if getrandom::getrandom(&mut bytes).is_err() {
+    if getrandom::fill(&mut bytes).is_err() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
