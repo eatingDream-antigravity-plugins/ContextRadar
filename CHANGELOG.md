@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.1](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.0.0...v1.0.1) (2026-11-23)
+
+
+### Documentation
+
+* **readme:** rewrite bilingual READMEs for human readability and usage focus ([#4](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/4)) ([59e1298](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/59e1298e01b7356a4c10c9a9f51a5fb7a895649c))
+
 ## [1.0.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases/tag/v1.0.0) (2026-11-24)
 
 ### Features
