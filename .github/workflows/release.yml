@@ -131,7 +131,7 @@ jobs:
     name: Build (macOS arm64 + x86_64)
     needs: prepare-release
     if: ${{ inputs.platforms != 'linux' }}
-    runs-on: macos-latest
+    runs-on: macos-15-intel
     permissions:
       contents: write
     env:
