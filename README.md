@@ -7,7 +7,7 @@
 **See how full your Antigravity context really is, why a turn got slow, and when it's actually worth compacting or starting fresh.**
 
 [![CI](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/static/v1?label=release&message=v1.1.0&color=D97757)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases)<!-- x-release-please-version -->
+[![Release](https://img.shields.io/static/v1?label=release&message=v1.2.0&color=D97757)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases)<!-- x-release-please-version -->
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555)
 
