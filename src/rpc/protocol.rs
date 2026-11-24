@@ -22,16 +22,16 @@ use crate::i18n::select_display_cost;
 use crate::rpc::tools::{
     fmt_k, resources_spec, summarize_snapshot_text, tools_spec, APP_MIME, HANDOFF_URI, PANEL_URI,
 };
-use crate::settings::{expand_tilde, PANEL_HTML_ENV};
+use crate::settings::{expand_tilde, ACP_PROXY_ENV, PANEL_HTML_ENV};
 
 pub const SERVER_NAME: &str = "context-radar-mcp";
-pub const SERVER_VERSION: &str = "1.0.0";
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROTOCOL_VERSION: &str = "2025-03-26";
 const MAX_HTML_BYTES: usize = 10 * 1024 * 1024;
 const BOOT_MARKER: &str = "/*__CONTEXT_RADAR_BOOT__*/";
-/// Short burst-coalescing TTL so back-to-back `resources/read` + `context_radar_overview`
-/// calls during the same pane open share one snapshot without ever serving stale data.
-pub const SWR_STALE_TTL: Duration = Duration::from_millis(500);
+/// Short burst-coalescing TTL (paired with live disk-activity validation so any new LLM
+/// request invalidates the cache immediately without waiting for TTL expiry).
+pub const SWR_STALE_TTL: Duration = Duration::from_millis(150);
 
 fn serialize_boot_json(val: &Value) -> String {
     let raw = serde_json::to_string(val).unwrap_or_else(|_| "null".to_string());
@@ -87,11 +87,63 @@ struct RenderedPanelCache {
     html: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct DiskActivitySig {
+    sum_mtime_ns: i128,
+    sum_size: u64,
+    wal_mtime_ns: i128,
+    wal_size: u64,
+    conv_mtime_ns: i128,
+    active_wal_hash: u64,
+}
+
+fn quick_disk_activity_sig(data_root: &Path) -> DiskActivitySig {
+    let stat_pair = |p: &Path| -> (i128, u64) {
+        match fs::metadata(p) {
+            Ok(m) => (
+                (m.mtime() as i128) * 1_000_000_000 + (m.mtime_nsec() as i128),
+                m.size(),
+            ),
+            Err(_) => (0, 0),
+        }
+    };
+    let (sum_mtime_ns, sum_size) = stat_pair(&data_root.join("conversation_summaries.db"));
+    let (wal_mtime_ns, wal_size) = stat_pair(&data_root.join("conversation_summaries.db-wal"));
+    let conv_dir = data_root.join("conversations");
+    let (conv_mtime_ns, _) = stat_pair(&conv_dir);
+    // Also fold every active `.db-wal` (and `.db` mtime/size) so new LLM turns written
+    // directly into an existing conversation SQLite WAL immediately invalidate burst cache
+    // even when parent directory mtime does not change on APFS/ext4.
+    let mut active_wal_hash: u64 = 0xcbf2_9ce4_8422_2325;
+    if let Ok(entries) = fs::read_dir(&conv_dir) {
+        for entry in entries.flatten() {
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str() else { continue };
+            if name.ends_with(".db-wal") || name.ends_with(".db") {
+                if let Ok(m) = entry.metadata() {
+                    let ns = (m.mtime() as i128) * 1_000_000_000 + (m.mtime_nsec() as i128);
+                    let mix = (ns as u64) ^ m.size().rotate_left(17) ^ (m.ino().rotate_left(7));
+                    active_wal_hash = active_wal_hash.wrapping_add(mix).wrapping_mul(0x100000001b3);
+                }
+            }
+        }
+    }
+    DiskActivitySig {
+        sum_mtime_ns,
+        sum_size,
+        wal_mtime_ns,
+        wal_size,
+        conv_mtime_ns,
+        active_wal_hash,
+    }
+}
+
 #[derive(Clone)]
 struct CachedDefaultSnap {
     snap: OverviewSnapshot,
     built_at: Instant,
     grants_rev: u64,
+    disk_sig: DiskActivitySig,
 }
 
 #[derive(Default)]
@@ -139,12 +191,13 @@ impl SwrHub {
         self.cached.read().ok().and_then(|g| g.clone())
     }
 
-    fn put_cached(&self, snap: OverviewSnapshot, grants_rev: u64) {
+    fn put_cached(&self, snap: OverviewSnapshot, grants_rev: u64, disk_sig: DiskActivitySig) {
         if let Ok(mut g) = self.cached.write() {
             *g = Some(CachedDefaultSnap {
                 snap,
                 built_at: Instant::now(),
                 grants_rev,
+                disk_sig,
             });
         }
     }
@@ -400,6 +453,7 @@ impl McpDaemon {
                         .unwrap_or_else(default_panel_html_path);
                     let html_loaded = hub.load_html(&panel_path).ok();
 
+                    let disk_sig = quick_disk_activity_sig(&bg_engine.ledger.data_root);
                     let rev_before = hub.grants_rev();
                     let mut snap = bg_engine.build_overview_snapshot(25, false, false, "", None);
                     attach_grant_and_rehash_inner(bg_engine, bg_grants, &mut snap, None, None);
@@ -423,7 +477,7 @@ impl McpDaemon {
                             );
                         }
                     }
-                    hub.put_cached(snap, final_rev);
+                    hub.put_cached(snap, final_rev, disk_sig);
                 };
 
                 run_refresh(&mut bg_engine, &mut bg_grants, &hub, &panel_override);
@@ -511,6 +565,10 @@ impl McpDaemon {
         if cached.built_at.elapsed() >= SWR_STALE_TTL {
             return None;
         }
+        let cur_sig = quick_disk_activity_sig(&self.engine.ledger.data_root);
+        if cached.disk_sig != cur_sig {
+            return None;
+        }
         let active_lang = self.engine.rates.get_lang().as_str();
         if cached.snap.lang != active_lang {
             return None;
@@ -567,8 +625,18 @@ impl McpDaemon {
         } else {
             0
         };
-        let require_auto = claim_mode == "auto_handoff";
-        let check_subs = if matches!(claim_mode, "auto_handoff" | "manual_handoff") {
+        let require_auto = matches!(
+            claim_mode,
+            "auto_handoff" | "auto_compact" | "acp_auto_compact"
+        );
+        let check_subs = if matches!(
+            claim_mode,
+            "auto_handoff"
+                | "manual_handoff"
+                | "auto_compact"
+                | "manual_compact"
+                | "acp_auto_compact"
+        ) {
             Some(running_subs)
         } else {
             None
@@ -641,6 +709,25 @@ impl McpDaemon {
                 }
                 let txt = if res.ok {
                     "ok".to_string()
+                } else {
+                    res.reason.clone().unwrap_or_else(|| "error".to_string())
+                };
+                json!({
+                    "content": [{ "type": "text", "text": txt }],
+                    "structuredContent": res,
+                    "isError": false
+                })
+            }
+            "record_compact" => {
+                let res = self.grants.record_compact(
+                    &str_arg(args, "grant_id"),
+                    &str_arg_or(args, "status", "sent"),
+                );
+                if res.ok {
+                    self.on_grants_mutated();
+                }
+                let txt = if res.ok {
+                    res.reason.clone().unwrap_or_else(|| "ok".to_string())
                 } else {
                     res.reason.clone().unwrap_or_else(|| "error".to_string())
                 };
@@ -871,6 +958,9 @@ impl McpDaemon {
         self.on_grants_mutated();
         let settings = self.grants.get_settings();
         let allow_auto = settings.allow_auto_handoff;
+        let acp_proxy_active = env::var(ACP_PROXY_ENV)
+            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+            .unwrap_or(false);
 
         let card = json!({
             "mode": "handoff_card",
@@ -883,33 +973,39 @@ impl McpDaemon {
             "grant_id": grant.grant_id,
             "auto_fire": grant.auto_fire,
             "allow_auto_handoff": allow_auto,
+            "acp_proxy_active": acp_proxy_active,
             "running_subagent_count": running_subs,
             "preserve_points": grant.preserve_points,
             "resume_task": grant.resume_task,
             "scratch_note_path": grant.scratch_note_path,
             "compact_command": grant.compact_command,
             "handoff_prompt": grant.handoff_prompt,
-            "handoff_conversation_id": ""
+            "handoff_conversation_id": "",
+            "compact_status": ""
         });
 
         let guide = if zh {
-            let auto_line = if allow_auto && grant.auto_fire {
-                "面板「自动接力」已开启且 running_subagent_count == 0：当本工具内联卡片或同工作区 Context Radar 侧边栏处于可见挂载状态时，前端会自动核销票据并通过官方 target:new 拉起新会话；若当前在无界面的 agy CLI、折叠卡片或后台标签页中运行，请展开卡片/侧边栏点击拉起，或直接复制下方 `/compact` 指令。"
+            let auto_line = if kind == "compact" && acp_proxy_active && allow_auto && grant.auto_fire {
+                "检测到官方 ACP 自动压缩代理（acp-proxy / acp-run）已挂载且 running_subagent_count == 0：请立即结束本轮回复（不要再调用额外工具），代理将在本轮结束后通过官方 ACP `session/prompt` 原地执行下方 `/compact` 指令并无缝续跑。"
+            } else if allow_auto && grant.auto_fire {
+                "面板「自动接力」已开启且 running_subagent_count == 0：当本工具内联卡片或同工作区 Context Radar 侧边栏处于可见挂载状态时，前端会自动核销票据并触发官方接力/压缩流程；若当前在无界面的 agy CLI、折叠卡片或后台标签页中运行，请使用 `context-radar-mcp acp-proxy` / `acp-run`，或展开面板点击/复制下方 `/compact` 指令。"
             } else {
-                "本次未启用自动拉起（auto_fire=false 或面板开关已关闭）：已保留当前会话窗口，可在卡片或侧边栏复制 `/compact` 指令，或手动点击拉起新会话。"
+                "本次未启用自动触发（auto_fire=false 或面板开关已关闭）：已保留当前会话窗口，可在卡片或侧边栏一键执行/复制 `/compact` 指令，或手动点击拉起新会话。"
             };
             format!(
-                "已通过模型档位、冷却、回本轮数与 running_subagent_count == 0 校验，票据已绑定至当前会话与工作区。\n- `/compact` 指令：`{}`\n- 官方接力说明：{auto_line}",
+                "已通过模型档位、冷却、回本轮数与 running_subagent_count == 0 校验，票据已绑定至当前会话与工作区。\n- `/compact` 指令：`{}`\n- 官方执行说明：{auto_line}",
                 grant.compact_command
             )
         } else {
-            let auto_line = if allow_auto && grant.auto_fire {
-                "Auto-handoff is enabled and running_subagent_count == 0: when the inline handoff card or a matching-workspace Context Radar side pane is mounted and visible, the webview will claim this single-use grant and launch a background chat via official `target:new`. Note: in headless `agy` CLI, collapsed tool cards, or hidden tabs, `target:new` waits until a UI pane opens—expand the card/pane or paste the `/compact` command below."
+            let auto_line = if kind == "compact" && acp_proxy_active && allow_auto && grant.auto_fire {
+                "Official ACP auto-compact proxy (`acp-proxy` / `acp-run`) is active and running_subagent_count == 0: end this turn cleanly now (avoid further tool calls) so the proxy can execute native ACP `session/prompt` `/compact` in-place on the same session and resume automatically."
+            } else if allow_auto && grant.auto_fire {
+                "Auto-handoff is enabled and running_subagent_count == 0: when the inline card or matching-workspace Context Radar side pane is mounted and visible, the webview will claim this single-use grant automatically; in headless `agy` CLI or ACP editors, run via `context-radar-mcp acp-proxy` / `acp-run`, or copy the `/compact` command below."
             } else {
-                "Auto-launch is off for this grant (`auto_fire=false` or paused in panel): the current window stays active; copy the `/compact` command or click 'Launch New Chat' in the panel when ready."
+                "Auto-launch is off for this grant (`auto_fire=false` or paused in panel): the current window stays active; run or copy the `/compact` command or click 'Launch New Chat' in the panel when ready."
             };
             format!(
-                "Passed all model-tier, cooldown, break-even, and running_subagent_count == 0 gates (grant scoped to this conversation and workspace).\n- Ready `/compact` command: `{}`\n- Relay status: {auto_line}",
+                "Passed all model-tier, cooldown, break-even, and running_subagent_count == 0 gates (grant scoped to this conversation and workspace).\n- Ready `/compact` command: `{}`\n- Dispatch status: {auto_line}",
                 grant.compact_command
             )
         };
@@ -991,8 +1087,10 @@ impl McpDaemon {
             "context_radar_overview" => {
                 let act = str_arg_or(args, "action", "snapshot");
                 match act.as_str() {
-                    "set_prefs" | "record_relay" | "dismiss_grant" | "claim_grant"
-                    | "distill_slice" | "create_handoff" => Ok(self.handle_ui_action(&act, args)),
+                    "set_prefs" | "record_relay" | "record_compact" | "dismiss_grant"
+                    | "claim_grant" | "distill_slice" | "create_handoff" => {
+                        Ok(self.handle_ui_action(&act, args))
+                    }
                     "turns" => Ok(self.handle_turns_tool(args)),
                     _ => {
                         let t0 = Instant::now();
@@ -1030,9 +1128,11 @@ impl McpDaemon {
 
                         if is_default_query && !if_digest.is_empty() && !fresh {
                             let cur_lang = self.engine.rates.get_lang().as_str();
+                            let cur_sig = quick_disk_activity_sig(&self.engine.ledger.data_root);
                             if let Some(cached) = self.swr.get_cached() {
                                 if cached.grants_rev == self.swr.grants_rev()
                                     && cached.snap.lang == cur_lang
+                                    && cached.disk_sig == cur_sig
                                     && cached.snap.digest != if_digest
                                     && cached.built_at.elapsed() < SWR_STALE_TTL
                                 {
@@ -1068,9 +1168,10 @@ impl McpDaemon {
                         };
                         self.attach_grant_and_rehash(&mut snap, cid_opt, ws_opt);
 
+                        let disk_sig = quick_disk_activity_sig(&self.engine.ledger.data_root);
                         if is_default_query {
                             let rev = self.swr.grants_rev();
-                            self.swr.put_cached(snap.clone(), rev);
+                            self.swr.put_cached(snap.clone(), rev, disk_sig);
                         }
 
                         if !if_digest.is_empty() && if_digest == snap.digest {
@@ -1399,17 +1500,14 @@ impl McpDaemon {
         let panel_path = self.resolve_panel_path();
 
         let html = if uri == PANEL_URI {
-            let snap = match self.get_fresh_default_snapshot() {
-                Some(s) => s,
-                None => {
-                    let mut s = self.engine.build_overview_snapshot(25, false, false, "", None);
-                    self.attach_grant_and_rehash(&mut s, None, None);
-                    s.stale = false;
-                    let rev = self.swr.grants_rev();
-                    self.swr.put_cached(s.clone(), rev);
-                    s
-                }
-            };
+            // Opening the panel ALWAYS computes a live synchronous incremental snapshot (<1 ms warm)
+            // so initial SSR boot data never lags behind a just-completed LLM request.
+            let disk_sig = quick_disk_activity_sig(&self.engine.ledger.data_root);
+            let mut snap = self.engine.build_overview_snapshot(25, false, false, "", None);
+            self.attach_grant_and_rehash(&mut snap, None, None);
+            snap.stale = false;
+            let rev = self.swr.grants_rev();
+            self.swr.put_cached(snap.clone(), rev, disk_sig);
 
             let (template, mtime_ns, size) = self
                 .swr

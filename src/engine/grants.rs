@@ -187,9 +187,9 @@ pub fn build_compact_command_for_lang(
         }
         (true, false) => {
             if zh {
-                format!("/compact 保留关键上下文与约束：{pts}")
+                format!("/compact 保留关键上下文与约束：{pts}。压缩完成后请简要确认已保留要点并等待后续指令。")
             } else {
-                format!("/compact Preserve key context and constraints: {pts}")
+                format!("/compact Preserve key context and constraints: {pts}. After compaction, briefly confirm preserved points and stop to await further instructions.")
             }
         }
         (false, true) => format!("/compact {nxt}"),
@@ -359,6 +359,10 @@ pub struct RelayGrant {
     pub handoff_conversation_id: String,
     #[serde(default)]
     pub handoff_at: f64,
+    #[serde(default)]
+    pub compact_status: String,
+    #[serde(default)]
+    pub compact_dispatched_at: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_subagent_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -627,6 +631,8 @@ impl RelayGrantStore {
             handoff_prompt,
             handoff_conversation_id: String::new(),
             handoff_at: 0.0,
+            compact_status: String::new(),
+            compact_dispatched_at: 0.0,
             running_subagent_count: None,
             allow_auto_handoff: None,
         };
@@ -686,6 +692,14 @@ impl RelayGrantStore {
                         rec.claimed_at
                     };
                     return (ref_now - h_ts) <= RELAY_DISPLAY_SEC;
+                }
+                if !rec.compact_status.is_empty() {
+                    let c_ts = if rec.compact_dispatched_at > 0.0 {
+                        rec.compact_dispatched_at
+                    } else {
+                        rec.claimed_at
+                    };
+                    return (ref_now - c_ts) <= RELAY_DISPLAY_SEC;
                 }
                 false
             })
@@ -937,6 +951,93 @@ impl RelayGrantStore {
             grant_id: Some(grant_id.to_string()),
             handoff_conversation_id: Some(saved_cid),
         }
+    }
+
+    pub fn record_compact(&mut self, grant_id: &str, status: &str) -> ActionOutcome {
+        if grant_id.is_empty() {
+            return ActionOutcome {
+                ok: false,
+                reason: Some("missing_grant_id".into()),
+                grant_id: None,
+                handoff_conversation_id: None,
+            };
+        }
+        let mut data = self.load();
+        let Some(rec) = data.grants.get_mut(grant_id) else {
+            return ActionOutcome {
+                ok: false,
+                reason: Some("not_found".into()),
+                grant_id: None,
+                handoff_conversation_id: None,
+            };
+        };
+        rec.claimed = true;
+        if rec.claimed_at <= 0.0 {
+            rec.claimed_at = now_sec();
+        }
+        rec.compact_status = status.trim().to_string();
+        rec.compact_dispatched_at = now_sec();
+        let saved = rec.compact_status.clone();
+        self.save(&data);
+        ActionOutcome {
+            ok: true,
+            reason: Some(saved),
+            grant_id: Some(grant_id.to_string()),
+            handoff_conversation_id: None,
+        }
+    }
+
+    /// Find the latest unclaimed, non-expired `kind == "compact"` grant scoped to `conversation_id`.
+    /// Used by official ACP orchestrators (`acp-proxy` / `acp-run`) at clean turn boundaries.
+    pub fn find_pending_compact_grant(
+        &mut self,
+        conversation_id: &str,
+        workspace: Option<&str>,
+        require_auto: bool,
+        now_override: Option<f64>,
+    ) -> Option<RelayGrant> {
+        let cid_req = conversation_id.trim();
+        if cid_req.is_empty() {
+            return None;
+        }
+        let ref_now = now_override.unwrap_or_else(now_sec);
+        let ws_f = workspace.map(norm_ws_str).filter(|s| !s.is_empty());
+        let data = self.load();
+        if require_auto && !data.settings.allow_auto_handoff {
+            return None;
+        }
+        let mut cands: Vec<RelayGrant> = data
+            .grants
+            .values()
+            .filter(|rec| {
+                if rec.dismissed || rec.claimed || rec.kind != "compact" {
+                    return false;
+                }
+                if require_auto && !rec.auto_fire {
+                    return false;
+                }
+                if (ref_now - rec.created_at) > rec.ttl_sec {
+                    return false;
+                }
+                if rec.conversation_id != cid_req {
+                    return false;
+                }
+                if let Some(ref ws_req) = ws_f {
+                    let has_grant_ws = !rec.workspace.is_empty() || !rec.workspaces.is_empty();
+                    if has_grant_ws && !workspaces_overlap(&rec.workspace, &rec.workspaces, ws_req) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        cands.sort_by(|a, b| {
+            b.created_at
+                .partial_cmp(&a.created_at)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        cands.into_iter().next()
     }
 
     pub fn dismiss_grant(&mut self, grant_id: &str) -> ActionOutcome {

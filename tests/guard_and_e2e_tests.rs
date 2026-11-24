@@ -474,7 +474,10 @@ fn test_full_stdio_mcp_daemon_e2e_with_synthetic_fixture() {
         "params": { "protocolVersion": "2025-03-26", "capabilities": {} }
     }));
     assert_eq!(init["result"]["serverInfo"]["name"], "context-radar-mcp");
-    assert_eq!(init["result"]["serverInfo"]["version"], "1.0.0");
+    assert_eq!(
+        init["result"]["serverInfo"]["version"],
+        env!("CARGO_PKG_VERSION")
+    );
 
     let tools = rpc(json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }));
     let tool_arr = tools["result"]["tools"].as_array().unwrap();

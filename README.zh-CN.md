@@ -7,7 +7,7 @@
 **看清 Antigravity 的上下文到底占了多少、为什么突然变慢，以及什么时候才值得 `/compact` 或开新对话。**
 
 [![CI](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/eatingDream-antigravity-plugins/context-radar-mcp?color=D97757&label=release)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases)
+[![Release](https://img.shields.io/badge/release-v1.1.0-D97757)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases)<!-- x-release-please-version -->
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-555)
 
@@ -25,10 +25,10 @@ Context Radar 在 Antigravity 里提供了一个实时面板，把上下文占�
 
 ## 它能帮你做什么
 
-- **实时看清上下文和消耗**：在侧边栏直观查看当前会话和子 Agent 的上下文占比、缓存命中率、输出速度和估算费用。
+- **实时看清上下文和消耗**：在侧边栏直观查看当前会话和子 Agent 的上下文占比、缓存命中率、输出速度和估算费用；打开/切回面板时立即刷新，并在后台保持轻量 `if_digest` 轮询与按会话 WAL 变更感知，避免显示延迟。
 - **定位变慢的原因**：自动区分"新的一轮正常未命中""对话中途意外断缓存"和"压缩后的首次重建"，一眼知道慢在哪。
 - **找出撑大上下文的罪魁祸首**：快速定位哪几轮历史最占空间，让 Agent 把早期冗长记录浓缩成简短摘要存到 `scratch/`，不用带着一堆旧日志继续跑。
-- **判断 `/compact` 或换新对话划不划算**：结合当前模型预算和回本轮数给出建议，确认合适后再弹出 `/compact` 或一键交接新对话的卡片，避免盲目压缩。
+- **判断 `/compact` 或换新对话划不划算**：结合当前模型预算和回本轮数给出建议；在 Antigravity App 中提供一键「执行 /compact」「复制 /compact」与官方 `target:new` 新会话交接卡片，在 `agy CLI` 与 ACP 编辑器中则可通过 `acp-proxy` / `acp-run` 全自动原地执行官方 `/compact`。
 - **顺手的小保护**：防止 Agent 把几秒钟就能跑完的命令过早丢到后台；如果你在配置里指定了工作区状态文件，也能在开新会话时自动带入。
 
 ## 安装
@@ -70,6 +70,28 @@ CONTEXT_RADAR_VERSION=v1.0.0 ANTIGRAVITY_PLUGINS_DIR=~/.gemini/config/plugins \
 | `context_radar_hotspots` | 找出历史里最占空间的片段，并按需整理成摘要写入 `scratch/`。 |
 | `context_radar_prepare_handoff` | 评估现在执行 `/compact` 或开新对话是否划算。 |
 | `context_radar_commit_handoff` | 条件满足后生成 `/compact` 或新对话交接卡片。 |
+
+### 通过官方 ACP 协议实现 Agent 自主原地 `/compact`（`agy acp`）
+
+针对 **Antigravity CLI（`agy`）** 与支持 ACP 的编辑器（**Zed、JetBrains IDE、Android Studio、Xcode、VS Code ACP Client**），Context Radar 内置了两个完全遵循官方 ACP v1 协议的子命令，可在同一条 ACP 会话连接上安全执行原生 `/compact`（含 compact-and-continue 自动续跑）：
+
+- **编辑器透明代理（`acp-proxy`）**：将编辑器的自定义 ACP Agent 启动命令从 `agy acp` 改为 `context-radar-mcp acp-proxy`：
+
+```json
+{
+  "command": "~/.gemini/config/plugins/context-radar-mcp/bin/context-radar-mcp",
+  "args": ["acp-proxy"]
+}
+```
+
+当 Agent 在对话中调用 `context_radar_commit_handoff(kind: "compact", auto_fire: true, ...)` 并结束本轮回复后，`acp-proxy` 会自动核销单次票据，并在同一条 ACP 连接上注入原生 `session/prompt` `/compact ...` 完成原地压缩并无缝续跑，无需并发读写冲突。
+
+- **无头 CLI / CI 编排器（`acp-run`）**：在终端或自动化流水线中直接托管长任务并自动压缩：
+
+```sh
+~/.gemini/config/plugins/context-radar-mcp/bin/context-radar-mcp acp-run \
+  --cwd /path/to/project --auto-approve --prompt "完成迁移并运行完整验证"
+```
 
 ## 自定义配置（可选）
 

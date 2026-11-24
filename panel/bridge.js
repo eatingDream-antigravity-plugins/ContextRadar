@@ -1,9 +1,10 @@
 // Lightweight SEP-1865 (2026-01-26) MCP Apps PostMessage bridge for Context Radar MCP.
 export const PROTOCOL_VERSION = "2026-01-26";
 
+const BG = "--color-background-primary";
 export function applyDocumentTheme(t) {
   if (t !== "dark" && t !== "light") return;
-  const d = document, e = d.documentElement, bg = `var(--color-background-primary,${t === "light" ? "#FAF8F5" : "#141311"})`;
+  const d = document, e = d.documentElement, bg = `var(${BG},${t === "light" ? "#FAF8F5" : "#141311"})`;
   if (e.getAttribute("data-theme") !== t) e.setAttribute("data-theme", t);
   e.style.colorScheme = t; e.style.backgroundColor = bg;
   if (d.body) d.body.style.backgroundColor = bg;
@@ -15,11 +16,11 @@ const isOpaqueBg = (raw) => {
   const s = String(raw ?? "").trim();
   if (!s || /^(transparent|none|initial|inherit|unset|revert(?:-layer)?)$/i.test(s)) return false;
   const h = s.match(/^#([0-9a-f]{4}|[0-9a-f]{8})$/i)?.[1];
-  if (h) return (h.length === 4 ? parseInt(h[3] + h[3], 16) : parseInt(h.slice(6), 16)) >= 230;
+  if (h) return parseInt(h.length === 4 ? h[3] + h[3] : h.slice(6), 16) >= 230;
   const m = s.match(/^(?:rgba?|hsla?)\([^,/) ]+(?:[\s,]+[^,/) ]+){2}\s*[,/]\s*([^)\s]+)\s*\)$/i)
     || s.match(/^[a-z-]+\([^)]*\/\s*([^)\s]+)\s*\)$/i);
   if (!m) return true;
-  const a = m[1].endsWith("%") ? parseFloat(m[1]) / 100 : parseFloat(m[1]);
+  const a = parseFloat(m[1]) / (m[1].endsWith("%") ? 100 : 1);
   return !Number.isNaN(a) && a >= 0.9;
 };
 
@@ -28,7 +29,7 @@ export function applyHostStyleVariables(vars, target = document.documentElement)
   for (const [k, v] of Object.entries(vars)) {
     if (k.startsWith("--") && v != null) {
       const val = String(v).trim();
-      if (val && (k !== "--color-background-primary" || isOpaqueBg(val))) target.style.setProperty(k, val);
+      if (val && (k !== BG || isOpaqueBg(val))) target.style.setProperty(k, val);
     }
   }
 }

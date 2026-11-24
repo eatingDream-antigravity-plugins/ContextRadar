@@ -19,7 +19,7 @@ use crate::ledger::index_db::DbVersionSig;
 use crate::ledger::sqlite_ro::{stat_db_stamp, FileStamp, LedgerReader};
 use crate::ledger::{is_safe_id, SummaryRecord, TurnSample};
 use crate::settings::{
-    default_data_root, default_plugin_data_dir, expand_tilde, SettingsWatcher,
+    default_data_root_for_plugin_data, default_plugin_data_dir, expand_tilde, SettingsWatcher,
     CONVERSATION_ID_ENV, DEFAULT_CONTEXT_LIMIT, DISABLE_DISK_CACHE_ENV, INDEX_CACHE_PATH_ENV,
     WORKSPACE_ENV,
 };
@@ -1277,7 +1277,8 @@ impl TelemetryEngine {
         rates: Option<RateTable>,
         explicit_disk_cache: Option<Option<PathBuf>>,
     ) -> Self {
-        let root = data_root.unwrap_or_else(default_data_root);
+        let root = data_root
+            .unwrap_or_else(|| default_data_root_for_plugin_data(plugin_data_dir.as_deref()));
         let mut rate_table =
             rates.unwrap_or_else(|| RateTable::new(SettingsWatcher::new(None), None, None));
         let disk_path = resolve_disk_cache_path(

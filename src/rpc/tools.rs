@@ -99,6 +99,7 @@ pub fn tools_spec() -> Value {
                             "set_prefs",
                             "claim_grant",
                             "record_relay",
+                            "record_compact",
                             "dismiss_grant",
                             "distill_slice",
                             "create_handoff"
@@ -128,12 +129,23 @@ pub fn tools_spec() -> Value {
                     },
                     "claim_mode": {
                         "type": "string",
-                        "enum": ["auto_handoff", "manual_handoff", "manual"],
+                        "enum": [
+                            "auto_handoff",
+                            "manual_handoff",
+                            "auto_compact",
+                            "manual_compact",
+                            "acp_auto_compact",
+                            "manual"
+                        ],
                         "description": "Grant claim verification mode."
                     },
                     "handoff_conversation_id": {
                         "type": "string",
                         "description": "New conversationId returned by official target:new when action='record_relay'."
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "Compaction dispatch status when action='record_compact' (e.g. 'sent', 'acp_compacted', 'fallback_copied')."
                     },
                     "start_step": {
                         "type": "integer",
