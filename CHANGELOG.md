@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.0.0...v1.1.0) (2026-11-24)
+
+
+### Features
+
+* add Gemini 4 180s prefill TTL, mid-loop sub-reasons, and Carbon concurrency warning ([#9](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/9)) ([864307f](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/864307fa0e4a0fea5981709767c642eef902cf72))
+* complete Antigravity model pricing, scoped grants, bilingual UI, and safety docs ([#8](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/8)) ([95ce974](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/95ce974d3f369223bad5a99b7b2eb8351526700a))
+
+
+### Documentation
+
+* **readme:** rewrite bilingual READMEs for human readability and usage focus ([#4](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/4)) ([59e1298](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/59e1298e01b7356a4c10c9a9f51a5fb7a895649c))
+
 ## [1.0.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases/tag/v1.0.0) (2026-11-24)
 
 ### Features
