@@ -176,24 +176,23 @@ fn iso(ts: f64) -> String {
 }
 
 #[test]
-fn test_builtin_generic_defaults_when_config_disabled() {
-    let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
-    assert_eq!(DEFAULT_CONTEXT_LIMIT, 512_000);
+fn test_builtin_defaults_and_external_user_config_live_reload() {
+    {
+        let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
+        assert_eq!(DEFAULT_CONTEXT_LIMIT, 512_000);
 
-    let p = rates.resolve_rate("gemini-3-pro", "Gemini 3 Pro (High)");
-    assert_eq!((p.input_per_m, p.cache_read_per_m, p.output_per_m), (2.0, 0.20, 12.0));
-    assert_eq!(p.context_limit, 512_000);
+        let p = rates.resolve_rate("gemini-3-pro", "Gemini 3 Pro (High)");
+        assert_eq!((p.input_per_m, p.cache_read_per_m, p.output_per_m), (2.0, 0.20, 12.0));
+        assert_eq!(p.context_limit, 512_000);
 
-    let cl = rates.resolve_rate("claude-sonnet-4", "Claude Sonnet 4");
-    assert_eq!((cl.input_per_m, cl.cache_read_per_m, cl.output_per_m), (3.0, 0.30, 15.0));
+        let cl = rates.resolve_rate("claude-sonnet-4", "Claude Sonnet 4");
+        assert_eq!((cl.input_per_m, cl.cache_read_per_m, cl.output_per_m), (3.0, 0.30, 15.0));
 
-    let (fx, src) = rates.get_fx_rate();
-    assert!((fx - DEFAULT_FX_RATE).abs() < 1e-4);
-    assert_eq!(src, "default");
-}
+        let (fx, src) = rates.get_fx_rate();
+        assert!((fx - DEFAULT_FX_RATE).abs() < 1e-4);
+        assert_eq!(src, "default");
+    }
 
-#[test]
-fn test_external_user_config_overrides_pricing_tiers_and_live_reloads() {
     let td = TempDir::new().unwrap();
     let ext_fx = td.path().join("fx.json");
     fs::write(&ext_fx, serde_json::to_string(&json!({"rate": 6.85})).unwrap()).unwrap();
@@ -741,7 +740,7 @@ fn filetime_set(path: &Path, sec: i64) -> bool {
 }
 
 #[test]
-fn test_relay_grant_lifecycle_and_anti_replay() {
+fn test_relay_grant_lifecycle_anti_replay_and_workspace_scoping() {
     let td = TempDir::new().unwrap();
     let mut gs = RelayGrantStore::new(td.path().join("relay_grants.json"));
     assert!(gs.get_settings().allow_auto_handoff);
@@ -796,6 +795,61 @@ fn test_relay_grant_lifecycle_and_anti_replay() {
     let dis = gs.dismiss_grant(&grant.grant_id);
     assert!(dis.ok);
     assert!(gs.get_pending_grant(None).is_none());
+
+    // Scoped grants reject cross-workspace and cross-conversation claims
+    let cid_a = "92000000-0000-0000-0000-000000000011";
+    let scoped = gs.create_grant_scoped(
+        "Keep A",
+        "Finish A",
+        true,
+        cid_a,
+        "/workspace/project-a",
+        &["/workspace/project-a".to_string()],
+        30,
+        0,
+        "handoff",
+        "",
+        "Project A",
+        Lang::En,
+    );
+
+    assert!(gs.get_pending_grant_scoped(None, Some("/workspace/project-b"), None).is_none());
+    assert!(gs.get_pending_grant_scoped(None, Some("/workspace/project-a"), None).is_some());
+
+    let wrong_cid = gs.claim_grant_scoped(
+        &scoped.grant_id,
+        Some("92000000-0000-0000-0000-000000000099"),
+        Some("/workspace/project-a"),
+        Some(30),
+        Some(0),
+        Some(0),
+        true,
+    );
+    assert!(!wrong_cid.claimed);
+    assert_eq!(wrong_cid.reason.as_deref(), Some("conversation_mismatch"));
+
+    let wrong_ws = gs.claim_grant_scoped(
+        &scoped.grant_id,
+        Some(cid_a),
+        Some("/workspace/project-b"),
+        Some(30),
+        Some(0),
+        Some(0),
+        true,
+    );
+    assert!(!wrong_ws.claimed);
+    assert_eq!(wrong_ws.reason.as_deref(), Some("workspace_mismatch"));
+
+    let scoped_ok = gs.claim_grant_scoped(
+        &scoped.grant_id,
+        Some(cid_a),
+        Some("/workspace/project-a"),
+        Some(30),
+        Some(0),
+        Some(0),
+        true,
+    );
+    assert!(scoped_ok.claimed);
 }
 
 #[test]
@@ -1304,65 +1358,6 @@ fn test_hotspot_attribution_excludes_outgoing_step_and_detects_partial_cold() {
     assert_eq!(rows[0].cold_cache_kind, "mid_loop_cold");
 }
 
-#[test]
-fn test_scoped_relay_grants_reject_cross_workspace_and_cross_conversation() {
-    let td = TempDir::new().unwrap();
-    let mut gs = RelayGrantStore::new(td.path().join("relay_grants.json"));
-    let cid_a = "92000000-0000-0000-0000-000000000011";
-    let grant = gs.create_grant_scoped(
-        "Keep A",
-        "Finish A",
-        true,
-        cid_a,
-        "/workspace/project-a",
-        &["/workspace/project-a".to_string()],
-        30,
-        0,
-        "handoff",
-        "",
-        "Project A",
-        Lang::En,
-    );
-
-    assert!(gs.get_pending_grant_scoped(None, Some("/workspace/project-b"), None).is_none());
-    assert!(gs.get_pending_grant_scoped(None, Some("/workspace/project-a"), None).is_some());
-
-    let wrong_cid = gs.claim_grant_scoped(
-        &grant.grant_id,
-        Some("92000000-0000-0000-0000-000000000099"),
-        Some("/workspace/project-a"),
-        Some(30),
-        Some(0),
-        Some(0),
-        true,
-    );
-    assert!(!wrong_cid.claimed);
-    assert_eq!(wrong_cid.reason.as_deref(), Some("conversation_mismatch"));
-
-    let wrong_ws = gs.claim_grant_scoped(
-        &grant.grant_id,
-        Some(cid_a),
-        Some("/workspace/project-b"),
-        Some(30),
-        Some(0),
-        Some(0),
-        true,
-    );
-    assert!(!wrong_ws.claimed);
-    assert_eq!(wrong_ws.reason.as_deref(), Some("workspace_mismatch"));
-
-    let ok = gs.claim_grant_scoped(
-        &grant.grant_id,
-        Some(cid_a),
-        Some("/workspace/project-a"),
-        Some(30),
-        Some(0),
-        Some(0),
-        true,
-    );
-    assert!(ok.claimed);
-}
-
 fn sample_turn(
     turn_index: usize,
     began: f64,
@@ -1397,7 +1392,7 @@ fn sample_turn(
 }
 
 #[test]
-fn test_gemini4_180s_prefill_ttl_vs_non_gemini4_300s() {
+fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
     assert!(is_gemini_4_model("gemini-4-carbon-high", "Gemini 4 Carbon (High)"));
     assert!(is_gemini_4_model("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"));
     assert!(!is_gemini_4_model("claude-sonnet-4-5", "Claude Sonnet 4.5"));
@@ -1465,11 +1460,6 @@ fn test_gemini4_180s_prefill_ttl_vs_non_gemini4_300s() {
     assert_eq!(g4_plan.cache_ttl_sec, 180);
     let cl_plan = prepare_handoff_plan(Some(&cl_tel), 12, 0, &mut rates);
     assert_eq!(cl_plan.cache_ttl_sec, 300);
-}
-
-#[test]
-fn test_mid_loop_sub_reasons_slow_turn_replica_and_model_switch() {
-    let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
 
     // 1) slow_turn_self_expiry: idle_gap = 7s (<60s) AND curr.began - prev.began = 192s (>=180s)
     // 2) replica_spillover: partial rollback to turn 1 prompt (22_847)

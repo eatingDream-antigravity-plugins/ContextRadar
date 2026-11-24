@@ -194,7 +194,7 @@ fn iso(ts: f64) -> String {
 }
 
 #[test]
-fn test_pb_thinking_response_split_legacy_fallback_and_start_ts() {
+fn test_pb_rich_step_checkpoint_and_error_decoding() {
     // Rich usage with field 9 (response) and field 10 (thinking)
     let rich_meta = make_step_meta_rich(
         1_700_000_100,
@@ -238,10 +238,7 @@ fn test_pb_thinking_response_split_legacy_fallback_and_start_ts() {
     assert!(decode_step_metadata(&inflight).is_none());
     assert!((extract_step_start_ts(&inflight) - 1_700_000_333.0).abs() < 1e-6);
     assert_eq!(extract_step_start_ts(&[]), 0.0);
-}
 
-#[test]
-fn test_pb_checkpoint_summary_len_and_error_summary_sanitization() {
     // Checkpoint payload field 30 -> inner field 5
     let ckpt = make_checkpoint_payload(22_418);
     assert_eq!(extract_checkpoint_summary_len(&ckpt), 22_418);
