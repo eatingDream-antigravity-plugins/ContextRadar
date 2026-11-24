@@ -281,6 +281,332 @@ test("panel supports immediate open/focus refresh, continuous background polling
   // 3. Official ui/message Send /compact action and record_compact persistence
   assert.ok(viewSrc.includes("record_compact"), "view.js must record compact dispatch status");
   assert.ok(viewSrc.includes("manual_compact"), "view.js must claim grants with manual_compact mode");
+  assert.ok(viewSrc.includes("auto_compact"), "view.js must claim grants with auto_compact mode");
   assert.ok(html.includes("Send /compact"), "panel.html must include EN Send /compact label");
   assert.ok(html.includes("执行 /compact"), "panel.html must include ZH Send /compact label");
+});
+
+test("auto_compact gating enforces inline ownership, side-pane canDirectCid, subagent/auto flags, and official ui/message without target:new", async () => {
+  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
+  const normWsM = viewSrc.match(/const normWs = [\s\S]*?;\n/);
+  const sameWsM = viewSrc.match(/const sameWs = [\s\S]*?\n\};/);
+  const getHeroM = viewSrc.match(/const getHero = [\s\S]*?;\n/);
+  const canDirectM = viewSrc.match(/const canDirectCid = [\s\S]*?\n\};/);
+  const canAutoM = viewSrc.match(/function canAutoRelay\([\s\S]*?\n\}/);
+  const maybeAutoM = viewSrc.match(/function maybeAutoRelay\([\s\S]*?\n\}/);
+  const execM = viewSrc.match(/async function executeDispatch\([\s\S]*?\n\}/);
+  assert.ok(normWsM && sameWsM && getHeroM && canDirectM && canAutoM && maybeAutoM && execM, "view.js must define auto_compact helpers");
+
+  const timers = [];
+  const sentMessages = [];
+  const uiActions = [];
+  const copied = [];
+  const sandbox = {
+    D: { hidden: false },
+    AG_M: "com.google.antigravity/message",
+    K_CID: "conversation_id",
+    K_HCID: "handoff_conversation_id",
+    K_AAH: "allow_auto_handoff",
+    K_RSC: "running_subagent_count",
+    K_LCT: "latest_context_tokens",
+    T_WS: ["Wait", "等待"],
+    num: (v) => Number(v) || 0,
+    tr: (e) => e,
+    canMessage: true,
+    canCallTools: true,
+    allowAutoHandoff: true,
+    ownerCid: "",
+    snapshot: {
+      daemon_workspace: "/ws/a",
+      summary: { running_main_count: 1 },
+      sessions: [{ id: "c1", is_active: true, workspace: "/ws/a" }],
+      pending_grant: null,
+    },
+    handoffCard: null,
+    handoffStatus: "pending",
+    busyGrantId: null,
+    attemptedGrants: new Set(),
+    autoCmpTimer: null,
+    pg: () => sandbox.snapshot?.pending_grant,
+    cancelAutoCmp: () => { sandbox.autoCmpTimer = null; },
+    isHandoffLocked: () => /^(sen|com|old)/.test(sandbox.handoffStatus),
+    st: (fn, ms) => { const h = { fn, ms, cancelled: false }; timers.push(h); return h; },
+    ct: (h) => { if (h) h.cancelled = true; },
+    render: () => {},
+    flashMicro: () => {},
+    cpCompact: async (cmd) => { copied.push(cmd); return true; },
+    copyText: async (txt) => { copied.push(txt); return true; },
+    extractRelayCid: () => "",
+    uiSc: async (args) => { uiActions.push(args); return { claimed: true }; },
+    recAct: async (action, gid, extra) => { uiActions.push({ action, grant_id: gid, ...extra }); },
+    sendTxt: async (text, meta) => { sentMessages.push({ text, meta }); return sandbox._sendReply(); },
+    _sendReply: () => ({ isError: false }),
+  };
+
+  vm.runInNewContext(
+    `${normWsM[0]}\n${sameWsM[0]}\n${getHeroM[0]}\n${canDirectM[0]}\n${canAutoM[0]}\n${maybeAutoM[0]}\n${execM[0]}\nthis.canAutoRelay = canAutoRelay; this.maybeAutoRelay = maybeAutoRelay; this.executeDispatch = executeDispatch;`,
+    sandbox
+  );
+
+  const mkGrant = (ov = {}) => ({
+    grant_id: "g1",
+    kind: "compact",
+    conversation_id: "c1",
+    workspace: "/ws/a",
+    compact_command: "/compact preserve X",
+    handoff_prompt: "handoff...",
+    auto_fire: true,
+    allow_auto_handoff: true,
+    acp_proxy_active: false,
+    claimed: false,
+    compact_status: "",
+    handoff_conversation_id: "",
+    running_subagent_count: 0,
+    ...ov,
+  });
+
+  // 1. Inline card allows auto_compact even when running_main_count > 1
+  sandbox.snapshot.summary.running_main_count = 3;
+  assert.equal(sandbox.canAutoRelay(mkGrant(), true), "auto_compact");
+  assert.equal(sandbox.canAutoRelay(mkGrant({ running_subagent_count: 1 }), true), "");
+  assert.equal(sandbox.canAutoRelay(mkGrant({ auto_fire: false }), true), "");
+  assert.equal(sandbox.canAutoRelay(mkGrant({ allow_auto_handoff: false }), true), "");
+  assert.equal(sandbox.canAutoRelay(mkGrant({ claimed: true }), true), "");
+  assert.equal(sandbox.canAutoRelay(mkGrant({ compact_status: "sent" }), true), "");
+  assert.equal(sandbox.canAutoRelay(mkGrant({ acp_proxy_active: true }), true), "");
+
+  // 2. Side pane (isInline=false) enforces canDirectCid: blocked when >1 main without ownerCid
+  assert.equal(sandbox.canAutoRelay(mkGrant(), false), "");
+  // Allowed when ownerCid matches cid even with >1 main
+  sandbox.ownerCid = "c1";
+  assert.equal(sandbox.canAutoRelay(mkGrant(), false), "auto_compact");
+  // Blocked when ownerCid mismatches
+  sandbox.ownerCid = "c-other";
+  assert.equal(sandbox.canAutoRelay(mkGrant(), false), "");
+  // Allowed when !ownerCid and single active main in matching workspace
+  sandbox.ownerCid = "";
+  sandbox.snapshot.summary.running_main_count = 1;
+  assert.equal(sandbox.canAutoRelay(mkGrant(), false), "auto_compact");
+  // Blocked when workspace mismatches or allowAutoHandoff is toggled off
+  assert.equal(sandbox.canAutoRelay(mkGrant({ workspace: "/ws/other" }), false), "");
+  sandbox.allowAutoHandoff = false;
+  assert.equal(sandbox.canAutoRelay(mkGrant(), false), "");
+  sandbox.allowAutoHandoff = true;
+
+  // 3. Inline maybeAutoRelay waits 1500ms settle window, claims auto_compact, sends ui/message without target:new, records sent
+  const gInline = mkGrant({ grant_id: "g-inline" });
+  sandbox.handoffCard = gInline;
+  sandbox.handoffStatus = "pending";
+  sandbox.maybeAutoRelay(gInline, true);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 1500, "inline auto_compact must wait 1500ms settle window");
+  assert.equal(sentMessages.length, 0, "must not send before settle window elapses");
+  const flush = () => new Promise((r) => setImmediate(r));
+  timers[0].fn();
+  await flush();
+  assert.equal(uiActions[0].action, "claim_grant");
+  assert.equal(uiActions[0].claim_mode, "auto_compact");
+  assert.deepEqual(sentMessages[0], { text: "/compact preserve X", meta: 0 });
+  assert.deepEqual(uiActions[1], { action: "record_compact", grant_id: "g-inline", status: "sent" });
+  assert.equal(sandbox.handoffStatus, "compacted");
+
+  // 4. Side-pane auto_compact waits 2000ms and records fallback_copied detail on host isError
+  uiActions.length = 0; sentMessages.length = 0; copied.length = 0; timers.length = 0;
+  const gPane = mkGrant({ grant_id: "g-pane" });
+  sandbox.snapshot.pending_grant = gPane;
+  sandbox._sendReply = () => ({ isError: true, content: [{ type: "text", text: "host rejected" }] });
+  sandbox.maybeAutoRelay(gPane, false);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 2000, "side-pane auto_compact must wait 2000ms settle window");
+  timers[0].fn();
+  await flush();
+  assert.equal(uiActions[0].claim_mode, "auto_compact");
+  assert.deepEqual(uiActions[1], { action: "record_compact", grant_id: "g-pane", status: "fallback_copied:host rejected" });
+  assert.deepEqual(copied, ["/compact preserve X"]);
+
+  // 5. Exception during ui/message records error detail and falls back to clipboard copy
+  uiActions.length = 0; copied.length = 0;
+  sandbox._sendReply = () => { throw new Error("Method not found"); };
+  await sandbox.executeDispatch(mkGrant({ grant_id: "g-err" }), "auto_compact", true, true);
+  assert.deepEqual(uiActions[1], { action: "record_compact", grant_id: "g-err", status: "error:Method not found" });
+  assert.deepEqual(copied, ["/compact preserve X"]);
+});
+
+test("non-force periodic poll updates DOM on digest change, skips render on unchanged, clears error on recovery, and uses 15s timeout", async () => {
+  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
+  const applyM = viewSrc.match(/function applySnapshot\([\s\S]*?\n\}/);
+  const refreshM = viewSrc.match(/async function refreshSnapshot\([\s\S]*?\n\}/);
+  assert.ok(applyM && refreshM, "view.js must define applySnapshot and refreshSnapshot");
+
+  let renderedTokens = 100000;
+  let renderCount = 0;
+  const calls = [];
+  let replyQueue = [];
+
+  const sandbox = {
+    DB: "dashboard",
+    D: { hidden: false },
+    DE: { lang: "en" },
+    M: Math,
+    performance: { now: () => 100 },
+    now: () => 1000,
+    st: () => 1,
+    ct: () => {},
+    num: (v) => Number(v) || 0,
+    tr: (e) => e,
+    parseLoc: () => "",
+    K_AAH: "allow_auto_handoff",
+    viewMode: "dashboard",
+    canCallTools: true,
+    inFlightPoll: false,
+    queuedForce: false,
+    refreshing: false,
+    showSpinner: false,
+    spinTimer: null,
+    filterTab: "active",
+    lastDigest: "d1",
+    snapshot: { mode: "snapshot", digest: "d1", sessions: [{ id: "c1", latest_context_tokens: 100000 }] },
+    loadingInitial: false,
+    errorText: "",
+    serverMs: 0,
+    ewmaRttMs: null,
+    pollErrors: 0,
+    lastSyncTs: 0,
+    unchangedHits: 0,
+    langLocked: true,
+    lang: "en",
+    allowAutoHandoff: true,
+    cancelPoll: () => {},
+    scheduleNextPoll: () => {},
+    maybeAutoRelay: () => {},
+    flashMicro: () => {},
+    render: () => {
+      renderCount += 1;
+      renderedTokens = sandbox.snapshot?.sessions?.[0]?.latest_context_tokens ?? renderedTokens;
+    },
+    callTool: async (name, args, opts) => {
+      calls.push({ name, args, opts });
+      return replyQueue.shift();
+    },
+  };
+
+  vm.runInNewContext(
+    `${applyM[0]}\n${refreshM[0]}\nthis.refreshSnapshot = refreshSnapshot;`,
+    sandbox
+  );
+
+  // 1. Non-force periodic poll with changed digest MUST render updated tokens and pass 15s timeout
+  replyQueue.push({
+    isError: false,
+    structuredContent: {
+      mode: "snapshot",
+      digest: "d2",
+      server_ms: 4,
+      sessions: [{ id: "c1", latest_context_tokens: 245000 }],
+    },
+  });
+  await sandbox.refreshSnapshot(false);
+  assert.equal(calls[0].name, "context_radar_overview");
+  assert.equal(calls[0].args.if_digest, "d1");
+  assert.equal(calls[0].opts?.timeout, 15000, "overview poll must pass 15s timeout");
+  assert.equal(renderCount, 1, "non-force poll with changed digest MUST call render()");
+  assert.equal(renderedTokens, 245000, "rendered DOM tokens must update to 245000");
+  assert.equal(sandbox.lastDigest, "d2");
+
+  // 2. Non-force periodic poll with unchanged:true MUST NOT mutate DOM (renderCount unchanged)
+  replyQueue.push({
+    isError: false,
+    structuredContent: { mode: "snapshot", unchanged: true, digest: "d2", server_ms: 2 },
+  });
+  await sandbox.refreshSnapshot(false);
+  assert.equal(renderCount, 1, "unchanged non-force poll must keep 0 DOM churn");
+  assert.equal(sandbox.unchangedHits, 1);
+
+  // 3. Recovering from a transient error on an unchanged:true poll MUST re-render to clear error banner
+  sandbox.errorText = "Sync: timeout";
+  replyQueue.push({
+    isError: false,
+    structuredContent: { mode: "snapshot", unchanged: true, digest: "d2", server_ms: 2 },
+  });
+  await sandbox.refreshSnapshot(false);
+  assert.equal(sandbox.errorText, "");
+  assert.equal(renderCount, 2, "recovering from transient error on unchanged poll must call render()");
+});
+
+test("kept-alive pane reveal hooks (ResizeObserver, IntersectionObserver, onhostcontextchanged, pointerenter) trigger fresh overview refresh", () => {
+  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
+  const canForceM = viewSrc.match(/const canForceDb = [\s\S]*?;\n/);
+  const forceNowM = viewSrc.match(/const forceNow = [\s\S]*?;\n/);
+  const setupObsM = viewSrc.match(/function setupRevealObservers\([\s\S]*?\n\}/);
+  const hostChgM = viewSrc.match(/bridge\.onhostcontextchanged = [\s\S]*?;\n/);
+  const ptrM = viewSrc.match(/onD\("pointerenter"[\s\S]*?\);\n/);
+  assert.ok(canForceM && forceNowM && setupObsM && hostChgM && ptrM, "view.js must define kept-alive reveal hooks");
+
+  let roCb = null, ioCb = null, ptrCb = null;
+  let fakeNow = 1000;
+  const refreshes = [];
+  const listeners = {};
+  const sandbox = {
+    DB: "dashboard",
+    D: { hidden: false },
+    DE: { clientWidth: 420, clientHeight: 800 },
+    viewMode: "dashboard",
+    canCallTools: true,
+    lastForceTs: 0,
+    lastSyncTs: 0,
+    obsRo: null,
+    obsIo: null,
+    now: () => fakeNow,
+    onD: (ev, fn, opts) => { listeners[ev] = { fn, opts }; if (ev === "pointerenter") ptrCb = fn; },
+    ResizeObserver: class {
+      constructor(cb) { roCb = cb; }
+      observe() {}
+      disconnect() {}
+    },
+    IntersectionObserver: class {
+      constructor(cb) { ioCb = cb; }
+      observe() {}
+      disconnect() {}
+    },
+    bridge: {},
+    syncHostContext: () => {},
+    refreshSnapshot: (force, showSynced) => { refreshes.push({ force, showSynced }); },
+  };
+
+  vm.runInNewContext(
+    `${canForceM[0]}\n${forceNowM[0]}\n${setupObsM[0]}\n${hostChgM[0]}\n${ptrM[0]}\nsetupRevealObservers();`,
+    sandbox
+  );
+
+  // 1. ResizeObserver: 0x0 -> 420x800 triggers fresh refresh immediately
+  roCb([{ contentRect: { width: 0, height: 0 } }]);
+  assert.equal(refreshes.length, 0, "collapsing to 0x0 must not refresh");
+  fakeNow += 500;
+  roCb([{ contentRect: { width: 420, height: 800 } }]);
+  assert.deepEqual(refreshes, [{ force: true, showSynced: false }]);
+
+  // 2. IntersectionObserver: false -> true triggers fresh refresh immediately
+  ioCb([{ isIntersecting: false }]);
+  assert.equal(refreshes.length, 1);
+  fakeNow += 500;
+  ioCb([{ isIntersecting: true }]);
+  assert.equal(refreshes.length, 2);
+  assert.deepEqual(refreshes[1], { force: true, showSynced: false });
+
+  // 3. onhostcontextchanged({ containerDimensions }) triggers fresh refresh immediately
+  fakeNow += 500;
+  sandbox.bridge.onhostcontextchanged({ containerDimensions: { width: 420, height: 800 } });
+  assert.equal(refreshes.length, 3);
+  assert.deepEqual(refreshes[2], { force: true, showSynced: false });
+
+  // 4. passive pointerenter triggers fresh refresh when stale (>900ms since lastSyncTs)
+  assert.equal(listeners.pointerenter?.opts?.passive, true, "pointerenter must be passive");
+  sandbox.lastSyncTs = fakeNow;
+  fakeNow += 400;
+  ptrCb();
+  assert.equal(refreshes.length, 3, "pointerenter within 900ms must not spam refresh");
+  fakeNow += 600;
+  ptrCb();
+  assert.equal(refreshes.length, 4, "pointerenter after >900ms must trigger fresh refresh");
+  assert.deepEqual(refreshes[3], { force: true, showSynced: false });
 });
