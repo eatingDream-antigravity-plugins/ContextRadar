@@ -536,8 +536,8 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
     assert_eq!(sa.total_response_tokens, 900);
     assert!((sa.thinking_share_pct - 70.0).abs() < 0.01);
     assert_eq!(sa.latest_ttft_ms, 1_000);
-    // Latest turn (r3): out=800, total=4000ms, ttft=1000ms -> stream_tps = 800 / 3.0 = 266.7
-    assert!((sa.latest_stream_tps - 266.7).abs() < 0.1);
+    // Latest turn (r3): thinking=600, response=200, total=4000ms, ttft=1000ms -> post-TTFT stream_tps = 200 / 3.0 = 66.7
+    assert!((sa.latest_stream_tps - 66.7).abs() < 0.1);
     // e2e_tps across r1 (1000/5=200), r2 (1200/6=200), r3 (800/4=200) -> median 200.0
     assert!((sa.e2e_tps - 200.0).abs() < 0.1);
     // Last loop = r2 + r3 (2 steps, user input 3 triggered after_turn_start=Some(true) on r2)
@@ -840,4 +840,56 @@ fn test_schema_v1_to_v2_index_cache_migration_and_mcp_json_contract() {
     assert_eq!(t0["thinking_tokens"], 750);
     assert_eq!(t0["response_tokens"], 250);
     assert_eq!(t0["e2e_tps"], 200.0);
+}
+
+#[test]
+fn test_stream_tps_accounts_for_thinking_time_inside_ttft() {
+    use context_radar_mcp::ledger::TurnSample;
+
+    // 1) Reasoning model where Antigravity ttft_ms spans prefill + thinking (109ms post-TTFT for 31 response tokens)
+    let reasoning = TurnSample {
+        step_idx: 1,
+        turn_index: 1,
+        timestamp: 1000.0,
+        model: "gemini-4-neon".into(),
+        model_display: "Gemini 4 Neon".into(),
+        input_tokens: 3000,
+        cache_read: 100_000,
+        cache_write: 0,
+        output_tokens: 226,
+        thinking_tokens: 195,
+        response_tokens: 31,
+        ttft_ms: 6566,
+        total_ms: 6675,
+        response_id: "r1".into(),
+        step_type: 15,
+        is_checkpoint: false,
+        after_turn_start: None,
+        after_checkpoint: false,
+    };
+    // Must compute 31 / 0.109 = 284.4 t/s, NOT 226 / 0.109 = 2073.4 t/s
+    assert!((reasoning.stream_tps() - 284.4).abs() < 0.2, "got {}", reasoning.stream_tps());
+    assert!((reasoning.e2e_tps() - 33.86).abs() < 0.1, "got {}", reasoning.e2e_tps());
+
+    // 2) Pure thinking turn (0 response tokens) falls back to E2E throughput
+    let pure_think = TurnSample {
+        output_tokens: 700,
+        thinking_tokens: 700,
+        response_tokens: 0,
+        ttft_ms: 6900,
+        total_ms: 7000,
+        ..reasoning.clone()
+    };
+    assert!((pure_think.stream_tps() - 100.0).abs() < 0.1, "got {}", pure_think.stream_tps());
+
+    // 3) Legacy non-thinking turn uses full output_tokens / (total_ms - ttft_ms)
+    let legacy = TurnSample {
+        output_tokens: 600,
+        thinking_tokens: 0,
+        response_tokens: 0,
+        ttft_ms: 1000,
+        total_ms: 4000,
+        ..reasoning
+    };
+    assert!((legacy.stream_tps() - 200.0).abs() < 0.1, "got {}", legacy.stream_tps());
 }

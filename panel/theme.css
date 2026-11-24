@@ -20,7 +20,7 @@ html:not([data-can-msg="1"]) .cr-cap-msg,html[data-ct="0"] .ct0,[hidden]{display
 @media(prefers-reduced-motion:reduce){.dt.run,.dt.wait,.spn{animation:none!important}}
 *{box-sizing:border-box}:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
 .sh{max-width:920px;margin:0 auto;padding:10px 12px 16px;gap:9px}.sh.inl{padding:4px}
-.sh,.hr,.bn,.cd,.dtl,.ty,.bx,.gg,.pl,.ls{display:flex;flex-direction:column}
+.sh,.hr,.bn,.cd,.dl,.ty,.bx,.gg,.pl,.ls,.hs{display:flex;flex-direction:column}
 .mt,.gl,.pv,.ps,.id,.cx,.ag,.tb{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .tt,.rt,.pv,.ps{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mt,.mi,.bd,.id,.ct,.tb th,.tb td{white-space:nowrap}
@@ -50,7 +50,7 @@ html:not([data-can-msg="1"]) .cr-cap-msg,html[data-ct="0"] .ct0,[hidden]{display
 .ib{width:24px;height:24px;justify-content:center;padding:0}
 .lg{padding:1.5px;gap:1px}.lo{padding:2px 5.5px}.lo.on,.sb.on{background:var(--sf);color:var(--ac)}
 .hr,.bn,.cd,.ls,.bx,.em,.er,.cw{background:var(--sf);border:1px solid var(--ln);border-radius:10px}
-.hr,.bn,.cd{padding:10px 12px;gap:8px}.dl,.ty{gap:7px}
+.hr,.bn,.cd{padding:10px 12px;gap:8px}.hs{margin:2px -12px -10px;border-top:1px solid var(--ls)}.dl,.ty{gap:7px}
 .hr.lc,.cd.lc,.er,.bt.c{border-color:#d95f597a}.hr.lw,.cd.lw,.cw,.bt.w{border-color:#d4a14b73}
 .bn{gap:6px}.bn.dn{border-color:var(--ok)}
 .hh,.br,.bds,.ac{flex-wrap:wrap}.hm{gap:6px;min-width:90px;flex:1}
@@ -78,7 +78,7 @@ html:not([data-can-msg="1"]) .cr-cap-msg,html[data-ct="0"] .ct0,[hidden]{display
 .csw.on .th{transform:translateX(10px)}
 .sg{display:inline-flex;background:var(--wl);padding:2px;gap:2px}
 .sb{border:1px solid transparent;background:0 0;padding:3px 8px}
-.ls{overflow:hidden}.it+.it{border-top:1px solid var(--ls)}
+.hr,.ls{overflow:hidden}.it+.it{border-top:1px solid var(--ls)}
 .rw{gap:6px;cursor:pointer}.er,.cw,.rw{padding:7px 10px}
 .rw:hover{background:var(--wl)}.rw.sub{padding:6px 10px 6px 22px;background:#8881}
 .rw.lc{box-shadow:inset 3px 0 0 var(--cr)}.rw.lw{box-shadow:inset 3px 0 0 var(--wn)}
