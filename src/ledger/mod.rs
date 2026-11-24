@@ -15,6 +15,10 @@ pub struct TurnSample {
     pub cache_read: u64,
     pub cache_write: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub thinking_tokens: u64,
+    #[serde(default)]
+    pub response_tokens: u64,
     pub ttft_ms: u64,
     pub total_ms: u64,
     pub response_id: String,
@@ -22,6 +26,45 @@ pub struct TurnSample {
     pub is_checkpoint: bool,
     pub after_turn_start: Option<bool>,
     pub after_checkpoint: bool,
+}
+
+fn default_neg_one() -> i64 {
+    -1
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiveStepProbe {
+    #[serde(default)]
+    pub live_phase: String,
+    #[serde(default)]
+    pub live_started_ts: f64,
+    #[serde(default = "default_neg_one")]
+    pub live_active_step_idx: i64,
+    #[serde(default)]
+    pub live_step_waiting: bool,
+    #[serde(default)]
+    pub live_model: String,
+    #[serde(default)]
+    pub live_error: String,
+    #[serde(default = "default_neg_one")]
+    pub live_error_step_idx: i64,
+    #[serde(default)]
+    pub compact_summary_bytes: usize,
+}
+
+impl Default for LiveStepProbe {
+    fn default() -> Self {
+        Self {
+            live_phase: String::new(),
+            live_started_ts: 0.0,
+            live_active_step_idx: -1,
+            live_step_waiting: false,
+            live_model: String::new(),
+            live_error: String::new(),
+            live_error_step_idx: -1,
+            compact_summary_bytes: 0,
+        }
+    }
 }
 
 impl TurnSample {
@@ -113,6 +156,14 @@ impl TurnSample {
             return 0.0;
         }
         (self.output_tokens as f64) / ((gen_ms as f64) / 1000.0)
+    }
+
+    #[inline]
+    pub fn e2e_tps(&self) -> f64 {
+        if self.output_tokens == 0 || self.total_ms == 0 {
+            return 0.0;
+        }
+        (self.output_tokens as f64) / ((self.total_ms as f64) / 1000.0)
     }
 }
 

@@ -14,8 +14,11 @@ use serde_json::Value;
 
 use crate::ledger::index_db::{DbVersionSig, IndexDbCache, ParsedLedgerState};
 use crate::ledger::journal_tail::JournalTailCache;
-use crate::ledger::{is_safe_id, SummaryRecord, TurnSample};
-use crate::wire::pb_cursor::{decode_step_metadata, extract_gen_model};
+use crate::ledger::{is_safe_id, LiveStepProbe, SummaryRecord, TurnSample};
+use crate::wire::pb_cursor::{
+    decode_step_metadata, extract_checkpoint_summary_len, extract_error_summary, extract_gen_model,
+    extract_step_start_and_gen_idx,
+};
 
 fn ann_title_regex() -> &'static BytesRegex {
     static RE: OnceLock<BytesRegex> = OnceLock::new();
@@ -585,8 +588,16 @@ impl LedgerReader {
         cid: &str,
         prefetched: Option<&FileStamp>,
     ) -> Arc<Vec<TurnSample>> {
+        self.read_turns_and_probe(cid, prefetched).0
+    }
+
+    pub fn read_turns_and_probe(
+        &mut self,
+        cid: &str,
+        prefetched: Option<&FileStamp>,
+    ) -> (Arc<Vec<TurnSample>>, LiveStepProbe) {
         if !is_safe_id(cid) {
-            return Arc::new(Vec::new());
+            return (Arc::new(Vec::new()), LiveStepProbe::default());
         }
         let db_path = self.conv_dir.join(format!("{cid}.db"));
         let owned_stamp;
@@ -597,13 +608,13 @@ impl LedgerReader {
                     owned_stamp = s;
                     &owned_stamp
                 }
-                None => return Arc::new(Vec::new()),
+                None => return (Arc::new(Vec::new()), LiveStepProbe::default()),
             },
         };
 
         if let Some(cached) = self.db_cache.get(cid) {
             if cached.dev == stamp.dev && cached.ino == stamp.ino && cached.sig == stamp.sig {
-                return Arc::clone(&cached.turns);
+                return (Arc::clone(&cached.turns), cached.live_probe.clone());
             }
         }
 
@@ -612,7 +623,7 @@ impl LedgerReader {
             if let Some(dc) = &mut self.disk_cache {
                 if let Some(disk_state) = dc.load(cid, stamp.dev, stamp.ino) {
                     if disk_state.sig == stamp.sig {
-                        let out = Arc::clone(&disk_state.turns);
+                        let out = (Arc::clone(&disk_state.turns), disk_state.live_probe.clone());
                         self.db_cache.insert(cid.to_string(), disk_state);
                         return out;
                     }
@@ -629,7 +640,7 @@ impl LedgerReader {
                 && stamp.sig.db_size >= prev.sig.db_size
             {
                 if let Some(updated) = parse_db_incremental(&db_path, prev, stamp) {
-                    let out = Arc::clone(&updated.turns);
+                    let out = (Arc::clone(&updated.turns), updated.live_probe.clone());
                     if let Some(dc) = &mut self.disk_cache {
                         dc.save(cid, &updated);
                     }
@@ -640,9 +651,9 @@ impl LedgerReader {
         }
 
         let Some(state) = parse_db_full(&db_path, stamp) else {
-            return Arc::new(Vec::new());
+            return (Arc::new(Vec::new()), LiveStepProbe::default());
         };
-        let out = Arc::clone(&state.turns);
+        let out = (Arc::clone(&state.turns), state.live_probe.clone());
         if let Some(dc) = &mut self.disk_cache {
             dc.save(cid, &state);
         }
@@ -786,6 +797,8 @@ fn parse_db_incremental(
                     cache_read: parsed.cache_read,
                     cache_write: parsed.cache_write,
                     output_tokens: parsed.output,
+                    thinking_tokens: parsed.thinking_tokens,
+                    response_tokens: parsed.response_tokens,
                     ttft_ms,
                     total_ms,
                     response_id: parsed.response_id,
@@ -823,6 +836,8 @@ fn parse_db_incremental(
                     cache_read: parsed.cache_read,
                     cache_write: parsed.cache_write,
                     output_tokens: parsed.output,
+                    thinking_tokens: parsed.thinking_tokens,
+                    response_tokens: parsed.response_tokens,
                     ttft_ms,
                     total_ms,
                     response_id: resp_id,
@@ -848,6 +863,8 @@ fn parse_db_incremental(
             cache_read: parsed.cache_read,
             cache_write: parsed.cache_write,
             output_tokens: parsed.output,
+            thinking_tokens: parsed.thinking_tokens,
+            response_tokens: parsed.response_tokens,
             ttft_ms,
             total_ms,
             response_id: resp_id.clone(),
@@ -864,10 +881,18 @@ fn parse_db_incremental(
         turns_mut.push(new_turn);
     }
 
+    let live_probe = probe_live_step_state(
+        &conn,
+        prev.has_step_type,
+        &prev.turns,
+        &prev.models,
+        prev.max_gen_idx,
+    );
     prev.dev = stamp.dev;
     prev.ino = stamp.ino;
     prev.sig = stamp.sig.clone();
     prev.max_step_idx = new_max_step.max(cur_max_step);
+    prev.live_probe = live_probe;
     Some(prev)
 }
 
@@ -978,6 +1003,8 @@ fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState>
                     cache_read: parsed.cache_read,
                     cache_write: parsed.cache_write,
                     output_tokens: parsed.output,
+                    thinking_tokens: parsed.thinking_tokens,
+                    response_tokens: parsed.response_tokens,
                     ttft_ms,
                     total_ms,
                     response_id: parsed.response_id,
@@ -1006,6 +1033,8 @@ fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState>
             cache_read: parsed.cache_read,
             cache_write: parsed.cache_write,
             output_tokens: parsed.output,
+            thinking_tokens: parsed.thinking_tokens,
+            response_tokens: parsed.response_tokens,
             ttft_ms,
             total_ms,
             response_id: resp_id.clone(),
@@ -1030,6 +1059,8 @@ fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState>
         }
     }
 
+    let live_probe = probe_live_step_state(&conn, has_step_type, &turns, &models, max_gen_idx);
+
     Some(ParsedLedgerState {
         dev: stamp.dev,
         ino: stamp.ino,
@@ -1043,5 +1074,153 @@ fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState>
         saw_turn_start,
         by_resp,
         turns: Arc::new(turns),
+        live_probe,
     })
+}
+
+/// O(log N) indexed live step probe on an already-open read-only conversation connection.
+/// Gracefully ignores missing columns (`status`, `error_details`, `step_payload`) on minimal/legacy schemas.
+fn probe_live_step_state(
+    conn: &Connection,
+    has_step_type: bool,
+    turns: &[TurnSample],
+    models: &HashMap<i64, (String, String)>,
+    max_gen_idx: i64,
+) -> LiveStepProbe {
+    let mut probe = LiveStepProbe::default();
+    if !has_step_type {
+        return probe;
+    }
+
+    // 1. Active in-flight steps via `idx_steps_status`
+    if let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT idx, step_type, status, metadata
+         FROM steps
+         WHERE status IN (1, 2, 8, 9, 11)
+         ORDER BY idx DESC
+         LIMIT 4",
+    ) {
+        let mut active_rows: Vec<(i64, i32, i32, Option<Vec<u8>>)> = Vec::with_capacity(4);
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                let idx = row.get::<_, i64>(0).unwrap_or(-1);
+                let stype = row.get::<_, Option<i32>>(1).unwrap_or(Some(0)).unwrap_or(0);
+                let status = row.get::<_, Option<i32>>(2).unwrap_or(Some(0)).unwrap_or(0);
+                let meta = row
+                    .get_ref(3)
+                    .ok()
+                    .and_then(|v| v.as_bytes().ok())
+                    .map(|b| b.to_vec());
+                active_rows.push((idx, stype, status, meta));
+            }
+        }
+        let chosen = if let Some(ckpt_row) = active_rows.iter().find(|r| r.1 == 23) {
+            probe.live_phase = "compacting".to_string();
+            Some(ckpt_row)
+        } else if let Some(non_user) = active_rows.iter().find(|r| r.1 != 14) {
+            probe.live_phase = if non_user.1 == 15 {
+                "llm".to_string()
+            } else {
+                "tool".to_string()
+            };
+            Some(non_user)
+        } else {
+            None
+        };
+        if let Some((idx, _stype, status, meta)) = chosen {
+            probe.live_active_step_idx = *idx;
+            probe.live_step_waiting = matches!(*status, 1 | 8 | 9 | 11);
+            let (start_ts, gen_idx_opt) = meta
+                .as_deref()
+                .map(extract_step_start_and_gen_idx)
+                .unwrap_or((0.0, None));
+            probe.live_started_ts = start_ts;
+            let resolved_gen_idx = gen_idx_opt.or_else(|| {
+                if probe.live_phase == "compacting" && max_gen_idx >= 0 {
+                    Some(max_gen_idx)
+                } else {
+                    None
+                }
+            });
+            if let Some(gidx) = resolved_gen_idx {
+                if let Some((m_id, m_disp)) = models.get(&gidx) {
+                    probe.live_model = if !m_id.is_empty() {
+                        m_id.clone()
+                    } else {
+                        m_disp.clone()
+                    };
+                } else if let Ok(mut gq) = conn.prepare_cached(
+                    "SELECT data FROM gen_metadata WHERE idx = ?1 AND data IS NOT NULL",
+                ) {
+                    if let Ok(Some(blob)) =
+                        gq.query_row(params![gidx], |r| r.get::<_, Vec<u8>>(0)).optional()
+                    {
+                        let (m_id, m_disp) = extract_gen_model(&blob);
+                        probe.live_model = if !m_id.is_empty() { m_id } else { m_disp };
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Latest terminal/active step across step_type IN (15, 17, 23) using zero-sort O(log N) index seeks
+    let latest_completed_turn_step_idx = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
+    if let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT idx, step_type, status, error_details
+         FROM steps
+         WHERE step_type = ?1
+         ORDER BY idx DESC
+         LIMIT 1",
+    ) {
+        let mut best: Option<(i64, i32, Option<Vec<u8>>)> = None;
+        for st in [15i32, 17, 23] {
+            if let Ok(Some((idx, status, err_blob))) = stmt
+                .query_row(params![st], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<i32>>(2)?.unwrap_or(0),
+                        r.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                })
+                .optional()
+            {
+                if best.as_ref().map(|b| idx > b.0).unwrap_or(true) {
+                    best = Some((idx, status, err_blob));
+                }
+            }
+        }
+        if let Some((err_idx, status, err_blob)) = best {
+            if status == 7 && err_idx >= latest_completed_turn_step_idx {
+                let summary = err_blob
+                    .as_deref()
+                    .map(extract_error_summary)
+                    .unwrap_or_default();
+                probe.live_error = if summary.is_empty() {
+                    "Step error".to_string()
+                } else {
+                    summary
+                };
+                probe.live_error_step_idx = err_idx;
+            }
+        }
+    }
+
+    // 3. Latest completed checkpoint summary byte length via `idx_steps_step_type` (zero-alloc)
+    if let Ok(mut stmt) = conn.prepare_cached(
+        "SELECT idx, step_payload
+         FROM steps
+         WHERE step_type = 23 AND status = 3
+         ORDER BY idx DESC
+         LIMIT 1",
+    ) {
+        if let Ok(mut rows) = stmt.query([]) {
+            if let Ok(Some(row)) = rows.next() {
+                if let Some(bytes) = row.get_ref(1).ok().and_then(|v| v.as_bytes().ok()) {
+                    probe.compact_summary_bytes = extract_checkpoint_summary_len(bytes);
+                }
+            }
+        }
+    }
+
+    probe
 }

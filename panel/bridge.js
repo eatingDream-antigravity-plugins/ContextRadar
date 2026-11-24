@@ -1,13 +1,13 @@
 // Lightweight SEP-1865 (2026-01-26) MCP Apps PostMessage bridge for Context Radar MCP.
 export const PROTOCOL_VERSION = "2026-01-26";
 
-const BG = "--color-background-primary", NTF = "ui/notifications/";
+const BG = "--color-background-primary", NTF = "ui/notifications/", JR = "2.0";
 export function applyDocumentTheme(t) {
   if (t !== "dark" && t !== "light") return;
-  const d = document, e = d.documentElement, bg = `var(${BG},${t === "light" ? "#FAF8F5" : "#141311"})`;
+  const d = document, e = d.documentElement, s = e.style, b = d.body, bg = `var(${BG},${t === "light" ? "#FAF8F5" : "#141311"})`;
   if (e.getAttribute("data-theme") !== t) e.setAttribute("data-theme", t);
-  e.style.colorScheme = t; e.style.backgroundColor = bg;
-  if (d.body) d.body.style.backgroundColor = bg;
+  s.colorScheme = t; s.backgroundColor = bg;
+  if (b) b.style.backgroundColor = bg;
   const m = d.querySelector?.('meta[name="color-scheme"]');
   if (m && m.getAttribute("content") !== t) m.setAttribute("content", t);
 }
@@ -42,91 +42,83 @@ export function applyHostFonts(css) {
 
 export class McpAppBridge {
   constructor(appInfo, appCaps = {}, opts = { autoResize: true }) {
-    this._i = appInfo; this._c = appCaps || {}; this._o = { autoResize: true, ...opts };
-    this._n = 1; this._p = new Map(); this._on = false; this._t = window.parent; this._ro = null;
-    this._m = ({ source, data: m }) => {
-      if (source !== this._t || !m || typeof m !== "object" || m.jsonrpc !== "2.0") return;
-      if (m.id !== undefined && !m.method) {
-        const e = this._p.get(m.id); if (!e) return;
-        this._p.delete(m.id); clearTimeout(e.t);
-        m.error ? e.rej(new Error(m.error.message || JSON.stringify(m.error))) : e.res(m.result);
-      } else if (m.id !== undefined && m.method) this._req(m);
-      else if (m.method) this._ntf(m);
+    let n = 1, on = false, ro = null, hc, hx;
+    const w = window, d = document, p = new Map(), t = w.parent, c = appCaps || {}, o = { autoResize: true, ...opts };
+    const post = (x) => t.postMessage({ jsonrpc: JR, ...x }, "*");
+    const req = async (m) => {
+      try {
+        if (m.method === "ping") return post({ id: m.id, result: {} });
+        if (m.method === "ui/resource-teardown") return post({ id: m.id, result: (await this.onteardown?.(m.params || {})) ?? {} });
+        post({ id: m.id, error: { code: -32601, message: m.method } });
+      } catch (e) { post({ id: m.id, error: { code: -32603, message: e?.message || String(e) } }); }
     };
-  }
-
-  getHostCapabilities() { return this._hc; }
-  getHostContext() { return this._hx; }
-  _post(p) { this._t.postMessage({ jsonrpc: "2.0", ...p }, "*"); }
-
-  async _req(m) {
-    try {
-      if (m.method === "ping") return this._post({ id: m.id, result: {} });
-      if (m.method === "ui/resource-teardown") return this._post({ id: m.id, result: (await this.onteardown?.(m.params || {})) ?? {} });
-      this._post({ id: m.id, error: { code: -32601, message: m.method } });
-    } catch (e) { this._post({ id: m.id, error: { code: -32603, message: e?.message || String(e) } }); }
-  }
-
-  _ntf({ method: k, params: p = {} }) {
-    if (k === `${NTF}tool-input`) this.ontoolinput?.(p);
-    else if (k === `${NTF}tool-result`) this.ontoolresult?.(p);
-    else if (k === `${NTF}host-context-changed`) {
-      const prev = this._hx?.styles || {};
-      this._hx = { ...this._hx, ...p, styles: p.styles ? { ...prev, ...p.styles, variables: { ...(prev.variables || {}), ...(p.styles.variables || {}) } } : prev };
-      this.onhostcontextchanged?.(p);
-    } else if (k === "notifications/progress") for (const e of this._p.values()) e.rst?.();
-  }
-
-  request(method, params, { timeoutMs = 45_000 } = {}) {
-    const id = this._n++;
-    return new Promise((res, rej) => {
-      const mk = () => setTimeout(() => { this._p.delete(id); rej(new Error(method)); }, timeoutMs);
-      const e = { res, rej, t: mk(), rst() { clearTimeout(e.t); e.t = mk(); } };
-      this._p.set(id, e); this._post({ id, method, params });
-    });
-  }
-
-  notification(method, params) { this._post(params === undefined ? { method } : { method, params }); }
-  callServerTool(params, opts = {}) { return this.request("tools/call", params, { timeoutMs: opts.timeout ?? 45_000 }); }
-  sendMessage(params, opts = {}) { return this.request("ui/message", params, { timeoutMs: opts.timeout ?? 30_000 }); }
-
-  _autoSz() {
-    if (typeof ResizeObserver === "undefined") return;
-    let q = false, lw = 0, lh = 0;
-    const d = document, r = d.documentElement;
-    const go = () => {
-      if (q) return; q = true;
-      requestAnimationFrame(() => {
-        q = false;
-        const prev = r.style.height; r.style.height = "max-content";
-        const h = Math.ceil(r.getBoundingClientRect().height); r.style.height = prev;
-        const w = Math.ceil(window.innerWidth);
-        if (w !== lw || h !== lh) { lw = w; lh = h; this.notification(`${NTF}size-changed`, { width: w, height: h }); }
+    const ntf = ({ method: k, params: a = {} }) => {
+      if (k.startsWith(NTF)) {
+        const s = k.slice(NTF.length);
+        if (s === "tool-input") this.ontoolinput?.(a);
+        else if (s === "tool-result") this.ontoolresult?.(a);
+        else if (s === "host-context-changed") {
+          const prev = hx?.styles || {};
+          hx = { ...hx, ...a, styles: a.styles ? { ...prev, ...a.styles, variables: { ...(prev.variables || {}), ...(a.styles.variables || {}) } } : prev };
+          this.onhostcontextchanged?.(a);
+        }
+      } else if (k === "notifications/progress") for (const e of p.values()) e.rst?.();
+    };
+    const onMsg = ({ source, data: m }) => {
+      if (source !== t || !m || typeof m !== "object" || m.jsonrpc !== JR) return;
+      if (m.id !== undefined && !m.method) {
+        const e = p.get(m.id); if (!e) return;
+        p.delete(m.id); clearTimeout(e.t);
+        m.error ? e.rej(new Error(m.error.message || JSON.stringify(m.error))) : e.res(m.result);
+      } else if (m.id !== undefined && m.method) req(m);
+      else if (m.method) ntf(m);
+    };
+    const autoSz = () => {
+      if (typeof ResizeObserver === "undefined") return;
+      let q = false, lw = 0, lh = 0;
+      const r = d.documentElement, go = () => {
+        if (q) return; q = true;
+        requestAnimationFrame(() => {
+          q = false;
+          const prev = r.style.height; r.style.height = "max-content";
+          const h = Math.ceil(r.getBoundingClientRect().height); r.style.height = prev;
+          const wd = Math.ceil(w.innerWidth);
+          if (wd !== lw || h !== lh) { lw = wd; lh = h; this.notification(`${NTF}size-changed`, { width: wd, height: h }); }
+        });
+      };
+      go(); ro = new ResizeObserver(go); ro.observe(r);
+      if (d.body) ro.observe(d.body);
+    };
+    this.getHostCapabilities = () => hc;
+    this.getHostContext = () => hx;
+    this.request = (method, params, { timeoutMs = 45_000 } = {}) => {
+      const id = n++;
+      return new Promise((res, rej) => {
+        const mk = () => setTimeout(() => { p.delete(id); rej(new Error(method)); }, timeoutMs);
+        const e = { res, rej, t: mk(), rst() { clearTimeout(e.t); e.t = mk(); } };
+        p.set(id, e); post({ id, method, params });
       });
     };
-    go();
-    this._ro = new ResizeObserver(go);
-    this._ro.observe(r);
-    if (d.body) this._ro.observe(d.body);
-  }
-
-  async connect() {
-    if (this._on) return; this._on = true;
-    window.addEventListener("message", this._m);
-    try {
-      const r = await this.request("ui/initialize", { appInfo: this._i, appCapabilities: this._c, protocolVersion: PROTOCOL_VERSION }, { timeoutMs: 20_000 });
-      if (!r || typeof r !== "object") throw new Error("Bad init");
-      this._hc = r.hostCapabilities; this._hx = r.hostContext;
-      this.notification(`${NTF}initialized`);
-      // Only enable ResizeObserver RPCs for inline conversation frames (which report containerDimensions.maxHeight).
-      if (this._o.autoResize && Boolean(r.hostContext?.containerDimensions?.maxHeight)) this._autoSz();
-    } catch (e) { this.close(); throw e; }
-  }
-
-  close() {
-    this._on = false; window.removeEventListener("message", this._m);
-    this._ro?.disconnect(); this._ro = null;
-    for (const e of this._p.values()) { clearTimeout(e.t); e.rej(new Error("Closed")); }
-    this._p.clear();
+    this.notification = (method, params) => post(params === undefined ? { method } : { method, params });
+    this.callServerTool = (params, opts0 = {}) => this.request("tools/call", params, { timeoutMs: opts0.timeout ?? 45_000 });
+    this.sendMessage = (params, opts0 = {}) => this.request("ui/message", params, { timeoutMs: opts0.timeout ?? 30_000 });
+    this.connect = async () => {
+      if (on) return; on = true;
+      w.addEventListener("message", onMsg);
+      try {
+        const r = await this.request("ui/initialize", { appInfo, appCapabilities: c, protocolVersion: PROTOCOL_VERSION }, { timeoutMs: 20_000 });
+        if (!r || typeof r !== "object") throw new Error("Bad init");
+        hc = r.hostCapabilities; hx = r.hostContext;
+        this.notification(`${NTF}initialized`);
+        // Only enable ResizeObserver RPCs for inline conversation frames (which report containerDimensions.maxHeight).
+        if (o.autoResize && Boolean(r.hostContext?.containerDimensions?.maxHeight)) autoSz();
+      } catch (e) { this.close(); throw e; }
+    };
+    this.close = () => {
+      on = false; w.removeEventListener("message", onMsg);
+      ro?.disconnect(); ro = null;
+      for (const e of p.values()) { clearTimeout(e.t); e.rej(new Error("Closed")); }
+      p.clear();
+    };
   }
 }
