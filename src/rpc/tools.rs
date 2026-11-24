@@ -2,7 +2,7 @@
 
 use serde_json::{json, Value};
 
-use crate::engine::telemetry::OverviewSnapshot;
+use crate::engine::telemetry::{OverviewSnapshot, SessionTelemetry};
 use crate::i18n::select_display_cost;
 
 pub const PANEL_URI: &str = "ui://context-radar-mcp/panel";
@@ -344,6 +344,84 @@ pub fn resources_spec() -> Value {
     ])
 }
 
+fn truncate_inline(s: &str, max_chars: usize) -> String {
+    let mut count = 0usize;
+    let mut cut_byte: Option<usize> = None;
+    for (bidx, _) in s.char_indices() {
+        if count == max_chars.saturating_sub(1) {
+            cut_byte = Some(bidx);
+        }
+        count += 1;
+        if count > max_chars {
+            break;
+        }
+    }
+    if count > max_chars {
+        if let Some(b) = cut_byte {
+            return format!("{}…", s[..b].trim_end());
+        }
+    }
+    s.to_string()
+}
+
+pub fn format_live_status_tag(item: &SessionTelemetry, zh: bool) -> String {
+    if item.live_status == "error" {
+        if item.live_error.is_empty() {
+            return if zh { " [异常]" } else { " [error]" }.to_string();
+        }
+        let short_err = truncate_inline(&item.live_error, 48);
+        return if zh {
+            format!(" [异常: {short_err}]")
+        } else {
+            format!(" [error: {short_err}]")
+        };
+    }
+    if item.live_phase == "compacting" {
+        let elapsed = if item.live_elapsed_sec > 0 {
+            format!(" {}s", item.live_elapsed_sec)
+        } else {
+            String::new()
+        };
+        let xmod = if item.cross_model_compact {
+            if zh { "·跨模型" } else { "·cross-model" }
+        } else {
+            ""
+        };
+        return if zh {
+            format!(" [压缩中{elapsed}{xmod}]")
+        } else {
+            format!(" [compacting{elapsed}{xmod}]")
+        };
+    }
+    if item.live_status == "waiting" {
+        return if item.live_elapsed_sec > 0 {
+            if zh {
+                format!(" [等待 {}s]", item.live_elapsed_sec)
+            } else {
+                format!(" [waiting {}s]", item.live_elapsed_sec)
+            }
+        } else if zh {
+            " [等待]".to_string()
+        } else {
+            " [waiting]".to_string()
+        };
+    }
+    if item.is_active {
+        return if item.is_subagent {
+            if zh { " [运行中]" } else { " [running]" }
+        } else if zh {
+            " [进行中]"
+        } else {
+            " [active]"
+        }
+        .to_string();
+    }
+    if item.is_subagent {
+        return if zh { " [历史]" } else { " [history]" }.to_string();
+    }
+    String::new()
+}
+
 pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
     let zh = snap.lang == "zh-CN";
     let s = &snap.summary;
@@ -359,9 +437,25 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
     };
     let total_disp = select_display_cost(s.total_cost_usd, s.total_cost_cny, ccode);
 
+    let mut live_counts = String::new();
+    if s.compacting_count > 0 {
+        live_counts.push_str(&if zh {
+            format!("，压缩中 {} 个", s.compacting_count)
+        } else {
+            format!(", {} compacting", s.compacting_count)
+        });
+    }
+    if s.error_session_count > 0 {
+        live_counts.push_str(&if zh {
+            format!("，异常 {} 个", s.error_session_count)
+        } else {
+            format!(", {} error", s.error_session_count)
+        });
+    }
+
     let mut lines = vec![if zh {
         format!(
-            "Context Radar 快照（上限 {}）：主会话 {} 个（进行中 {}，已隐藏归档 {}），活跃子代理 {} 个（已隐藏历史子代理 {}），待压缩 {} 个，合计约 {}{:.2}。",
+            "Context Radar 快照（上限 {}）：主会话 {} 个（进行中 {}，已隐藏归档 {}），活跃子代理 {} 个（已隐藏历史子代理 {}），待压缩 {} 个{live_counts}，合计约 {}{:.2}。",
             fmt_k(snap.thresholds.max),
             s.shown_main_count,
             s.running_main_count,
@@ -374,7 +468,7 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
         )
     } else {
         format!(
-            "Context Radar Snapshot (limit {}): {} main session(s) ({} active, {} archived hidden), {} active subagent(s) ({} historical hidden), {} ready for /compact, est. total {}{:.2}.",
+            "Context Radar Snapshot (limit {}): {} main session(s) ({} active, {} archived hidden), {} active subagent(s) ({} historical hidden), {} ready for /compact{live_counts}, est. total {}{:.2}.",
             fmt_k(snap.thresholds.max),
             s.shown_main_count,
             s.running_main_count,
@@ -394,10 +488,20 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
     for item in snap.sessions.iter().take(8) {
         let item_cost = select_display_cost(item.cost_usd, item.cost_cny, ccode);
         let flag = if item.just_compacted {
-            if zh {
-                format!(" [已压缩·原{}]", fmt_k(item.pre_compact_tokens))
+            let kb_note = if item.compact_summary_kb > 0.0 {
+                format!("·~{:.1}KB", item.compact_summary_kb)
             } else {
-                format!(" [compacted from {}]", fmt_k(item.pre_compact_tokens))
+                String::new()
+            };
+            let xmod_note = if item.cross_model_compact {
+                if zh { "·跨模型" } else { "·cross-model" }
+            } else {
+                ""
+            };
+            if zh {
+                format!(" [已压缩·原{}{kb_note}{xmod_note}]", fmt_k(item.pre_compact_tokens))
+            } else {
+                format!(" [compacted from {}{kb_note}{xmod_note}]", fmt_k(item.pre_compact_tokens))
             }
         } else if item.suggest_compact {
             if zh {
@@ -408,10 +512,15 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
         } else {
             String::new()
         };
-        let run_tag = if item.is_active {
-            if zh { " [进行中]" } else { " [active]" }
+        let run_tag = format_live_status_tag(item, zh);
+        let think_txt = if item.total_thinking_tokens > 0 {
+            if zh {
+                format!(" | 思考 {:.0}%", item.thinking_share_pct)
+            } else {
+                format!(" | think {:.0}%", item.thinking_share_pct)
+            }
         } else {
-            ""
+            String::new()
         };
         let cb = &item.cold_cache_breakdown;
         let mb = &item.mid_loop_breakdown;
@@ -457,12 +566,13 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
         };
         lines.push(if zh {
             format!(
-                "- {} ({}){}: {}/{} | {} | 缓存 {:.1}%{} | {} 轮 | {}{:.2}{}",
+                "- {} ({}){}: {}/{} (余 {}) | {} | 缓存 {:.1}%{}{think_txt} | {} 轮 | {}{:.2}{}",
                 item.title,
                 item.id,
                 run_tag,
                 fmt_k(item.latest_context_tokens),
                 fmt_k(item.context_limit),
+                fmt_k(item.remaining_context_tokens),
                 item.model_display,
                 item.cache_hit_rate,
                 cold_txt,
@@ -473,12 +583,13 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
             )
         } else {
             format!(
-                "- {} ({}){}: {}/{} | {} | cache {:.1}%{} | {} turns | {}{:.2}{}",
+                "- {} ({}){}: {}/{} ({} left) | {} | cache {:.1}%{}{think_txt} | {} turns | {}{:.2}{}",
                 item.title,
                 item.id,
                 run_tag,
                 fmt_k(item.latest_context_tokens),
                 fmt_k(item.context_limit),
+                fmt_k(item.remaining_context_tokens),
                 item.model_display,
                 item.cache_hit_rate,
                 cold_txt,
@@ -490,13 +601,7 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
         });
         for sub in item.subagents.iter().take(4) {
             let sub_cost = select_display_cost(sub.cost_usd, sub.cost_cny, ccode);
-            let sub_run = if sub.is_active {
-                if zh { " [运行中]" } else { " [running]" }
-            } else if zh {
-                " [历史]"
-            } else {
-                " [history]"
-            };
+            let sub_run = format_live_status_tag(sub, zh);
             let sub_flag = if sub.suggest_compact && !sub.just_compacted {
                 if zh {
                     " [建议切棒]"
@@ -508,12 +613,13 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
             };
             lines.push(if zh {
                 format!(
-                    "  · 子代理 {} ({}){}: {}/{} | {} | 缓存 {:.1}% | {}{:.2}{}",
+                    "  · 子代理 {} ({}){}: {}/{} (余 {}) | {} | 缓存 {:.1}% | {}{:.2}{}",
                     sub.title,
                     sub.id,
                     sub_run,
                     fmt_k(sub.latest_context_tokens),
                     fmt_k(sub.context_limit),
+                    fmt_k(sub.remaining_context_tokens),
                     sub.model_display,
                     sub.cache_hit_rate,
                     sym,
@@ -522,12 +628,13 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
                 )
             } else {
                 format!(
-                    "  · Subagent {} ({}){}: {}/{} | {} | cache {:.1}% | {}{:.2}{}",
+                    "  · Subagent {} ({}){}: {}/{} ({} left) | {} | cache {:.1}% | {}{:.2}{}",
                     sub.title,
                     sub.id,
                     sub_run,
                     fmt_k(sub.latest_context_tokens),
                     fmt_k(sub.context_limit),
+                    fmt_k(sub.remaining_context_tokens),
                     sub.model_display,
                     sub.cache_hit_rate,
                     sym,
