@@ -9,10 +9,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use serde::Serialize;
 
-use crate::engine::budget::resolve_budget_tier;
+use crate::engine::budget::{
+    is_gemini_4_carbon, model_cache_ttl_sec, resolve_budget_tier,
+};
 use crate::engine::grants::{workspaces_overlap, PanelPrefs, RelayGrant};
 use crate::engine::rates::RateTable;
-use crate::i18n::{resolve_active_lang, Lang};
+use crate::i18n::{carbon_concurrency_warning_text, resolve_active_lang, Lang};
 use crate::ledger::index_db::DbVersionSig;
 use crate::ledger::sqlite_ro::{stat_db_stamp, FileStamp, LedgerReader};
 use crate::ledger::{is_safe_id, SummaryRecord, TurnSample};
@@ -27,6 +29,92 @@ pub struct ColdCacheBreakdown {
     pub turn_start_cold: usize,
     pub mid_loop_cold: usize,
     pub post_compact_cold: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct MidLoopBreakdown {
+    pub slow_turn_self_expiry: usize,
+    pub replica_spillover: usize,
+    pub model_switch_cold: usize,
+    pub other: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MidLoopSubReason {
+    None,
+    SlowTurnSelfExpiry,
+    ReplicaSpillover,
+    ModelSwitchCold,
+    Other,
+}
+
+impl MidLoopSubReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::SlowTurnSelfExpiry => "slow_turn_self_expiry",
+            Self::ReplicaSpillover => "replica_spillover",
+            Self::ModelSwitchCold => "model_switch_cold",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn label_and_reason_for_lang(
+        self,
+        lang: Lang,
+        ttl_sec: u64,
+        partial: bool,
+    ) -> (&'static str, &'static str) {
+        let zh = lang.is_zh();
+        match self {
+            Self::None => ("", ""),
+            Self::SlowTurnSelfExpiry => match (zh, ttl_sec) {
+                (true, 180) => (
+                    "慢轮自过期",
+                    "单轮生成耗时 >=3 分钟（空闲 <60s），prefill 起的 180s 缓存 TTL 在流式中途过期",
+                ),
+                (false, 180) => (
+                    "Slow-turn TTL",
+                    "Turn took >=3m from prefill start (idle <60s), expiring its 180s KV cache mid-stream",
+                ),
+                (true, _) => (
+                    "慢轮自过期",
+                    "单轮生成耗时 >=5 分钟（空闲 <60s），prefill 起的缓存 TTL 在流式中途过期",
+                ),
+                (false, _) => (
+                    "Slow-turn TTL",
+                    "Turn took >=5m from prefill start (idle <60s), expiring its KV cache mid-stream",
+                ),
+            },
+            Self::ReplicaSpillover => {
+                if zh {
+                    (
+                        "副本溢出",
+                        "请求路由到其他缓存副本（回退早期前缀，或 >=3 个同模型活跃会话并发挤占）",
+                    )
+                } else {
+                    (
+                        "Replica spillover",
+                        "Routed to an alternate replica (earlier-prefix rollback or >=3 overlapping same-model sessions)",
+                    )
+                }
+            }
+            Self::ModelSwitchCold => {
+                if zh {
+                    (
+                        "切换模型",
+                        "相邻步骤切换了模型或推理档位，导致前缀缓存失效",
+                    )
+                } else {
+                    (
+                        "Model switch",
+                        "Model or reasoning-effort changed between consecutive steps",
+                    )
+                }
+            }
+            Self::Other => ColdCacheKind::MidLoop.label_and_reason_for_lang_with_ttl(lang, partial, ttl_sec),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +140,15 @@ impl ColdCacheKind {
     }
 
     pub fn label_and_reason_for_lang(self, lang: Lang, partial: bool) -> (&'static str, &'static str) {
+        self.label_and_reason_for_lang_with_ttl(lang, partial, 300)
+    }
+
+    pub fn label_and_reason_for_lang_with_ttl(
+        self,
+        lang: Lang,
+        partial: bool,
+        ttl_sec: u64,
+    ) -> (&'static str, &'static str) {
         let zh = lang.is_zh();
         match self {
             Self::None => ("", ""),
@@ -61,8 +158,10 @@ impl ColdCacheKind {
                         "新轮次未命中",
                         if partial {
                             "跨轮次唤醒缓存部分失效并触发重写入"
+                        } else if ttl_sec == 180 {
+                            "跨轮次首步缓存未命中（>3 分钟 prefill TTL 过期或副本切换）"
                         } else {
-                            "跨轮次首步缓存未命中（>5m TTL 过期或副本切换）"
+                            "跨轮次首步缓存未命中（>5 分钟 TTL 过期或副本切换）"
                         },
                     )
                 } else {
@@ -70,6 +169,8 @@ impl ColdCacheKind {
                         "New-turn miss",
                         if partial {
                             "Partial prefix miss across user turns with cache rebuild"
+                        } else if ttl_sec == 180 {
+                            "First step of a new turn missed cache (>3m prefill-anchored TTL expiry or replica shift)"
                         } else {
                             "First step of a new turn missed cache (>5m TTL expiry or replica shift)"
                         },
@@ -210,10 +311,78 @@ pub fn is_subagent_active(
     false
 }
 
-pub fn classify_cold_cache_turns(
+#[derive(Debug, Clone)]
+pub struct ActiveModelWindow {
+    pub cid: String,
+    pub model_key: String,
+    pub min_ts: f64,
+    pub max_ts: f64,
+    pub is_active: bool,
+    pub is_carbon: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColdTurnClassification {
+    pub kind: ColdCacheKind,
+    pub sub_reason: MidLoopSubReason,
+    pub partial: bool,
+}
+
+pub fn normalized_model_family(model: &str, model_display: &str) -> String {
+    let mut s = if !model.trim().is_empty() && model.trim() != "unknown" {
+        model.trim().to_ascii_lowercase()
+    } else {
+        model_display.trim().to_ascii_lowercase()
+    };
+    for suffix in ["-xhigh", "-high", "-medium", "-low"] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            s = stripped.to_string();
+            break;
+        }
+    }
+    s
+}
+
+pub fn compute_overlap_counts(
+    cid: &str,
+    turns: &[TurnSample],
+    windows: &[ActiveModelWindow],
+) -> Vec<usize> {
+    if windows.is_empty() {
+        return vec![1; turns.len()];
+    }
+    turns
+        .iter()
+        .map(|t| {
+            let mk = normalized_model_family(&t.model, &t.model_display);
+            if mk.is_empty() {
+                return 1;
+            }
+            let mut count = 1usize;
+            for w in windows {
+                if w.cid == cid || w.model_key != mk {
+                    continue;
+                }
+                let overlaps = if t.timestamp > 0.0 && w.min_ts > 0.0 {
+                    w.min_ts - 60.0 <= t.timestamp
+                        && (w.is_active || t.timestamp <= w.max_ts + 60.0)
+                } else {
+                    w.is_active
+                };
+                if overlaps {
+                    count += 1;
+                }
+            }
+            count
+        })
+        .collect()
+}
+
+pub fn classify_cold_cache_turns_detailed(
     turns: &[TurnSample],
     transcript_step_types: Option<&HashMap<i64, String>>,
-) -> Vec<ColdCacheKind> {
+    overlap_counts_by_turn: Option<&[usize]>,
+) -> Vec<ColdTurnClassification> {
     let mut sorted_indices: Vec<i64> = transcript_step_types
         .map(|m| {
             let mut ks: Vec<i64> = m.keys().copied().collect();
@@ -231,7 +400,11 @@ pub fn classify_cold_cache_turns(
         let full_cold = t.is_cold_cache();
         let partial_cold = !full_cold && is_partial_prefix_drop(prev_t, t);
         if !full_cold && !partial_cold {
-            results.push(ColdCacheKind::None);
+            results.push(ColdTurnClassification {
+                kind: ColdCacheKind::None,
+                sub_reason: MidLoopSubReason::None,
+                partial: false,
+            });
             continue;
         }
 
@@ -255,45 +428,86 @@ pub fn classify_cold_cache_turns(
             }
         }
 
-        if t.after_checkpoint
+        let ttl_sec = model_cache_ttl_sec(&t.model, &t.model_display);
+        let start_dt = prev_t.and_then(|p| t.start_delta_sec(p));
+        let idle_gap = prev_t.and_then(|p| t.idle_gap_sec(p));
+        let model_switched = prev_t.is_some_and(|p| t.is_model_or_effort_switch(p));
+        let concurrent_same_model = overlap_counts_by_turn
+            .and_then(|s| s.get(i).copied())
+            .unwrap_or(1);
+        let prefix_rollback = partial_cold
+            && (turns[..i.saturating_sub(1)].iter().any(|e| {
+                !e.is_checkpoint
+                    && e.context_tokens() > 0
+                    && t.cache_read.abs_diff(e.context_tokens()) <= 64
+            }) || turns.first().is_some_and(|t0| {
+                !t0.is_checkpoint
+                    && t0.context_tokens() >= 8_000
+                    && t.cache_read >= 8_000
+                    && t.cache_read <= t0.context_tokens().saturating_add(512)
+            }));
+
+        let kind = if t.after_checkpoint
             || prev_t.map(|p| p.is_checkpoint).unwrap_or(false)
             || saw_ckpt_between
         {
-            results.push(ColdCacheKind::PostCompact);
+            ColdCacheKind::PostCompact
         } else if prev_t.is_none()
             || t.after_turn_start == Some(true)
             || saw_user_or_sys_between
         {
-            // Partial prefix drop right at a new turn after >=300s idle is a TurnStart TTL drop;
-            // otherwise a sharp partial drop with active cache_write during a quick exchange is MidLoop.
             if partial_cold {
-                let gap = match prev_t {
-                    Some(p) if t.timestamp > 0.0 && p.timestamp > 0.0 => t.timestamp - p.timestamp,
-                    _ => 0.0,
-                };
-                if gap >= 300.0 {
-                    results.push(ColdCacheKind::TurnStart);
+                if start_dt.unwrap_or(0.0) >= ttl_sec {
+                    ColdCacheKind::TurnStart
                 } else {
-                    results.push(ColdCacheKind::MidLoop);
+                    ColdCacheKind::MidLoop
                 }
             } else {
-                results.push(ColdCacheKind::TurnStart);
+                ColdCacheKind::TurnStart
             }
         } else if t.after_turn_start == Some(false) || has_t_steps || partial_cold {
-            results.push(ColdCacheKind::MidLoop);
+            ColdCacheKind::MidLoop
+        } else if idle_gap.is_some_and(|g| g < 60.0) && start_dt.is_some_and(|d| d >= ttl_sec) {
+            ColdCacheKind::MidLoop
+        } else if start_dt.is_some_and(|d| d >= ttl_sec) {
+            ColdCacheKind::TurnStart
         } else {
-            let gap = match prev_t {
-                Some(p) if t.timestamp > 0.0 && p.timestamp > 0.0 => t.timestamp - p.timestamp,
-                _ => 0.0,
-            };
-            if gap >= 300.0 {
-                results.push(ColdCacheKind::TurnStart);
+            ColdCacheKind::MidLoop
+        };
+
+        let sub_reason = if kind == ColdCacheKind::MidLoop {
+            if model_switched {
+                MidLoopSubReason::ModelSwitchCold
+            } else if idle_gap.is_some_and(|g| g < 60.0) && start_dt.is_some_and(|d| d >= ttl_sec) {
+                MidLoopSubReason::SlowTurnSelfExpiry
+            } else if prefix_rollback
+                || (idle_gap.is_some_and(|g| g < 60.0) && concurrent_same_model >= 3)
+            {
+                MidLoopSubReason::ReplicaSpillover
             } else {
-                results.push(ColdCacheKind::MidLoop);
+                MidLoopSubReason::Other
             }
-        }
+        } else {
+            MidLoopSubReason::None
+        };
+
+        results.push(ColdTurnClassification {
+            kind,
+            sub_reason,
+            partial: partial_cold,
+        });
     }
     results
+}
+
+pub fn classify_cold_cache_turns(
+    turns: &[TurnSample],
+    transcript_step_types: Option<&HashMap<i64, String>>,
+) -> Vec<ColdCacheKind> {
+    classify_cold_cache_turns_detailed(turns, transcript_step_types, None)
+        .into_iter()
+        .map(|c| c.kind)
+        .collect()
 }
 
 fn median_u64(vals: &mut [u64]) -> u64 {
@@ -346,6 +560,7 @@ pub struct SessionTelemetry {
     pub model: String,
     pub model_display: String,
     pub model_short: String,
+    pub cache_ttl_sec: u64,
     pub pricing_known: bool,
     pub profile_label: String,
     pub min_compact_tokens: u64,
@@ -367,6 +582,7 @@ pub struct SessionTelemetry {
     pub latest_cache_hit_rate: f64,
     pub cold_cache_count: usize,
     pub cold_cache_breakdown: ColdCacheBreakdown,
+    pub mid_loop_breakdown: MidLoopBreakdown,
     pub turn_start_cold_count: usize,
     pub mid_loop_cold_count: usize,
     pub post_compact_cold_count: usize,
@@ -405,6 +621,31 @@ pub fn build_session_telemetry(
     rates: &mut RateTable,
     now_ts: f64,
     transcript_step_types: Option<&HashMap<i64, String>>,
+) -> SessionTelemetry {
+    build_session_telemetry_with_overlap(
+        cid,
+        summary,
+        turns,
+        eff_mtime,
+        fx_rate,
+        rates,
+        now_ts,
+        transcript_step_types,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_session_telemetry_with_overlap(
+    cid: &str,
+    summary: Option<&SummaryRecord>,
+    turns: &[TurnSample],
+    eff_mtime: f64,
+    fx_rate: f64,
+    rates: &mut RateTable,
+    now_ts: f64,
+    transcript_step_types: Option<&HashMap<i64, String>>,
+    overlap_counts_by_turn: Option<&[usize]>,
 ) -> SessionTelemetry {
     let cfg = rates.current_settings();
     let lang = rates.get_lang();
@@ -491,12 +732,33 @@ pub fn build_session_telemetry(
         0.0
     };
 
-    let cold_kinds = classify_cold_cache_turns(turns, transcript_step_types);
+    let cold_classified = classify_cold_cache_turns_detailed(
+        turns,
+        transcript_step_types,
+        overlap_counts_by_turn,
+    );
     let mut cold_breakdown = ColdCacheBreakdown::default();
-    for k in &cold_kinds {
-        match k {
+    let mut mid_loop_breakdown = MidLoopBreakdown::default();
+    for c in &cold_classified {
+        match c.kind {
             ColdCacheKind::TurnStart => cold_breakdown.turn_start_cold += 1,
-            ColdCacheKind::MidLoop => cold_breakdown.mid_loop_cold += 1,
+            ColdCacheKind::MidLoop => {
+                cold_breakdown.mid_loop_cold += 1;
+                match c.sub_reason {
+                    MidLoopSubReason::SlowTurnSelfExpiry => {
+                        mid_loop_breakdown.slow_turn_self_expiry += 1
+                    }
+                    MidLoopSubReason::ReplicaSpillover => {
+                        mid_loop_breakdown.replica_spillover += 1
+                    }
+                    MidLoopSubReason::ModelSwitchCold => {
+                        mid_loop_breakdown.model_switch_cold += 1
+                    }
+                    MidLoopSubReason::Other | MidLoopSubReason::None => {
+                        mid_loop_breakdown.other += 1
+                    }
+                }
+            }
             ColdCacheKind::PostCompact => cold_breakdown.post_compact_cold += 1,
             ColdCacheKind::None => {}
         }
@@ -510,12 +772,12 @@ pub fn build_session_telemetry(
         None => 1.min(turns.len()),
     };
     let post_ckpt_turns = &turns[post_ckpt_start..];
-    let post_ckpt_kinds = &cold_kinds[post_ckpt_start..];
+    let post_ckpt_kinds = &cold_classified[post_ckpt_start..];
     let recent_start = post_ckpt_turns.len().saturating_sub(3);
     let recent_cold_rebuild = post_ckpt_turns[recent_start..]
         .iter()
         .zip(post_ckpt_kinds[recent_start..].iter())
-        .any(|(t, &k)| k != ColdCacheKind::None && t.context_tokens() >= 60_000);
+        .any(|(t, c)| c.kind != ColdCacheKind::None && t.context_tokens() >= 60_000);
 
     let med_ttft = median_u64(&mut ttfts);
     let med_tps = round_dp(median_f64(&mut tps_vals), 1);
@@ -609,6 +871,7 @@ pub fn build_session_telemetry(
         "idle"
     };
 
+    let cache_ttl_sec = model_cache_ttl_sec(model_id, model_disp) as u64;
     let model_short = rates.short_model_label(model_disp, model_id);
     let ctx_pct = if ctx_limit > 0 {
         round_dp((latest_ctx as f64) / (ctx_limit as f64) * 100.0, 1)
@@ -638,6 +901,7 @@ pub fn build_session_telemetry(
         model: model_id.to_string(),
         model_display: model_disp.to_string(),
         model_short,
+        cache_ttl_sec,
         pricing_known: price.pricing_known,
         profile_label: prof.label,
         min_compact_tokens: prof.min_ctx,
@@ -662,6 +926,7 @@ pub fn build_session_telemetry(
         mid_loop_cold_count: cold_breakdown.mid_loop_cold,
         post_compact_cold_count: cold_breakdown.post_compact_cold,
         cold_cache_breakdown: cold_breakdown,
+        mid_loop_breakdown,
         median_ttft_ms: med_ttft,
         median_stream_tps: med_tps,
         total_input_tokens: total_in,
@@ -703,6 +968,10 @@ pub struct TurnViewRow {
     pub cold_cache_kind: String,
     pub cold_cache_label: String,
     pub cold_cache_reason: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cold_cache_sub_reason: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub cold_cache_sub_label: String,
     pub ttft_ms: u64,
     pub total_ms: u64,
     pub stream_tps: f64,
@@ -719,12 +988,24 @@ pub fn format_turn_rows(
     rates: &mut RateTable,
     transcript_step_types: Option<&HashMap<i64, String>>,
 ) -> Vec<TurnViewRow> {
-    let cold_kinds = classify_cold_cache_turns(turns, transcript_step_types);
+    format_turn_rows_with_overlap(turns, limit, fx_rate, rates, transcript_step_types, None)
+}
+
+pub fn format_turn_rows_with_overlap(
+    turns: &[TurnSample],
+    limit: usize,
+    fx_rate: f64,
+    rates: &mut RateTable,
+    transcript_step_types: Option<&HashMap<i64, String>>,
+    overlap_counts_by_turn: Option<&[usize]>,
+) -> Vec<TurnViewRow> {
+    let cold_classified =
+        classify_cold_cache_turns_detailed(turns, transcript_step_types, overlap_counts_by_turn);
     let lang = rates.get_lang();
     let (currency_code, currency_sym) = rates.get_currency();
     let start = turns.len().saturating_sub(limit);
     let mut rows = Vec::with_capacity(turns.len() - start);
-    for (t, &c_kind) in turns[start..].iter().zip(cold_kinds[start..].iter()).rev() {
+    for (t, c) in turns[start..].iter().zip(cold_classified[start..].iter()).rev() {
         let usd = rates.calculate_cost_usd(
             &t.model,
             t.input_tokens,
@@ -733,9 +1014,23 @@ pub fn format_turn_rows(
             t.output_tokens,
             &t.model_display,
         );
+        let c_kind = c.kind;
         let is_cold = c_kind != ColdCacheKind::None;
         let is_partial = is_cold && t.cache_read > 0;
-        let (c_label, c_reason) = c_kind.label_and_reason_for_lang(lang, is_partial);
+        let ttl_sec = model_cache_ttl_sec(&t.model, &t.model_display) as u64;
+        let (c_label, c_reason) = if c_kind == ColdCacheKind::MidLoop
+            && !matches!(c.sub_reason, MidLoopSubReason::None | MidLoopSubReason::Other)
+        {
+            c.sub_reason.label_and_reason_for_lang(lang, ttl_sec, is_partial)
+        } else {
+            c_kind.label_and_reason_for_lang_with_ttl(lang, is_partial, ttl_sec)
+        };
+        let (sub_reason_str, sub_label_str) = if c_kind == ColdCacheKind::MidLoop {
+            let (sl, _) = c.sub_reason.label_and_reason_for_lang(lang, ttl_sec, is_partial);
+            (c.sub_reason.as_str().to_string(), sl.to_string())
+        } else {
+            (String::new(), String::new())
+        };
         rows.push(TurnViewRow {
             turn: t.turn_index,
             step_idx: t.step_idx,
@@ -754,6 +1049,8 @@ pub fn format_turn_rows(
             cold_cache_kind: c_kind.as_str().to_string(),
             cold_cache_label: c_label.to_string(),
             cold_cache_reason: c_reason.to_string(),
+            cold_cache_sub_reason: sub_reason_str,
+            cold_cache_sub_label: sub_label_str,
             ttft_ms: t.ttft_ms,
             total_ms: t.total_ms,
             stream_tps: round_dp(t.stream_tps(), 1),
@@ -783,6 +1080,8 @@ pub struct SnapshotSummary {
     pub shown_subagent_count: usize,
     pub running_main_count: usize,
     pub running_subagent_count: usize,
+    pub active_carbon_count: usize,
+    pub carbon_concurrency_warning: bool,
     pub compact_needed_count: usize,
     pub critical_count: usize,
     pub total_cost_usd: f64,
@@ -791,6 +1090,10 @@ pub struct SnapshotSummary {
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -814,6 +1117,12 @@ pub struct OverviewSnapshot {
     pub show_history_subagents: bool,
     pub thresholds: SnapshotThresholds,
     pub summary: SnapshotSummary,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub active_carbon_count: usize,
+    #[serde(skip_serializing_if = "is_false")]
+    pub carbon_concurrency_warning: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub carbon_concurrency_note: Option<String>,
     pub sessions: Vec<SessionTelemetry>,
     pub orphan_subagents: Vec<SessionTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -833,6 +1142,8 @@ pub struct SessionTurnsPayload {
     pub total_turns: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cold_cache_breakdown: Option<ColdCacheBreakdown>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mid_loop_breakdown: Option<MidLoopBreakdown>,
     pub turns: Vec<TurnViewRow>,
 }
 
@@ -844,6 +1155,7 @@ struct MetricsCacheKey {
     settings_gen: u64,
     lang: Lang,
     currency_code: String,
+    overlap_sig: u64,
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -1041,10 +1353,19 @@ impl TelemetryEngine {
         stamp: Option<&FileStamp>,
         fx_rate: f64,
         ref_now: f64,
+        overlap_counts_by_turn: Option<&[usize]>,
     ) -> SessionTelemetry {
         let cfg = self.rates.current_settings();
         let lang = self.rates.get_lang();
         let (currency_code, _) = self.rates.get_currency();
+        let mut overlap_sig = 0u64;
+        if let Some(counts) = overlap_counts_by_turn {
+            for &c in counts {
+                overlap_sig = overlap_sig
+                    .wrapping_mul(0x100000001b3)
+                    .wrapping_add(u64::from(c >= 3));
+            }
+        }
         let cache_key = MetricsCacheKey {
             db_stamp: stamp.map(|s| (s.dev, s.ino, s.sig.clone())),
             summary: summary.cloned(),
@@ -1052,6 +1373,7 @@ impl TelemetryEngine {
             settings_gen: cfg.generation,
             lang,
             currency_code,
+            overlap_sig,
         };
         if let Some((prev_key, prev_tel)) = self.metrics_cache.get(cid) {
             if *prev_key == cache_key {
@@ -1081,7 +1403,7 @@ impl TelemetryEngine {
 
         let t_types = self.transcript_types_if_needed(cid, turns);
         let eff_mtime = stamp.map(|s| s.eff_mtime).unwrap_or(0.0);
-        let tel = build_session_telemetry(
+        let tel = build_session_telemetry_with_overlap(
             cid,
             summary,
             turns,
@@ -1090,10 +1412,38 @@ impl TelemetryEngine {
             &mut self.rates,
             ref_now,
             t_types.as_ref(),
+            overlap_counts_by_turn,
         );
         self.metrics_cache
             .insert(cid.to_string(), (cache_key, tel.clone()));
         tel
+    }
+
+    fn make_model_window(
+        cid: &str,
+        turns: &[TurnSample],
+        summary: Option<&SummaryRecord>,
+        eff_mtime: f64,
+        is_active: bool,
+    ) -> Option<ActiveModelWindow> {
+        let latest = turns.last()?;
+        let model_key = normalized_model_family(&latest.model, &latest.model_display);
+        let min_ts = turns
+            .iter()
+            .map(|t| t.timestamp)
+            .filter(|&ts| ts > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        let min_ts = if min_ts.is_finite() { min_ts } else { eff_mtime };
+        let summary_mod = summary.map(|s| parse_iso_ts(&s.last_modified_time)).unwrap_or(0.0);
+        let max_ts = latest.ended_ts().max(eff_mtime).max(summary_mod);
+        Some(ActiveModelWindow {
+            cid: cid.to_string(),
+            model_key,
+            min_ts,
+            max_ts,
+            is_active,
+            is_carbon: is_gemini_4_carbon(&latest.model, &latest.model_display),
+        })
     }
 
     pub fn get_turn_and_checkpoint_counts(&mut self, cid: &str) -> (usize, usize) {
@@ -1338,6 +1688,7 @@ impl TelemetryEngine {
             prefetched.as_ref(),
             fx_rate,
             ref_now,
+            None,
         );
         if !tel.is_subagent {
             let run_subs = self.get_running_subagent_count(&resolved_cid, Some(ref_now));
@@ -1490,20 +1841,67 @@ impl TelemetryEngine {
             }
         }
 
-        let mut metrics_by_id: HashMap<String, SessionTelemetry> = HashMap::new();
+        let mut turns_by_cid: HashMap<String, std::sync::Arc<Vec<TurnSample>>> = HashMap::new();
+        let mut model_windows: Vec<ActiveModelWindow> = Vec::new();
         for cid in selected_mains.iter().chain(selected_subs.iter()) {
             let stamp = file_stamps.get(cid);
             let turns = self.ledger.read_turns(cid, stamp);
             if turns.is_empty() && !running_ids.contains(cid) {
                 continue;
             }
+            if let Some(w) = Self::make_model_window(
+                cid,
+                &turns,
+                summaries.get(cid),
+                stamp.map(|s| s.eff_mtime).unwrap_or(0.0),
+                running_ids.contains(cid),
+            ) {
+                model_windows.push(w);
+            }
+            turns_by_cid.insert(cid.clone(), turns);
+        }
+        // Include any active conversations outside a workspace filter for global replica-pool/Carbon contention accuracy.
+        for cid in &running_ids {
+            if turns_by_cid.contains_key(cid) {
+                continue;
+            }
+            let stamp = file_stamps.get(cid);
+            let turns = self.ledger.read_turns(cid, stamp);
+            if let Some(w) = Self::make_model_window(
+                cid,
+                &turns,
+                summaries.get(cid),
+                stamp.map(|s| s.eff_mtime).unwrap_or(0.0),
+                true,
+            ) {
+                model_windows.push(w);
+            }
+        }
+
+        let active_carbon_count = model_windows
+            .iter()
+            .filter(|w| w.is_active && w.is_carbon)
+            .count();
+        let carbon_concurrency_warning = active_carbon_count >= 3;
+        let carbon_concurrency_note = if carbon_concurrency_warning {
+            Some(carbon_concurrency_warning_text(lang, active_carbon_count))
+        } else {
+            None
+        };
+
+        let mut metrics_by_id: HashMap<String, SessionTelemetry> = HashMap::new();
+        for cid in selected_mains.iter().chain(selected_subs.iter()) {
+            let Some(turns) = turns_by_cid.get(cid) else { continue };
+            let stamp = file_stamps.get(cid);
+            let overlaps = compute_overlap_counts(cid, turns, &model_windows);
             let tel = self.build_metrics_cached(
                 cid,
                 summaries.get(cid),
-                &turns,
+                turns,
                 stamp,
                 fx_rate,
                 ref_now,
+                Some(&overlaps),
             );
             metrics_by_id.insert(cid.clone(), tel);
         }
@@ -1651,11 +2049,16 @@ impl TelemetryEngine {
                 shown_subagent_count,
                 running_main_count,
                 running_subagent_count,
+                active_carbon_count,
+                carbon_concurrency_warning,
                 compact_needed_count,
                 critical_count,
                 total_cost_usd: round_dp(total_cost_usd, 4),
                 total_cost_cny: round_dp(total_cost_cny, 2),
             },
+            active_carbon_count,
+            carbon_concurrency_warning,
+            carbon_concurrency_note,
             sessions,
             orphan_subagents: orphans,
             settings: None,
@@ -1684,6 +2087,7 @@ impl TelemetryEngine {
                         session: None,
                         total_turns: 0,
                         cold_cache_breakdown: None,
+                        mid_loop_breakdown: None,
                         turns: Vec::new(),
                     };
                 }
@@ -1704,15 +2108,52 @@ impl TelemetryEngine {
                 session: None,
                 total_turns: 0,
                 cold_cache_breakdown: None,
+                mid_loop_breakdown: None,
                 turns: Vec::new(),
             };
         }
 
         let limit = limit.clamp(1, 200);
+        let ref_now = now_epoch_sec();
+        let cfg = self.rates.current_settings();
         let (fx_rate, _) = self.rates.get_fx_rate();
         let summaries = self.ledger.read_summaries();
+        let (file_mtimes, file_stamps) = self.ledger.scan_dir();
         let stamp = stat_db_stamp(&self.ledger.db_path(&resolved));
         let turns = self.ledger.read_turns(&resolved, stamp.as_ref());
+        let mut model_windows: Vec<ActiveModelWindow> = Vec::new();
+        for (cid, s) in summaries.iter() {
+            let Some(&mtime) = file_mtimes.get(cid) else { continue };
+            let is_act = if s.is_subagent() {
+                let eff_ts = parse_iso_ts(&s.last_modified_time).max(mtime);
+                is_subagent_active(
+                    Some(s),
+                    eff_ts,
+                    ref_now,
+                    cfg.context.subagent_silent_timeout_sec,
+                )
+            } else {
+                !s.killed && (s.status == "CASCADE_RUN_STATUS_RUNNING" || s.not_fully_idle)
+            };
+            if is_act || cid == &resolved {
+                let st = file_stamps.get(cid);
+                let c_turns = if cid == &resolved {
+                    turns.clone()
+                } else {
+                    self.ledger.read_turns(cid, st)
+                };
+                if let Some(w) = Self::make_model_window(
+                    cid,
+                    &c_turns,
+                    Some(s),
+                    st.map(|x| x.eff_mtime).unwrap_or(mtime),
+                    is_act,
+                ) {
+                    model_windows.push(w);
+                }
+            }
+        }
+        let overlaps = compute_overlap_counts(&resolved, &turns, &model_windows);
         let t_types = self.transcript_types_if_needed(&resolved, &turns);
         let session = self.build_metrics_cached(
             &resolved,
@@ -1720,10 +2161,19 @@ impl TelemetryEngine {
             &turns,
             stamp.as_ref(),
             fx_rate,
-            now_epoch_sec(),
+            ref_now,
+            Some(&overlaps),
         );
-        let rows = format_turn_rows(&turns, limit, fx_rate, &mut self.rates, t_types.as_ref());
+        let rows = format_turn_rows_with_overlap(
+            &turns,
+            limit,
+            fx_rate,
+            &mut self.rates,
+            t_types.as_ref(),
+            Some(&overlaps),
+        );
         let cb = session.cold_cache_breakdown.clone();
+        let mb = session.mid_loop_breakdown.clone();
         SessionTurnsPayload {
             mode: "turns".into(),
             error: None,
@@ -1731,6 +2181,7 @@ impl TelemetryEngine {
             session: Some(session),
             total_turns: turns.len(),
             cold_cache_breakdown: Some(cb),
+            mid_loop_breakdown: Some(mb),
             turns: rows,
         }
     }

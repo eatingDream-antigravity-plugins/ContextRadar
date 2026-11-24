@@ -11,6 +11,40 @@ use crate::engine::telemetry::SessionTelemetry;
 use crate::i18n::{resolve_active_lang, select_display_cost, Lang};
 use crate::settings::{BudgetTierSpec, Settings, TierMatchRule};
 
+/// Empirical Gemini 4 implicit KV cache TTL (3 minutes, anchored to prefill start `prev.began`).
+pub const GEMINI_4_CACHE_TTL_SEC: f64 = 180.0;
+/// Default implicit/explicit KV cache TTL for non-Gemini-4 models (5 minutes).
+pub const DEFAULT_CACHE_TTL_SEC: f64 = 300.0;
+
+#[inline]
+pub fn is_gemini_4_model(model: &str, model_display: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    let d = model_display.trim().to_ascii_lowercase();
+    m.starts_with("gemini-4")
+        || m.contains("/gemini-4")
+        || d.starts_with("gemini 4")
+        || d.contains("gemini 4")
+        || d.contains("gemini-4")
+}
+
+#[inline]
+pub fn is_gemini_4_carbon(model: &str, model_display: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    let d = model_display.trim().to_ascii_lowercase();
+    m.starts_with("gemini-4-carbon")
+        || m.contains("/gemini-4-carbon")
+        || (is_gemini_4_model(model, model_display) && (m.contains("carbon") || d.contains("carbon")))
+}
+
+#[inline]
+pub fn model_cache_ttl_sec(model: &str, model_display: &str) -> f64 {
+    if is_gemini_4_model(model, model_display) {
+        GEMINI_4_CACHE_TTL_SEC
+    } else {
+        DEFAULT_CACHE_TTL_SEC
+    }
+}
+
 fn fast_model_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -481,6 +515,7 @@ pub struct HandoffPlan {
     pub context_limit: u64,
     pub currency_code: String,
     pub currency_symbol: String,
+    pub cache_ttl_sec: u64,
     pub cache_hit_rate: f64,
     pub estimated_remaining_turns: usize,
     pub upcoming_noisy_tokens: u64,
@@ -530,6 +565,7 @@ pub fn prepare_handoff_plan(
             context_limit: cfg.context.default_limit,
             currency_code: ccode,
             currency_symbol: sym,
+            cache_ttl_sec: DEFAULT_CACHE_TTL_SEC as u64,
             cache_hit_rate: 0.0,
             estimated_remaining_turns: rem_turns,
             upcoming_noisy_tokens,
@@ -684,16 +720,25 @@ pub fn prepare_handoff_plan(
         )
     };
 
+    let cache_ttl_sec = model_cache_ttl_sec(&s.model, &s.model_display) as u64;
     let recipes = if zh {
         HandoffRecipes {
             past_slice_distill: "调用 context_radar_hotspots(mode='distill', save_note=true)：在不改动当前会话前缀的前提下，将早期高膨胀步骤浓缩写入 scratch/，供全新子代理或后续 target:new 接力会话按需读取。".into(),
-            future_branch_fold: "需要继承当前上下文的高噪声探索可调用 swarm(action='add', fork='coordinator')：首轮复用热缓存，探索噪声留在分支，回传简短结论后结束子代理。".into(),
+            future_branch_fold: if is_gemini_4_model(&s.model, &s.model_display) && ctx > 40_000 {
+                "当前上下文 >40k：Gemini 4 上 fork 会触发全量冷 prefill 且缓存 TTL 为 180s（自 prefill 起算）；请用精简摘要派发全新子代理，勿使用 fork。".into()
+            } else {
+                "需要继承当前上下文的高噪声探索可调用 swarm(action='add', fork='coordinator')：探索噪声留在分支，回传简短结论后结束子代理。".into()
+            },
             official_handoff_new: "跨阶段且 running_subagent_count == 0 时调用 context_radar_commit_handoff：生成完整 /compact 指令，并在已打开的面板/卡片中通过官方 target:new 拉起同工作区新会话。".into(),
         }
     } else {
         HandoffRecipes {
             past_slice_distill: "Call context_radar_hotspots(mode='distill', save_note=true) to write an out-of-band <600-token summary to scratch/ for fresh subagents or a future target:new chat without touching the live KV prefix.".into(),
-            future_branch_fold: "Delegate noisy exploration that needs current context via swarm(action='add', fork='coordinator') so turn 1 hits the warm prefix and noisy tool output stays off the main thread.".into(),
+            future_branch_fold: if is_gemini_4_model(&s.model, &s.model_display) && ctx > 40_000 {
+                "Context >40k: on Gemini 4, fork triggers a full cold Turn-1 prefill and cache TTL is 180s from prefill start; spawn a fresh subagent with a concise brief instead of fork.".into()
+            } else {
+                "Delegate noisy exploration via swarm(action='add', fork='coordinator') so noisy tool output stays off the main thread.".into()
+            },
             official_handoff_new: "At a phase boundary with running_subagent_count == 0, call context_radar_commit_handoff to prepare a copyable /compact command or launch a scoped target:new session from an open UI view.".into(),
         }
     };
@@ -710,6 +755,7 @@ pub fn prepare_handoff_plan(
         context_limit: ctx_limit,
         currency_code: ccode,
         currency_symbol: sym,
+        cache_ttl_sec,
         cache_hit_rate: round_dp(cache_hit, 1),
         estimated_remaining_turns: rem_turns,
         upcoming_noisy_tokens,

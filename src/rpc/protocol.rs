@@ -1360,10 +1360,28 @@ impl McpDaemon {
             });
         }
         let short: String = detail.conversation_id.chars().take(8).collect();
+        let mid_note = detail
+            .mid_loop_breakdown
+            .as_ref()
+            .filter(|m| m.slow_turn_self_expiry > 0 || m.replica_spillover > 0 || m.model_switch_cold > 0)
+            .map(|m| {
+                if zh {
+                    format!(
+                        "（中途断缓：慢轮 {} / 副本溢出 {} / 切换模型 {}）",
+                        m.slow_turn_self_expiry, m.replica_spillover, m.model_switch_cold
+                    )
+                } else {
+                    format!(
+                        " (mid-loop: slow-turn {}, replica-spillover {}, model-switch {})",
+                        m.slow_turn_self_expiry, m.replica_spillover, m.model_switch_cold
+                    )
+                }
+            })
+            .unwrap_or_default();
         let text = if zh {
-            format!("会话 {short} 最近 {} 轮明细", detail.turns.len())
+            format!("会话 {short} 最近 {} 轮明细{mid_note}", detail.turns.len())
         } else {
-            format!("Last {} turn(s) for session {short}", detail.turns.len())
+            format!("Last {} turn(s) for session {short}{mid_note}", detail.turns.len())
         };
         json!({
             "content": [{ "type": "text", "text": text }],

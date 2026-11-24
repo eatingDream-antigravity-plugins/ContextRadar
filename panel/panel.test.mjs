@@ -220,3 +220,47 @@ test("bridge.js ignores transparent or translucent --color-background-primary an
   assert.ok(parseColorLum("rgba(20, 19, 17, 0.8)") < 0.15, "rgba with alpha >= 0.5 should return luminance");
   assert.ok(parseColorLum("#faf8f5cc") > 0.9, "8-digit hex with alpha >= 0.5 should return luminance");
 });
+
+test("panel renders bilingual mid-loop sub-reasons and whisper-quiet Carbon concurrency warning without jargon", () => {
+  const html = fs.readFileSync(DIST_HTML, "utf8");
+  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
+
+  // Clean #92 UI rules: zero backend/infra jargon in panel HTML
+  for (const forbidden of ["HBM", "radix", "SHA-1", "0600 Unix Socket", "原生 Rust"]) {
+    assert.equal(html.includes(forbidden), false, `panel.html must not expose jargon '${forbidden}'`);
+  }
+
+  // Carbon concurrency warning is gated on carbon_concurrency_warning && >= 3
+  assert.ok(viewSrc.includes("carbon_concurrency_warning"), "view.js must check carbon_concurrency_warning");
+  assert.ok(viewSrc.includes("active_carbon_count"), "view.js must read active_carbon_count");
+  assert.ok(html.includes("Concurrency tip:"), "panel.html must include English Carbon concurrency tip");
+  assert.ok(html.includes("并发提示："), "panel.html must include Chinese Carbon concurrency tip");
+
+  // Verify coldKind + getCold handle all 3 mid-loop sub-reasons in EN and zh-CN
+  const subMatch = viewSrc.match(/const SUB_L = \{[\s\S]*?\};/);
+  const kindMatch = viewSrc.match(/const coldKind = \(t\) => \{[\s\S]*?\n\};/);
+  const getColdMatch = viewSrc.match(/const getCold = \([\s\S]*?=>[\s\S]*?;\n/);
+  assert.ok(subMatch && kindMatch && getColdMatch, "view.js must define SUB_L, coldKind, getCold");
+
+  let curLang = "en";
+  const sandbox = {
+    num: (v) => Number(v) || 0,
+    tr: (e, z) => (curLang === "zh-CN" ? z : e),
+  };
+  vm.runInNewContext(`${subMatch[0]}\n${kindMatch[0]}\n${getColdMatch[0]}\nthis.coldKind = coldKind; this.getCold = getCold;`, sandbox);
+
+  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "slow_turn_self_expiry" }), "Slow-turn TTL");
+  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "replica_spillover" }), "Replica spillover");
+  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "model_switch_cold" }), "Model switch");
+
+  curLang = "zh-CN";
+  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "slow_turn_self_expiry" }), "慢轮自过期");
+  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "replica_spillover" }), "副本溢出");
+  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "model_switch_cold" }), "切换模型");
+
+  const parsed = sandbox.getCold({
+    cold_cache_breakdown: { turn_start_cold: 1, mid_loop_cold: 3, post_compact_cold: 0 },
+    mid_loop_breakdown: { slow_turn_self_expiry: 1, replica_spillover: 1, model_switch_cold: 1 },
+  });
+  assert.deepEqual({ t: parsed.t, m: parsed.m, p: parsed.p, s: parsed.s, r: parsed.r, w: parsed.w }, { t: 1, m: 3, p: 0, s: 1, r: 1, w: 1 });
+});
