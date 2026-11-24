@@ -47,6 +47,58 @@ impl TurnSample {
         !self.is_checkpoint && self.context_tokens() > 0 && self.cache_read == 0
     }
 
+    /// Prefill start timestamp (`began`) in epoch seconds.
+    #[inline]
+    pub fn began_ts(&self) -> f64 {
+        self.timestamp
+    }
+
+    /// Generation end timestamp (`ended`) in epoch seconds (`began + total_ms / 1000.0`).
+    #[inline]
+    pub fn ended_ts(&self) -> f64 {
+        if self.timestamp > 0.0 && self.total_ms > 0 {
+            self.timestamp + (self.total_ms as f64) / 1000.0
+        } else {
+            self.timestamp
+        }
+    }
+
+    /// Prefill-to-prefill elapsed time (`curr.began - prev.began`) in seconds.
+    #[inline]
+    pub fn start_delta_sec(&self, prev: &TurnSample) -> Option<f64> {
+        if self.timestamp > 0.0 && prev.timestamp > 0.0 {
+            Some((self.timestamp - prev.timestamp).max(0.0))
+        } else {
+            None
+        }
+    }
+
+    /// Idle gap between previous generation end and current prefill start (`curr.began - prev.ended`).
+    #[inline]
+    pub fn idle_gap_sec(&self, prev: &TurnSample) -> Option<f64> {
+        if self.timestamp > 0.0 && prev.timestamp > 0.0 {
+            Some((self.timestamp - prev.ended_ts()).max(0.0))
+        } else {
+            None
+        }
+    }
+
+    /// Returns true if model ID or reasoning-effort display label changed between consecutive steps.
+    pub fn is_model_or_effort_switch(&self, prev: &TurnSample) -> bool {
+        let pm = prev.model.trim().to_ascii_lowercase();
+        let cm = self.model.trim().to_ascii_lowercase();
+        if !pm.is_empty() && !cm.is_empty() && pm != "unknown" && cm != "unknown" && pm != cm {
+            return true;
+        }
+        let pd = prev.model_display.trim().to_ascii_lowercase();
+        let cd = self.model_display.trim().to_ascii_lowercase();
+        !pd.is_empty()
+            && !cd.is_empty()
+            && pd != "未知模型"
+            && cd != "未知模型"
+            && pd != cd
+    }
+
     #[inline]
     pub fn stream_tps(&self) -> f64 {
         if self.output_tokens == 0 || self.total_ms == 0 {

@@ -9,21 +9,22 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use context_radar_mcp::engine::budget::{
-    builtin_tiers, compute_economics, evaluate_handoff_gate, prepare_handoff_plan,
-    resolve_budget_tier,
+    builtin_tiers, compute_economics, evaluate_handoff_gate, is_gemini_4_carbon,
+    is_gemini_4_model, model_cache_ttl_sec, prepare_handoff_plan, resolve_budget_tier,
 };
 use context_radar_mcp::engine::grants::{build_handoff_prompt, RelayGrantStore};
 use context_radar_mcp::engine::pruner::{analyze_hotspots_with_lang, distill_slice};
 use context_radar_mcp::engine::rates::RateTable;
 use context_radar_mcp::engine::telemetry::{
-    build_session_telemetry, format_turn_rows, ColdCacheBreakdown, TelemetryEngine,
+    build_session_telemetry, classify_cold_cache_turns_detailed, format_turn_rows,
+    ColdCacheBreakdown, ColdCacheKind, MidLoopBreakdown, MidLoopSubReason, TelemetryEngine,
 };
 use context_radar_mcp::i18n::{resolve_lang_from_sources, Lang};
 use context_radar_mcp::ledger::journal_tail::JournalTailCache;
 use context_radar_mcp::ledger::sqlite_ro::open_host_readonly;
 use context_radar_mcp::ledger::TurnSample;
 use context_radar_mcp::rpc::protocol::McpDaemon;
-use context_radar_mcp::rpc::tools::{HANDOFF_URI, PANEL_URI};
+use context_radar_mcp::rpc::tools::{summarize_snapshot_text, HANDOFF_URI, PANEL_URI};
 use context_radar_mcp::settings::{SettingsWatcher, DEFAULT_CONTEXT_LIMIT, DEFAULT_FX_RATE};
 use context_radar_mcp::wire::pb_cursor::{decode_step_metadata, decode_timestamp, extract_gen_model};
 
@@ -1315,4 +1316,253 @@ fn test_scoped_relay_grants_reject_cross_workspace_and_cross_conversation() {
         true,
     );
     assert!(ok.claimed);
+}
+
+fn sample_turn(
+    turn_index: usize,
+    began: f64,
+    total_ms: u64,
+    model: &str,
+    model_display: &str,
+    input_tokens: u64,
+    cache_read: u64,
+    cache_write: u64,
+    after_turn_start: Option<bool>,
+) -> TurnSample {
+    TurnSample {
+        turn_index,
+        step_idx: (turn_index as i64) * 2,
+        timestamp: began,
+        model: model.into(),
+        model_display: model_display.into(),
+        input_tokens,
+        cache_read,
+        cache_write,
+        output_tokens: 400,
+        ttft_ms: 1_200,
+        total_ms,
+        response_id: format!("resp-{turn_index}"),
+        step_type: 15,
+        is_checkpoint: false,
+        after_turn_start,
+        after_checkpoint: false,
+    }
+}
+
+#[test]
+fn test_gemini4_180s_prefill_ttl_vs_non_gemini4_300s() {
+    assert!(is_gemini_4_model("gemini-4-carbon-high", "Gemini 4 Carbon (High)"));
+    assert!(is_gemini_4_model("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"));
+    assert!(!is_gemini_4_model("claude-sonnet-4-5", "Claude Sonnet 4.5"));
+    assert!(!is_gemini_4_model("gpt-5", "GPT-5"));
+
+    assert_eq!(model_cache_ttl_sec("gemini-4-carbon-high", "Gemini 4 Carbon (High)"), 180.0);
+    assert_eq!(model_cache_ttl_sec("claude-sonnet-4-5", "Claude Sonnet 4.5"), 300.0);
+
+    let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
+
+    // Gap of 190s (>=180s, <300s): Gemini 4 treats it as expired TTL (TurnStart), Claude treats it as MidLoop (<300s)
+    let g4_turns = vec![
+        sample_turn(1, 1000.0, 5_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 25_000, 0, 0, Some(true)),
+        sample_turn(2, 1190.0, 4_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 28_000, 0, 0, None),
+    ];
+    let g4_tel = build_session_telemetry(
+        "g4-ttl-test",
+        None,
+        &g4_turns,
+        1194.0,
+        7.2,
+        &mut rates,
+        1200.0,
+        None,
+    );
+    assert_eq!(g4_tel.cache_ttl_sec, 180);
+    assert_eq!(
+        g4_tel.cold_cache_breakdown,
+        ColdCacheBreakdown {
+            turn_start_cold: 2,
+            mid_loop_cold: 0,
+            post_compact_cold: 0,
+        }
+    );
+    let g4_rows = format_turn_rows(&g4_turns, 5, 7.2, &mut rates, None);
+    assert!(g4_rows[0].cold_cache_reason.contains("3m") || g4_rows[0].cold_cache_reason.contains("180s"));
+
+    // Claude at 190s (<300s) is NOT TTL-expired -> MidLoop; at 310s (>=300s) -> TurnStart
+    let cl_turns = vec![
+        sample_turn(1, 1000.0, 5_000, "claude-sonnet-4-5", "Claude Sonnet 4.5", 25_000, 0, 0, Some(true)),
+        sample_turn(2, 1190.0, 4_000, "claude-sonnet-4-5", "Claude Sonnet 4.5", 28_000, 0, 0, None),
+        sample_turn(3, 1500.0, 4_000, "claude-sonnet-4-5", "Claude Sonnet 4.5", 30_000, 0, 0, None),
+    ];
+    let cl_tel = build_session_telemetry(
+        "cl-ttl-test",
+        None,
+        &cl_turns,
+        1504.0,
+        7.2,
+        &mut rates,
+        1510.0,
+        None,
+    );
+    assert_eq!(cl_tel.cache_ttl_sec, 300);
+    assert_eq!(
+        cl_tel.cold_cache_breakdown,
+        ColdCacheBreakdown {
+            turn_start_cold: 2,
+            mid_loop_cold: 1,
+            post_compact_cold: 0,
+        }
+    );
+
+    let g4_plan = prepare_handoff_plan(Some(&g4_tel), 12, 0, &mut rates);
+    assert_eq!(g4_plan.cache_ttl_sec, 180);
+    let cl_plan = prepare_handoff_plan(Some(&cl_tel), 12, 0, &mut rates);
+    assert_eq!(cl_plan.cache_ttl_sec, 300);
+}
+
+#[test]
+fn test_mid_loop_sub_reasons_slow_turn_replica_and_model_switch() {
+    let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
+
+    // 1) slow_turn_self_expiry: idle_gap = 7s (<60s) AND curr.began - prev.began = 192s (>=180s)
+    // 2) replica_spillover: partial rollback to turn 1 prompt (22_847)
+    // 3) model_switch_cold: Carbon -> Hydrogen AND Neon XHigh -> Neon High
+    let turns = vec![
+        sample_turn(1, 1000.0, 4_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 22_847, 0, 0, Some(true)),
+        sample_turn(2, 1010.0, 185_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 5_000, 60_000, 0, Some(false)),
+        // Turn 3 begins at 1202.0: start_dt = 192s >= 180s, prev.ended = 1195.0 -> idle_gap = 7s < 60s
+        sample_turn(3, 1202.0, 5_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 72_000, 0, 0, Some(false)),
+        // Turn 4 warm
+        sample_turn(4, 1212.0, 4_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 4_000, 72_000, 0, Some(false)),
+        // Turn 5 partial rollback matching turn 1 static prompt (22_847)
+        sample_turn(5, 1220.0, 4_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 58_000, 22_847, 58_000, Some(false)),
+        // Turn 6 model switch Carbon -> Hydrogen
+        sample_turn(6, 1228.0, 3_000, "gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)", 82_000, 0, 0, Some(false)),
+        // Turn 7 warm on Neon XHigh baseline
+        sample_turn(7, 1235.0, 3_000, "gemini-4-neon", "Gemini 4 Neon (XHigh)", 3_000, 82_000, 0, Some(false)),
+        // Turn 8 reasoning-effort switch Neon XHigh -> Neon High
+        sample_turn(8, 1242.0, 3_000, "gemini-4-neon", "Gemini 4 Neon (High)", 87_000, 0, 0, Some(false)),
+    ];
+
+    let detailed = classify_cold_cache_turns_detailed(&turns, None, None);
+    assert_eq!(detailed[2].kind, ColdCacheKind::MidLoop);
+    assert_eq!(detailed[2].sub_reason, MidLoopSubReason::SlowTurnSelfExpiry);
+    assert_eq!(detailed[4].kind, ColdCacheKind::MidLoop);
+    assert_eq!(detailed[4].sub_reason, MidLoopSubReason::ReplicaSpillover);
+    assert_eq!(detailed[5].kind, ColdCacheKind::MidLoop);
+    assert_eq!(detailed[5].sub_reason, MidLoopSubReason::ModelSwitchCold);
+    assert_eq!(detailed[7].kind, ColdCacheKind::MidLoop);
+    assert_eq!(detailed[7].sub_reason, MidLoopSubReason::ModelSwitchCold);
+
+    let tel = build_session_telemetry(
+        "midloop-sub-test",
+        None,
+        &turns,
+        1245.0,
+        7.2,
+        &mut rates,
+        1250.0,
+        None,
+    );
+    assert_eq!(tel.cold_cache_breakdown.mid_loop_cold, 4);
+    assert_eq!(
+        tel.mid_loop_breakdown,
+        MidLoopBreakdown {
+            slow_turn_self_expiry: 1,
+            replica_spillover: 1,
+            model_switch_cold: 2,
+            other: 0,
+        }
+    );
+}
+
+#[test]
+fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
+    assert!(is_gemini_4_carbon("gemini-4-carbon-high", "Gemini 4 Carbon (High)"));
+    assert!(!is_gemini_4_carbon("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"));
+    let now = 1_795_400_000.0;
+    let td = TempDir::new().unwrap();
+    let conv_dir = td.path().join("conversations");
+    fs::create_dir_all(&conv_dir).unwrap();
+
+    let c1 = "c4000000-0000-0000-0000-000000000001";
+    let c2 = "c4000000-0000-0000-0000-000000000002";
+    let c3 = "c4000000-0000-0000-0000-000000000003";
+    let h1 = "c4000000-0000-0000-0000-000000000004";
+    let idle_c = "c4000000-0000-0000-0000-000000000005";
+
+    // c1 has a short-gap (<60s) mid-loop cold miss while 3 active Carbon sessions overlap
+    create_conv_db(
+        &conv_dir.join(format!("{c1}.db")),
+        &[
+            (0, 14, None),
+            (1, 15, Some(make_step_meta((now - 40.0) as u64, 30_000, 0, 400, "r1", 0, 0))),
+            (2, 132, None),
+            (3, 15, Some(make_step_meta((now - 10.0) as u64, 36_000, 0, 400, "r2", 0, 0))),
+        ],
+        "gemini-4-carbon-high",
+        "Gemini 4 Carbon (High)",
+    );
+    for (cid, model, disp) in [
+        (c2, "gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+        (c3, "gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)"),
+        (h1, "gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
+        (idle_c, "gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+    ] {
+        create_conv_db(
+            &conv_dir.join(format!("{cid}.db")),
+            &[
+                (0, 14, None),
+                (1, 15, Some(make_step_meta((now - 20.0) as u64, 25_000, 0, 300, "r1", 0, 0))),
+            ],
+            model,
+            disp,
+        );
+    }
+
+    // Phase 1: only 2 active Carbon sessions (c1, c2) + 1 active Hydrogen (h1) + 1 idle Carbon (idle_c) -> NO warning
+    create_summaries_db(
+        &td.path().join("conversation_summaries.db"),
+        &[
+            (c1, "Carbon 1", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_RUNNING", "", "", 0, 1, 0, iso(now - 10.0), 0),
+            (c2, "Carbon 2", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_RUNNING", "w-c2", c1, 1, 1, 0, iso(now - 15.0), -1),
+            (c3, "Carbon 3 (idle)", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_IDLE", "w-c3", c1, 1, 0, 0, iso(now - 20.0), -1),
+            (h1, "Hydrogen 1", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_RUNNING", "w-h1", c1, 1, 1, 0, iso(now - 12.0), -1),
+            (idle_c, "Idle Carbon", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_IDLE", "", "", 0, 0, 0, iso(now - 20.0), 0),
+        ],
+    );
+
+    let mut eng = TelemetryEngine::new(
+        Some(td.path().to_path_buf()),
+        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(None),
+    );
+    let snap2 = eng.build_overview_snapshot(20, false, false, "", Some(now));
+    assert_eq!(snap2.summary.active_carbon_count, 2);
+    assert!(!snap2.summary.carbon_concurrency_warning);
+    assert!(!snap2.carbon_concurrency_warning);
+    assert!(snap2.carbon_concurrency_note.is_none());
+
+    // Phase 2: activate c3 -> 3 simultaneous active Gemini 4 Carbon conversations -> warning triggers AND c1's short-gap cold miss attributes to replica_spillover!
+    {
+        let conn = Connection::open(td.path().join("conversation_summaries.db")).unwrap();
+        conn.execute(
+            "UPDATE conversation_summaries SET status='CASCADE_RUN_STATUS_RUNNING', not_fully_idle=1 WHERE conversation_id=?1",
+            params![c3],
+        )
+        .unwrap();
+    }
+    let snap3 = eng.build_overview_snapshot(20, false, false, "", Some(now));
+    assert_eq!(snap3.summary.active_carbon_count, 3);
+    assert!(snap3.summary.carbon_concurrency_warning);
+    assert!(snap3.carbon_concurrency_warning);
+    assert!(snap3.carbon_concurrency_note.as_deref().unwrap().contains("<= 2"));
+    assert!(summarize_snapshot_text(&snap3).contains("<= 2"));
+
+    let c1_tel = snap3.sessions.iter().find(|s| s.id == c1).unwrap();
+    assert_eq!(c1_tel.mid_loop_breakdown.replica_spillover, 1);
+
+    let turns_payload = eng.get_session_turns(c1, 10);
+    assert_eq!(turns_payload.mid_loop_breakdown.unwrap().replica_spillover, 1);
+    assert_eq!(turns_payload.turns[0].cold_cache_sub_reason, "replica_spillover");
 }

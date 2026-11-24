@@ -375,6 +375,10 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
         )
     }];
 
+    if let Some(ref note) = snap.carbon_concurrency_note {
+        lines.push(format!("! {note}"));
+    }
+
     for item in snap.sessions.iter().take(8) {
         let item_cost = select_display_cost(item.cost_usd, item.cost_cny, ccode);
         let flag = if item.just_compacted {
@@ -398,21 +402,41 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
             ""
         };
         let cb = &item.cold_cache_breakdown;
+        let mb = &item.mid_loop_breakdown;
+        let mid_sub = if cb.mid_loop_cold > 0
+            && (mb.slow_turn_self_expiry > 0 || mb.replica_spillover > 0 || mb.model_switch_cold > 0)
+        {
+            if zh {
+                format!(
+                    "[慢轮{}/溢出{}/切模{}]",
+                    mb.slow_turn_self_expiry, mb.replica_spillover, mb.model_switch_cold
+                )
+            } else {
+                format!(
+                    "[slow:{}/spill:{}/switch:{}]",
+                    mb.slow_turn_self_expiry, mb.replica_spillover, mb.model_switch_cold
+                )
+            }
+        } else {
+            String::new()
+        };
         let cold_txt = if item.cold_cache_count > 0 {
             if zh {
                 format!(
-                    " (冷未命中 {}: 新轮次 {}/中途 {}/压缩后 {})",
+                    " (冷未命中 {}: 新轮次 {}/中途 {}{}/压缩后 {})",
                     item.cold_cache_count,
                     cb.turn_start_cold,
                     cb.mid_loop_cold,
+                    mid_sub,
                     cb.post_compact_cold
                 )
             } else {
                 format!(
-                    " ({} cold: {} new-turn/{} mid-turn/{} post-compact)",
+                    " ({} cold: {} new-turn/{} mid-turn{}/{} post-compact)",
                     item.cold_cache_count,
                     cb.turn_start_cold,
                     cb.mid_loop_cold,
+                    mid_sub,
                     cb.post_compact_cold
                 )
             }

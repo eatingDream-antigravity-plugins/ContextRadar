@@ -9,7 +9,7 @@ const getPref = () => { try { const v = localStorage.getItem("cr_lang"); return 
 const setPref = (v) => { try { localStorage.setItem("cr_lang", v); } catch {} };
 const parseLoc = (r) => { const s = String(r || "").trim().toLowerCase(); return !s || s === "auto" ? "" : s.startsWith("zh") ? "zh-CN" : "en"; };
 
-let langLocked = Boolean(getPref() || boot?.settings?.lang);
+let langLocked = !!(getPref() || boot?.settings?.lang);
 let lang = getPref() || parseLoc(boot?.settings?.lang) || parseLoc(typeof navigator !== "undefined" ? navigator.language : "") || parseLoc(boot?.lang) || "en";
 DE.lang = lang;
 
@@ -37,12 +37,12 @@ let canCallTools = true, inFlightPoll = false, queuedForce = false, pollTimer = 
 // Persistent DOM mount state (mount ONCE, patch strictly in place — zero full-shell, hero, or row-tray wipes!)
 let mountedMode = "", ui = null, lastPendingSig = "", lastHandoffSig = "";
 const rowNodes = new Map();
-let uMi, uMt, uEn, uZh, uRb, uRi, uEr, uPg, uHd, uHt, uHi, uHm, uHs, uHv, uHdBlk, uBr, uSg, uTa, uTs, uTr, uAb, uSw, uSwL, uLs, uEm, uHl;
+let uMi, uMt, uEn, uZh, uRb, uRi, uEr, uCw, uPg, uHd, uHt, uHi, uHm, uHs, uHv, uHdBlk, uBr, uSg, uTa, uTs, uTr, uAb, uSw, uSwL, uLs, uEm, uHl;
 
 const callTool = (name, args) => bridge.callServerTool({ name, arguments: args });
 const uiAct = (args) => callTool("context_radar_ui_action", args);
 const num = (v) => Number(v) || 0;
-const esc = (v) => String(v ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#39;");
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const safeLvl = (l) => (l === "critical" || l === "warn" ? l : "ok");
 const lvlCls = (l) => (l === "critical" ? "lc" : l === "warn" ? "lw" : "");
 const dv = (c, s = "") => `<div class="${c}">${s}</div>`;
@@ -78,10 +78,10 @@ const canDirectMsg = (it) => {
   if (!canMessage || !it || it.is_subagent) return false;
   if (ownerCid) return ownerCid === it.id;
   const hero = getHero();
-  return Boolean(hero && hero.id === it.id && sameWs(it.workspace, it.workspaces) && num(snapshot?.summary?.running_main_count) <= 1);
+  return !!(hero && hero.id === it.id && sameWs(it.workspace, it.workspaces) && num(snapshot?.summary?.running_main_count) <= 1);
 };
-const getCold = ({ cold_cache_breakdown: c, turn_start_cold_count: t, mid_loop_cold_count: m, post_compact_cold_count: p }) =>
-  ({ t: num(c?.turn_start_cold ?? t), m: num(c?.mid_loop_cold ?? m), p: num(c?.post_compact_cold ?? p) });
+const getCold = ({ cold_cache_breakdown: c, mid_loop_breakdown: mb, turn_start_cold_count: t, mid_loop_cold_count: m, post_compact_cold_count: p }) =>
+  ({ t: num(c?.turn_start_cold ?? t), m: num(c?.mid_loop_cold ?? m), p: num(c?.post_compact_cold ?? p), s: num(mb?.slow_turn_self_expiry), r: num(mb?.replica_spillover), w: num(mb?.model_switch_cold) });
 
 function getVerdict(it) {
   const lvl = safeLvl(it.level);
@@ -98,24 +98,27 @@ function renderIdPill(id, compact = false) {
   return `<button class="id${ok ? " ok" : ""}" data-a="copy-id" data-i="${esc(id)}" title="${esc(id)}">${ok ? tr("✓ Copied", "✓ 已复制") : compact ? tr("Copy ID", "复制 ID") : esc(id.length > 12 ? `${id.slice(0, 6)}…${id.slice(-4)}` : id)}</button>`;
 }
 
-const coldKind = (k, p) => k === "mid_loop_cold" ? (p ? tr("Partial drop", "前缀跌落") : tr("Mid-turn", "中途断缓")) : k === "post_compact_cold" ? tr("Post-compact", "压缩后") : tr("New turn", "新轮次");
+const SUB_L = { slow_turn_self_expiry: ["Slow-turn TTL", "慢轮自过期"], replica_spillover: ["Replica spillover", "副本溢出"], model_switch_cold: ["Model switch", "切换模型"] };
+const coldKind = (t) => {
+  const k = t.cold_cache_kind, sr = t.cold_cache_sub_reason;
+  return k === "mid_loop_cold" ? (SUB_L[sr] ? tr(...SUB_L[sr]) : t.is_partial_cold ? tr("Partial drop", "前缀跌落") : tr("Mid-turn", "中途断缓")) : k === "post_compact_cold" ? tr("Post-compact", "压缩后") : tr("New turn", "新轮次");
+};
 const COLD_CLS = { mid_loop_cold: "mid", post_compact_cold: "post" };
 
 function renderSubTray(it) {
-  const { id: cid, pricing_known: pk, running_subagent_count: rsc, min_compact_tokens: mct, recommend_compact_tokens: rct, urgent_compact_tokens: uct, workspace: ws, workspaces: wss } = it;
-  const tab = openTrays.get(cid);
+  const cid = it.id, tab = openTrays.get(cid);
   if (!tab) return "";
   if (loadingKey === `${tab}:${cid}`) return bx(sp("nt", tr("Loading…", "加载中…")));
   if (tab === "turns") {
     const d = cTurns.get(cid);
     if (!d?.turns?.length) return bx(sp("nt", tr("No turns yet", "暂无轮次")));
     const chrono = d.turns.slice(0, 24).reverse(), mx = Math.max(1, ...chrono.map((t) => num(t.context_tokens)));
-    const bars = chrono.map(({ turn: tn, context_tokens: ct, cache_hit_rate: ch, is_checkpoint: ck, is_cold_cache: cc, cold_cache_kind: k, is_partial_cold: pc }) =>
-      `<span class="sr ${ck ? "ckpt" : cc ? "cold" : ""}" style="height:${Math.max(12, Math.round((num(ct) / mx) * 100))}%" title="${esc(`#${num(tn)} · ${fmtK(ct)} · ${tr("Cache", "缓存")} ${num(ch).toFixed(0)}%${cc ? ` (${coldKind(k, pc)})` : ""}`)}"></span>`).join("");
+    const bars = chrono.map((t) =>
+      `<span class="sr ${t.is_checkpoint ? "ckpt" : t.is_cold_cache ? "cold" : ""}" style="height:${Math.max(12, Math.round((num(t.context_tokens) / mx) * 100))}%" title="${esc(`#${num(t.turn)} · ${fmtK(t.context_tokens)} · ${tr("Cache", "缓存")} ${num(t.cache_hit_rate).toFixed(0)}%${t.is_cold_cache ? ` (${coldKind(t)})` : ""}`)}"></span>`).join("");
     const cellRow = (tag, arr) => arr.map((v) => `<${tag}>${v}</${tag}>`).join("");
-    const rows = d.turns.slice(0, 10).map(({ turn: tn, time_iso: ti, context_tokens: ct, cache_hit_rate: ch, is_checkpoint: ck, is_cold_cache: cc, cold_cache_kind: k, is_partial_cold: pc, ttft_ms: tt, stream_tps: st, cost_usd: cu, cost_cny: cy }) => {
-      const hr = num(ch).toFixed(0), cCell = !cc ? `${hr}%` : `${sp("ch", `${hr}%`)} ${sp(`ct ${COLD_CLS[k] || "turn"}`, coldKind(k, pc))}`;
-      return `<tr>${cellRow("td", [ck ? `#${num(tn)}·${tr("Compact", "压缩")}` : `#${num(tn)}`, fmtClock(ti), `<b>${fmtK(ct)}</b>`, cCell, ck ? tr("Ckpt", "检查点") : `${fmtMs(tt)}/${num(st) > 0 ? num(st).toFixed(0) : "-"}`, fmtMoney(cu, cy, 2, pk)])}</tr>`;
+    const rows = d.turns.slice(0, 10).map((t) => {
+      const hr = num(t.cache_hit_rate).toFixed(0), cCell = !t.is_cold_cache ? `${hr}%` : `${sp("ch", `${hr}%`)} ${sp(`ct ${COLD_CLS[t.cold_cache_kind] || "turn"}`, coldKind(t), t.cold_cache_reason ? ` title="${esc(t.cold_cache_reason)}"` : "")}`;
+      return `<tr>${cellRow("td", [t.is_checkpoint ? `#${num(t.turn)}·${tr("Compact", "压缩")}` : `#${num(t.turn)}`, fmtClock(t.time_iso), `<b>${fmtK(t.context_tokens)}</b>`, cCell, t.is_checkpoint ? tr("Ckpt", "检查点") : `${fmtMs(t.ttft_ms)}/${num(t.stream_tps) > 0 ? num(t.stream_tps).toFixed(0) : "-"}`, fmtMoney(t.cost_usd, t.cost_cny, 2, it.pricing_known)])}</tr>`;
     }).join("");
     const ths = cellRow("th", [tr("Turn", "轮次"), tr("Time", "时间"), tr("Ctx", "上下文"), tr("Cache", "缓存"), "TTFT/s", tr("Cost", "费用")]);
     return bx(`${nt(tr(`Recent ${chrono.length}/${num(d.total_turns)}`, `最近 ${chrono.length}/${num(d.total_turns)} 轮`))}${dv("sk", bars)}${dv("ts", `<table class="tb"><thead><tr>${ths}</tr></thead><tbody>${rows}</tbody></table>`)}`);
@@ -132,13 +135,12 @@ function renderSubTray(it) {
   if (tab === "advice") {
     const p = cAdv.get(cid);
     if (!p?.found) return bx(sp("nt", esc(p?.reason || tr("Unable to evaluate", "暂无法评估"))), " ac");
-    const { gate_allowed: ok, break_even_turns: bet, pricing_known: pk2, compact_overhead_usd: cou, compact_overhead_cny: coc, per_turn_saving_usd: psu, per_turn_saving_cny: psc, gate_reasons: gr, headline: hl } = p;
-    const runSubs = num(rsc), subBdg = runSubs > 0 ? bdg("warn", subTxt(runSubs)) : bdg("ok", tr("0 subagents", "无子代理"));
+    const ok = p.gate_allowed, runSubs = num(it.running_subagent_count), subBdg = runSubs > 0 ? bdg("warn", subTxt(runSubs)) : bdg("ok", tr("0 subagents", "无子代理"));
     const k = (v, d) => Math.round((num(v) || d) / 1e3), fm = (u, c, d) => fmtMoney(u, c, d, 1);
-    const tier = `${tr("Thresholds", "阈值")} ${k(mct, 27e4)}k/${k(rct, 31e4)}k/${k(uct, 42e4)}k · ${tr("break-even", "回本")} >=${num(bet)}${tr("t", "轮")}`;
-    const econ = pk2 !== false ? ` · ${tr("Rebuild", "重建")} ${fm(cou, coc, 2)} · ${tr("Saves", "省")} ${fm(psu, psc, 3)}/t` : "";
-    const canLaunch = ok && canMessage && !runSubs && sameWs(ws, wss), busy = loadingKey === `handoff:${cid}`;
-    return bx(`${dv("hh", dv("bds", `${bdg(ok ? "ok" : "warn", ok ? tr("Ready for handoff", "满足交接条件") : tr(...T_KP))}${subBdg}`))}${nt(esc(tier + econ))}<div class="nt wr" style="color:var(--t1)">${esc(hl)}</div>${(gr || []).map((r) => nt(`· ${esc(r)}`, " wr")).join("")}${dv("ac", `${ok ? btn("", "up", busy ? tr("Preparing…", "生成中…") : tr("Prepare /compact", "生成 /compact"), cid, busy ? " disabled" : "") : btn("", "cc", tr(...T_CP))}${canLaunch ? btn("p cr-cap-msg", "ul", tr(...T_LN), cid, busy ? " disabled" : "") : ""}${sw(tr(...T_AH))}`)}`, " ac");
+    const tier = `${tr("Thresholds", "阈值")} ${k(it.min_compact_tokens, 27e4)}k/${k(it.recommend_compact_tokens, 31e4)}k/${k(it.urgent_compact_tokens, 42e4)}k · ${tr("break-even", "回本")} >=${num(p.break_even_turns)}${tr("t", "轮")}`;
+    const econ = p.pricing_known !== false ? ` · ${tr("Rebuild", "重建")} ${fm(p.compact_overhead_usd, p.compact_overhead_cny, 2)} · ${tr("Saves", "省")} ${fm(p.per_turn_saving_usd, p.per_turn_saving_cny, 3)}/t` : "";
+    const canLaunch = ok && canMessage && !runSubs && sameWs(it.workspace, it.workspaces), busy = loadingKey === `handoff:${cid}`;
+    return bx(`${dv("hh", dv("bds", `${bdg(ok ? "ok" : "warn", ok ? tr("Ready for handoff", "满足交接条件") : tr(...T_KP))}${subBdg}`))}${nt(esc(tier + econ))}<div class="nt wr" style="color:var(--t1)">${esc(p.headline)}</div>${(p.gate_reasons || []).map((r) => nt(`· ${esc(r)}`, " wr")).join("")}${dv("ac", `${ok ? btn("", "up", busy ? tr("Preparing…", "生成中…") : tr("Prepare /compact", "生成 /compact"), cid, busy ? " disabled" : "") : btn("", "cc", tr(...T_CP))}${canLaunch ? btn("p cr-cap-msg", "ul", tr(...T_LN), cid, busy ? " disabled" : "") : ""}${sw(tr(...T_AH))}`)}`, " ac");
   }
   return "";
 }
@@ -154,10 +156,12 @@ function renderExtraActions(it) {
     : btn("cr-cap-msg", "ask", tr("Remind", "提醒"), cid));
 }
 
+const ce = (t) => D.createElement(t);
+const TABS = ["turns", "hotspots", "advice"];
 function mountDetailBlock() {
-  const el = D.createElement("div"); el.className = "dtl";
+  const el = ce("div"); el.className = "dtl";
   const pl = dv("pl", `${sp("pll")}${sp("pv")}${sp("ps")}`).repeat(3);
-  const bts = ["turns", "hotspots", "advice"].map((t, i) => `<button class="bt${i === 2 ? " p" : ""} ct0" data-a="t-${t}"></button>`).join("");
+  const bts = TABS.map((t, i) => `<button class="bt${i === 2 ? " p" : ""} ct0" data-a="t-${t}"></button>`).join("");
   el.innerHTML = `${dv("gg", `${dv("gt", `${dv("gf ok", "")}${sp("gk").repeat(2)}${sp("gk u")}`)}${dv("gl", "<span></span><span></span>")}`)}${dv("pls", pl)}${dv("ac", `${bts}<button class="id" data-a="copy-id"></button>${sp("ac", "", " hidden")}`)}<div hidden></div>`;
   const [gg, pls, acts, trEl] = el.children, gt = gg.firstElementChild;
   sa(gt, "role", "progressbar"); sa(gt, "aria-valuemin", "0"); sa(gt, "aria-valuemax", "100");
@@ -176,32 +180,33 @@ const patchIdBtn = (el, cid, show) => {
 };
 const patchBadge = (el, cls, txt) => { el.hidden = !txt; if (txt) { setCls(el, `bd ${cls}`); setTxt(el, txt); } };
 const setPill = (p, lbl, v1, v2, cls, tip) => {
-  const [l, a, b] = p.children; setTxt(l, lbl); a.textContent = v1; b.textContent = v2;
+  const [l, a, b] = p.children; setTxt(l, lbl); setTxt(a, v1); setTxt(b, v2);
   if (cls) b.className = cls; if (tip || b.title) b.title = tip;
 };
 
 function patchDetailBlock(d, it, showCopyId) {
-  const { id: cid = "", level, running_subagent_count: rsc, context_limit: cLim, latest_context_tokens: lct, min_compact_tokens: mct, recommend_compact_tokens: rct, urgent_compact_tokens: uct, context_pct: cpct, just_compacted: jc, pre_compact_tokens: pctPre, turns: tn, cold_cache_count: ccc, median_stream_tps: mst, peak_context_tokens: peak, cache_hit_rate: chr, median_ttft_ms: mtt, cost_usd: cu, cost_cny: cy, pricing_known: pk, checkpoint_count: ckc, suggest_compact: sc, is_subagent: sub } = it;
+  const cid = it.id || "", lvl = safeLvl(it.level), runSubs = num(it.running_subagent_count), lim = num(it.context_limit || snapshot?.thresholds?.max) || 512_000, ctx = num(it.latest_context_tokens), cpct = num(it.context_pct).toFixed(1), ckc = num(it.checkpoint_count);
   const [, gt, gf, ts, g1, g2, ps, bs, bi, ex, trEl] = d;
-  const lvl = safeLvl(level), runSubs = num(rsc), lim = num(cLim || snapshot?.thresholds?.max) || 512_000, ctx = num(lct);
   const pct = Math.min(100, Math.max(0, (ctx / lim) * 100));
   sa(gt, "aria-label", tr("Context usage", "上下文占用")); sa(gt, "aria-valuenow", String(Math.round(pct)));
   gf.className = `gf ${lvl}`; gf.style.width = `${pct.toFixed(1)}%`;
   const tick = (el, v, d0, lb) => { const n = num(v) || d0; el.style.left = `${Math.min(100, (n / lim) * 100).toFixed(1)}%`; el.title = `${lb} ${Math.round(n / 1e3)}k`; };
-  tick(ts[0], mct, 27e4, tr("Floor", "下限")); tick(ts[1], rct, 31e4, tr("Target", "推荐")); tick(ts[2], uct, 42e4, tr("Urgent", "紧急"));
-  g1.textContent = `${fmtK(ctx)} / ${fmtK(lim)} (${num(cpct).toFixed(1)}%)`;
-  g2.textContent = jc && pctPre ? `${tr("Before", "压缩前")} ${fmtK(pctPre)}` : isZh() ? `${num(tn)} 轮` : `${num(tn)}t`;
+  tick(ts[0], it.min_compact_tokens, 27e4, tr("Floor", "下限")); tick(ts[1], it.recommend_compact_tokens, 31e4, tr("Target", "推荐")); tick(ts[2], it.urgent_compact_tokens, 42e4, tr("Urgent", "紧急"));
+  setTxt(g1, `${fmtK(ctx)} / ${fmtK(lim)} (${cpct}%)`);
+  setTxt(g2, it.just_compacted && it.pre_compact_tokens ? `${tr("Before", "压缩前")} ${fmtK(it.pre_compact_tokens)}` : isZh() ? `${num(it.turns)} 轮` : `${num(it.turns)}t`);
 
-  const c = getCold(it), cN = num(ccc), tps = num(mst) > 0 ? `${num(mst).toFixed(0)} tok/s` : "-";
-  setPill(ps[0], tr("Context", "上下文"), `${fmtK(ctx)} · ${num(cpct).toFixed(1)}%`, `${tr("Peak", "峰值")} ${fmtK(peak || ctx)}`, "", "");
-  setPill(ps[1], tr("KV Cache", "KV 缓存"), `${num(chr).toFixed(1)}%`, cN ? (isZh() ? `冷未命中 ${cN} 次` : `${cN} cold miss${cN === 1 ? "" : "es"}`) : tr("0 cold misses", "无冷未命中"), `ps${cN && c.m > 0 ? " ch" : ""}`, cN ? (isZh() ? `新:${c.t} 途:${c.m} 压:${c.p}` : `New:${c.t} Mid:${c.m} Compact:${c.p}`) : "");
-  setPill(ps[2], tr("Speed & Cost", "速度与费用"), `${fmtMs(mtt)} · ${tps}`, fmtMoney(cu, cy, 2, pk), "", ckc ? (isZh() ? `压缩 ${num(ckc)} 次` : `Compacted ${num(ckc)}x`) : "");
+  const c = getCold(it), cN = num(it.cold_cache_count), tps = num(it.median_stream_tps) > 0 ? `${num(it.median_stream_tps).toFixed(0)} tok/s` : "-";
+  const midSub = c.m > 0 && (c.s || c.r || c.w) ? (isZh() ? `（慢轮${c.s}/溢出${c.r}/切模${c.w}）` : ` (Slow ${c.s}/Spill ${c.r}/Switch ${c.w})`) : "";
+  const coldTip = cN ? (isZh() ? `新轮次 ${c.t} · 中途 ${c.m}${midSub} · 压缩后 ${c.p}` : `New ${c.t} · Mid ${c.m}${midSub} · Compact ${c.p}`) : "";
+  setPill(ps[0], tr("Context", "上下文"), `${fmtK(ctx)} · ${cpct}%`, `${tr("Peak", "峰值")} ${fmtK(it.peak_context_tokens || ctx)}`, "", "");
+  setPill(ps[1], tr("KV Cache", "KV 缓存"), `${num(it.cache_hit_rate).toFixed(1)}%`, cN ? (isZh() ? `冷未命中 ${cN} 次` : `${cN} cold miss${cN === 1 ? "" : "es"}`) : tr("0 cold misses", "无冷未命中"), `ps${cN && c.m > 0 ? " ch" : ""}`, coldTip);
+  setPill(ps[2], tr("Speed & Cost", "速度与费用"), `${fmtMs(it.median_ttft_ms)} · ${tps}`, fmtMoney(it.cost_usd, it.cost_cny, 2, it.pricing_known), "", ckc ? (isZh() ? `压缩 ${ckc} 次` : `Compacted ${ckc}x`) : "");
 
-  const cur = openTrays.get(cid) || "", tKeys = ["turns", "hotspots", "advice"], tLbls = [tr("Turns", "轮次"), tr("Hotspots", "热点"), tr("Handoff", "交接")];
-  for (let i = 0; i < 3; i++) { setTxt(bs[i], tLbls[i]); bs[i].dataset.i = cid; cl(bs[i], "on", cur === tKeys[i]); }
+  const cur = openTrays.get(cid) || "", tLbls = [tr("Turns", "轮次"), tr("Hotspots", "热点"), tr("Handoff", "交接")];
+  for (let i = 0; i < 3; i++) { setTxt(bs[i], tLbls[i]); bs[i].dataset.i = cid; cl(bs[i], "on", cur === TABS[i]); }
   patchIdBtn(bi, cid, showCopyId);
 
-  const exSig = `${lang}|${cid}|${lvl}|${Boolean(sc)}|${Boolean(jc)}|${Boolean(sub)}|${canDirectMsg(it)}|${confirmSendId === cid}`;
+  const exSig = `${lang}|${cid}|${lvl}|${!!it.suggest_compact}|${!!it.just_compacted}|${!!it.is_subagent}|${canDirectMsg(it)}|${confirmSendId === cid}`;
   if (exSig !== d[11]) { d[11] = exSig; const h = renderExtraActions(it); ex.hidden = !h; ex.innerHTML = h; }
 
   const traySig = cur ? `${lang}|${cid}|${cur}|${loadingKey}|${subTrayRev}|${runSubs}|${allowAutoHandoff}|${canMessage}` : "";
@@ -212,9 +217,9 @@ function ensureDashboardMount(root) {
   if (mountedMode === "dashboard" && ui) return;
   rowNodes.clear(); lastPendingSig = ""; mountedMode = "dashboard";
   const tabs = ["active", "subs", "archived"].map((t) => `<button role="tab" class="sb" data-a="tab" data-i="${t}"></button>`).join("");
-  root.innerHTML = dv("sh", `<header class="ms">${dv("bd0", `${BRAND_SVG}<h1>Context Radar</h1>`)}${dv("mr", `${sp("mi", "", " hidden")}${sp("mt")}${langBtn(true)}<button class="ib ct0" data-a="ref" aria-label="Refresh">${REFRESH_SVG}</button>`)}</header>${dv("er", "", )}${dv("", "")}<section class="hr" hidden>${dv("hh", `${dv("hm", `${sp("dt idle")}${sp("tt")}<button class="id" data-a="copy-id"></button>`)}${dv("bds", `${sp("bd muted")}${sp("bd info", "", " hidden")}${sp("bd ok", "", " hidden")}`)}`)}</section>${dv("br", `${dv("sg ct0", tabs)}${dv("ac", `${btn("ct0", "aut", "")}<button role="switch" class="cr-switch cr-cap-msg" data-a="aho">${sp("tk", sp("th"))}<span></span></button>`)}`)}${dv("ls", "")}${dv("em", "")}`);
-  const sh = root.firstElementChild, [ms, er, pg, he, br, ls, em] = sh.children;
-  er.hidden = pg.hidden = br.hidden = ls.hidden = em.hidden = true;
+  root.innerHTML = dv("sh", `<header class="ms">${dv("bd0", `${BRAND_SVG}<h1>Context Radar</h1>`)}${dv("mr", `${sp("mi", "", " hidden")}${sp("mt")}${langBtn(true)}<button class="ib ct0" data-a="ref" aria-label="Refresh">${REFRESH_SVG}</button>`)}</header>${dv("er", "")}${dv("cw", "")}${dv("", "")}<section class="hr" hidden>${dv("hh", `${dv("hm", `${sp("dt idle")}${sp("tt")}<button class="id" data-a="copy-id"></button>`)}${dv("bds", `${sp("bd muted")}${sp("bd info", "", " hidden")}${sp("bd ok", "", " hidden")}`)}`)}</section>${dv("br", `${dv("sg ct0", tabs)}${dv("ac", `${btn("ct0", "aut", "")}<button role="switch" class="cr-switch cr-cap-msg" data-a="aho">${sp("tk", sp("th"))}<span></span></button>`)}`)}${dv("ls", "")}${dv("em", "")}`);
+  const sh = root.firstElementChild, [ms, er, cw, pg, he, br, ls, em] = sh.children;
+  er.hidden = cw.hidden = pg.hidden = br.hidden = ls.hidden = em.hidden = true;
   const [mi, mt, lgBtn, rb] = ms.lastElementChild.children;
   [uEn, uZh] = lgBtn.children;
   const hh = he.firstElementChild;
@@ -222,7 +227,7 @@ function ensureDashboardMount(root) {
   uHdBlk = mountDetailBlock(); he.appendChild(uHdBlk[0]);
   [uTa, uTs, uTr] = br.firstElementChild.children; sa(br.firstElementChild, "role", "tablist");
   [uAb, uSw] = br.lastElementChild.children;
-  uMi = mi; uMt = mt; uRb = rb; uRi = rb.firstElementChild; uEr = er; uPg = pg; uBr = br; uSg = br.firstElementChild; uSwL = uSw.lastElementChild; uLs = ls; uEm = em;
+  uMi = mi; uMt = mt; uRb = rb; uRi = rb.firstElementChild; uEr = er; uCw = cw; uPg = pg; uBr = br; uSg = br.firstElementChild; uSwL = uSw.lastElementChild; uLs = ls; uEm = em;
   ui = { he };
 }
 
@@ -241,15 +246,15 @@ function renderRelayCard(cls, active, title, cid, rightHtml, newCid, preserve, n
 function patchPendingSlot() {
   const g = snapshot?.pending_grant;
   if (!g || !sameWs(g.workspace, g.workspaces)) { if (!uPg.hidden) { uPg.hidden = true; uPg.innerHTML = ""; lastPendingSig = ""; } return; }
-  const { grant_id: gid, running_subagent_count: rsc, handoff_conversation_id: newCid = "", conversation_id: cid, preserve_points: pp, resume_task: rt, compact_command: cc } = g;
-  const busy = busyGrantId === gid, runSubs = num(rsc), sig = `${lang}|${gid}|${busy}|${runSubs}|${newCid}|${copiedId}|${pp}|${rt}`;
+  const gid = g.grant_id, busy = busyGrantId === gid, runSubs = num(g.running_subagent_count), newCid = g.handoff_conversation_id || "", pp = g.preserve_points, rt = g.resume_task, cc = g.compact_command;
+  const sig = `${lang}|${gid}|${busy}|${runSubs}|${newCid}|${copiedId}|${pp}|${rt}`;
   if (sig === lastPendingSig) return;
   lastPendingSig = sig;
   const rBdg = newCid ? bdg("ok", tr("Done", "已完成")) : runSubs > 0 ? bdg("warn", subTxt(runSubs)) : bdg("info", busy ? tr(...T_LB) : tr("Pending", "待触发"));
   uPg.hidden = false;
   uPg.innerHTML = renderRelayCard(
-    `bn${newCid ? " dn" : ""}`, Boolean(newCid),
-    newCid ? tr("New chat launched", "已拉起新会话") : tr("Handoff ready", "交接已就绪"), cid,
+    `bn${newCid ? " dn" : ""}`, !!newCid,
+    newCid ? tr("New chat launched", "已拉起新会话") : tr("Handoff ready", "交接已就绪"), g.conversation_id,
     `${rBdg}${btn("", "dis", "×", gid, ` aria-label="${tr("Dismiss", "关闭")}"`)}`,
     newCid, pp, rt, "",
     `${cc ? btn("", "cpc", tr(...T_CP)) : ""}${!newCid && !runSubs && !busy ? btn("p cr-cap-msg", "lph", tr(...T_LN), gid) : ""}`
@@ -258,20 +263,19 @@ function patchPendingSlot() {
 
 function patchHeroSlot(hero) {
   if (!hero) { if (!ui.he.hidden) ui.he.hidden = true; return; }
-  const { id: cid = "", level, running_subagent_count: rsc, is_active: act, title, model_short: ms, model_display: md } = hero;
-  const lvl = safeLvl(level), v = getVerdict(hero), runSubs = num(rsc);
+  const cid = hero.id || "", lvl = safeLvl(hero.level), v = getVerdict(hero), runSubs = num(hero.running_subagent_count), title = hero.title;
   ui.he.hidden = false; sa(ui.he, "aria-label", tr("Primary", "主会话"));
-  setCls(ui.he, `hr ${lvlCls(lvl)}`); setCls(uHd, `dt ${act ? "run" : "idle"}`);
+  setCls(ui.he, `hr ${lvlCls(lvl)}`); setCls(uHd, `dt ${hero.is_active ? "run" : "idle"}`);
   const tip = cid ? `${title} (${cid})` : title;
-  if (uHt.textContent !== title) uHt.textContent = title;
+  if (uHt.textContent !== title) setTxt(uHt, title);
   if (uHt.title !== tip) uHt.title = tip;
-  patchIdBtn(uHi, cid, true); setTxt(uHm, ms || md || "");
+  patchIdBtn(uHi, cid, true); setTxt(uHm, hero.model_short || hero.model_display || "");
   uHs.hidden = !(runSubs > 0); if (runSubs > 0) setTxt(uHs, subTxt(runSubs));
   patchBadge(uHv, v.cls, v.text); patchDetailBlock(uHdBlk, hero, false);
 }
 
 function createRowEntry(cid) {
-  const el = D.createElement("div"); el.className = "it"; el.dataset.i = cid;
+  const el = ce("div"); el.className = "it"; el.dataset.i = cid;
   el.innerHTML = `<div class="rw" role="button" tabindex="0" data-a="row" data-i="${esc(cid)}">${sp("cv", "▸")}${sp("dt idle")}${sp("bd ac", "", " hidden")}${sp("bd muted", "", " hidden")}${sp("rt")}${sp("bd", "", " hidden")}${sp("cx")}${sp("ag")}</div><div class="ty" hidden></div>`;
   const r = el.firstElementChild, ch = r.children;
   return { el, r, c: ch[0], d: ch[1], p: ch[2], sb: ch[3], t: ch[4], v: ch[5], x: ch[6], a: ch[7], tr: el.lastElementChild, dt: null };
@@ -282,21 +286,21 @@ function patchSessionList(items) {
   uLs.hidden = false;
   const seen = new Set();
   for (let i = 0; i < items.length; i++) {
-    const [it, isSub] = items[i], { id: cid, level, is_active: act, pinned, title, workspace_name: wn, latest_context_tokens: lct, sidebar_sort_ts: s1, effective_last_active_ts: s2, last_active_ts: s3 } = it;
+    const [it, isSub] = items[i], cid = it.id, title = it.title, wn = it.workspace_name;
     seen.add(cid);
     let rec = rowNodes.get(cid);
     if (!rec) { rec = createRowEntry(cid); rowNodes.set(cid, rec); }
-    const lvl = safeLvl(level), isOpen = openRowId === cid, v = getVerdict(it);
+    const lvl = safeLvl(it.level), isOpen = openRowId === cid, v = getVerdict(it);
 
     setCls(rec.r, `rw${isSub ? " sub" : ""} ${lvlCls(lvl)}`); sa(rec.r, "aria-expanded", String(isOpen));
-    setTxt(rec.c, isOpen ? "▾" : "▸"); setCls(rec.d, `dt ${act ? "run" : "idle"}`);
-    rec.p.hidden = isSub || !pinned; if (!rec.p.hidden) setTxt(rec.p, tr("Pinned", "置顶"));
+    setTxt(rec.c, isOpen ? "▾" : "▸"); setCls(rec.d, `dt ${it.is_active ? "run" : "idle"}`);
+    rec.p.hidden = isSub || !it.pinned; if (!rec.p.hidden) setTxt(rec.p, tr("Pinned", "置顶"));
     rec.sb.hidden = !isSub; if (isSub) setTxt(rec.sb, tr("Subagent", "子代理"));
     const rowTip = `${title}${wn ? ` · ${wn}` : ""} (${cid})`;
-    if (rec.t.textContent !== title) rec.t.textContent = title;
+    setTxt(rec.t, title);
     if (rec.t.title !== rowTip) rec.t.title = rowTip;
     patchBadge(rec.v, v.cls, v.text); setCls(rec.x, `cx ${lvl}`);
-    setTxt(rec.x, fmtK(lct)); setTxt(rec.a, fmtAge(s1 || s2 || s3));
+    setTxt(rec.x, fmtK(it.latest_context_tokens)); setTxt(rec.a, fmtAge(it.sidebar_sort_ts || it.effective_last_active_ts || it.last_active_ts));
 
     if (isOpen) { if (!rec.dt) { rec.dt = mountDetailBlock(); rec.tr.appendChild(rec.dt[0]); } rec.tr.hidden = false; patchDetailBlock(rec.dt, it, true); }
     else if (!rec.tr.hidden) rec.tr.hidden = true;
@@ -347,15 +351,18 @@ function render() {
   uMt.hidden = false;
   setTxt(uMt, pausedHidden ? tr("Paused", "已暂停") : snap ? fmtClock(snap.generated_at) : loadingInitial ? tr("Loading…", "加载中…") : "-");
   uMt.title = uRb.title = netTip; cl(uRi, "spn", showSpinner);
-  uEr.hidden = !errorText; if (errorText) uEr.textContent = errorText;
+  uEr.hidden = !errorText; if (errorText) setTxt(uEr, errorText);
 
   if (!snap) {
-    uPg.hidden = ui.he.hidden = uBr.hidden = uLs.hidden = true; uEm.hidden = false;
-    uEm.textContent = loadingInitial ? tr("Loading…", "加载中…") : tr("No sessions", "暂无会话");
+    uCw.hidden = uPg.hidden = ui.he.hidden = uBr.hidden = uLs.hidden = true; uEm.hidden = false;
+    setTxt(uEm, loadingInitial ? tr("Loading…", "加载中…") : tr("No sessions", "暂无会话"));
     return;
   }
 
   const s = snap.summary, mains = snap.sessions || [], hero = getHero(), showSubs = filterTab === "subs", items = [];
+  const cwN = num(s.active_carbon_count), showCw = !!(s.carbon_concurrency_warning && cwN >= 3);
+  uCw.hidden = !showCw;
+  if (showCw) setTxt(uCw, tr(`Concurrency tip: ${cwN} active Gemini 4 Carbon sessions — cap <= 2 to avoid spillover.`, `并发提示：${cwN} 个活跃会话正运行 Gemini 4 Carbon，建议并发 <= 2 以免缓存溢出。`));
   for (const m of mains) {
     if (!hero || m.id !== hero.id) items.push([m, false]);
     for (const sub of (m.subagents || []).filter((x) => showSubs || x.is_active)) items.push([sub, true]);
@@ -375,15 +382,15 @@ function render() {
   uSw.title = tr(...T_AHT); setTxt(uSwL, tr(...T_AH));
 
   patchSessionList(items);
-  uEm.hidden = Boolean(hero || items.length);
-  if (!uEm.hidden) uEm.textContent = tr("No sessions", "暂无会话");
+  uEm.hidden = !!(hero || items.length);
+  if (!uEm.hidden) setTxt(uEm, tr("No sessions", "暂无会话"));
 }
 
 function flashMicro(msg) { microMsg = msg; render(); clearTimeout(microTimer); microTimer = setTimeout(() => { microMsg = ""; render(); }, 2200); }
 
 async function copyText(text, okMsg) {
   try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); if (okMsg) flashMicro(okMsg); return true; } } catch {}
-  const ta = D.createElement("textarea");
+  const ta = ce("textarea");
   ta.value = text; sa(ta, "readonly", ""); ta.style.cssText = "position:fixed;top:-9999px;opacity:0";
   D.body.appendChild(ta); ta.focus(); ta.select(); ta.setSelectionRange(0, text.length);
   let ok = false; try { ok = D.execCommand("copy"); } catch {} finally { ta.remove(); }
@@ -411,12 +418,12 @@ function findSession(cid) {
 const extractRelayCid = (res) => { const c = res?._meta?.["com.google.antigravity/message"]?.conversationId; return typeof c === "string" ? c.trim() : ""; };
 
 async function executeRelay(payload, claimMode, isInline) {
-  const { grant_id: gid = "", handoff_prompt: prompt = "", compact_command: cmd = "/compact", running_subagent_count: rsc = 0, conversation_id: cid = "", workspace: ws = "", workspaces: wss } = payload;
+  const gid = payload.grant_id || "", prompt = payload.handoff_prompt || "", cmd = payload.compact_command || "/compact", cid = payload.conversation_id || "", ws = payload.workspace || "";
   if (!prompt) return;
   const fail = (msg) => { if (isInline) handoffStatus = "manual"; if (msg) flashMicro(msg); render(); };
   if (!canMessage) { if (claimMode === "manual_handoff") await cpCompact(cmd); return fail(""); }
-  if (!isInline && !sameWs(ws, wss)) { await copyText(cmd); return fail(tr("Other workspace; copied", "跨工作区不拉起，已复制")); }
-  if (rsc > 0) return fail(claimMode === "manual_handoff" ? tr(...T_WS) : "");
+  if (!isInline && !sameWs(ws, payload.workspaces)) { await copyText(cmd); return fail(tr("Other workspace; copied", "跨工作区不拉起，已复制")); }
+  if ((payload.running_subagent_count || 0) > 0) return fail(claimMode === "manual_handoff" ? tr(...T_WS) : "");
   if (canCallTools && gid) {
     try {
       const sc = (await uiAct({ action: "claim_grant", grant_id: gid, conversation_id: cid, workspace: snapshot?.daemon_workspace || ws, claim_mode: claimMode }))?.structuredContent;
@@ -450,7 +457,7 @@ function maybeAutoRelay(p, isInline) {
     if (!sameWs(p.workspace, p.workspaces) || (ownerCid && ownerCid !== p.conversation_id)) return;
     if (!ownerCid && (!snapshot?.daemon_workspace || num(snapshot?.summary?.running_main_count) > 1)) return;
   }
-  const allow = isInline ? Boolean(p.allow_auto_handoff) : Boolean(allowAutoHandoff && p.allow_auto_handoff !== false);
+  const allow = isInline ? !!p.allow_auto_handoff : !!(allowAutoHandoff && p.allow_auto_handoff !== false);
   if (!allow || p.auto_fire === false || p.claimed || p.handoff_conversation_id || (p.running_subagent_count ?? 0) > 0 || attemptedGrants.has(p.grant_id)) return;
   attemptedGrants.add(p.grant_id);
   void executeRelay(p, "auto_handoff", isInline);
@@ -468,7 +475,7 @@ const nextPollMs = () => { const r = ewmaRttMs ?? 0, b = r > 800 ? 12e3 : r > 35
 const cancelPoll = () => { if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; } };
 
 function scheduleNextPoll() {
-  cancelPoll(); pausedHidden = Boolean(D.hidden);
+  cancelPoll(); pausedHidden = !!D.hidden;
   if (viewMode !== "dashboard" || !autoRefresh || !canCallTools || pausedHidden) return;
   pollMs = nextPollMs();
   pollTimer = setTimeout(() => { pollTimer = null; void refreshSnapshot(false); }, pollMs);
@@ -485,7 +492,8 @@ async function refreshSnapshot(force = false, showSynced = false) {
     const args = { action: "snapshot", limit: 25, show_history: filterTab === "subs", include_archived: filterTab === "archived" };
     if (force) args.fresh = true; else if (lastDigest) args.if_digest = lastDigest;
     const res = await callTool("context_radar_overview", args);
-    const totalMs = Math.max(0, Math.round(performance.now() - t0)), sc = res?.structuredContent, srvMs = Math.max(0, Math.round(num(sc?.server_ms))), netRtt = Math.max(0, totalMs - srvMs);
+    const rz = (x) => Math.max(0, Math.round(x));
+    const totalMs = rz(performance.now() - t0), sc = res?.structuredContent, srvMs = rz(num(sc?.server_ms)), netRtt = Math.max(0, totalMs - srvMs);
     serverMs = srvMs; ewmaRttMs = ewmaRttMs === null ? netRtt : Math.round(ewmaRttMs * 0.65 + netRtt * 0.35);
     pollErrors = 0; lastSyncTs = Date.now(); clearTimeout(spinTimer); showSpinner = false;
 
@@ -566,10 +574,10 @@ async function toggleAutoHandoff() {
 }
 
 const buildReminder = (it) => {
-  const lim = num(it.context_limit) || 512_000, rec = Math.round((num(it.recommend_compact_tokens) || 31e4) / 1e3);
+  const lim = num(it.context_limit) || 512e3, rec = Math.round((num(it.recommend_compact_tokens) || 31e4) / 1e3);
   return isZh()
-    ? `会话《${it.title}》上下文达 ${fmtK(it.latest_context_tokens)}/${fmtK(lim)}（超 ${rec}k），请收尾或准备 /compact。`
-    : `Context for "${it.title}" is ${fmtK(it.latest_context_tokens)}/${fmtK(lim)} (>${rec}k); wrap up or prepare /compact.`;
+    ? `会话《${it.title}》上下文达 ${fmtK(it.latest_context_tokens)}/${fmtK(lim)}（超 ${rec}k），请收尾或 /compact。`
+    : `Context for "${it.title}" is ${fmtK(it.latest_context_tokens)}/${fmtK(lim)} (>${rec}k); wrap up or /compact.`;
 };
 
 async function sendReminder(it) {
@@ -615,7 +623,7 @@ D.addEventListener("click", (ev) => {
   if (a === "crm") { const it = findSession(id); return it && void copyText(buildReminder(it), tr(...T_RC)); }
   if (a === "copy-subagent-relay") {
     const it = findSession(id);
-    return it && void copyText(isZh() ? `子代理 ${it.agent_name || it.title} (${it.id}) 达 ${fmtK(it.latest_context_tokens)}，请收尾并切新子代理` : `Subagent ${it.agent_name || it.title} (${it.id}) at ${fmtK(it.latest_context_tokens)}; wrap up and spawn fresh subagent`, tr("✓ Copied baton", "✓ 已复制切棒提示"));
+    return it && void copyText(isZh() ? `子代理 ${it.agent_name || it.title} (${it.id}) 达 ${fmtK(it.latest_context_tokens)}，请收尾并切新子代理` : `Subagent ${it.agent_name || it.title} (${it.id}) at ${fmtK(it.latest_context_tokens)}; finish and pass baton`, tr("✓ Copied baton", "✓ 已复制切棒提示"));
   }
   if (a === "fhn" || a === "lph") { const g = a === "fhn" ? handoffCard : snapshot?.pending_grant; return g && void executeRelay(g, "manual_handoff", a === "fhn"); }
   if (a === "dis" && id) { if (snapshot?.pending_grant?.grant_id === id) { delete snapshot.pending_grant; render(); } return canCallTools && void uiAct({ action: "dismiss_grant", grant_id: id }).catch(() => {}); }
@@ -631,9 +639,9 @@ D.addEventListener("keydown", (ev) => {
   }
   const el = ev.target?.closest?.("[data-a]");
   if (!el) return;
-  if ((ev.key === "Enter" || ev.key === " ") && el.dataset.a === "row") {
+  if (/^(Enter| )$/.test(ev.key) && el.dataset.a === "row") {
     ev.preventDefault(); const id = el.dataset.i || ""; openRowId = openRowId === id ? null : id; render();
-  } else if ((ev.key === "ArrowLeft" || ev.key === "ArrowRight") && el.dataset.a === "tab") {
+  } else if (/^Arrow(Left|Right)$/.test(ev.key) && el.dataset.a === "tab") {
     ev.preventDefault(); const o = ["active", "subs", "archived"]; setFilterTab(o[(o.indexOf(filterTab) + (ev.key === "ArrowRight" ? 1 : 2)) % 3], true);
   }
 });
@@ -696,8 +704,7 @@ function syncHostContext(ctx) {
   if (!langLocked && ctx?.locale) { const h = parseLoc(ctx.locale); if (h && h !== lang) { lang = h; DE.lang = lang; render(); } }
   let res = null;
   const raw = String(ctx?.theme || "").trim().toLowerCase();
-  if (raw.includes("dark") || raw.includes("night") || raw.includes("black")) res = "dark";
-  else if (raw.includes("light") || raw.includes("day") || raw.includes("white")) res = "light";
+  if (raw) res = /dark|night|black/.test(raw) ? "dark" : /light|day|white/.test(raw) ? "light" : null;
   if (!res) {
     const lum = parseColorLum(st?.variables?.["--color-background-primary"]) ?? parseColorLum(getComputedStyle(DE).getPropertyValue("--color-background-primary"));
     if (lum !== null) res = lum < 0.45 ? "dark" : "light";
@@ -715,8 +722,8 @@ async function bootPanel() {
     await bridge.connect();
     syncHostContext(bridge.getHostContext());
     const caps = bridge.getHostCapabilities();
-    canMessage = Boolean(caps?.message);
-    canCallTools = caps?.serverTools !== undefined ? Boolean(caps.serverTools) : true;
+    canMessage = !!caps?.message;
+    canCallTools = caps?.serverTools !== undefined ? !!caps.serverTools : true;
     DE.dataset.canMsg = canMessage ? "1" : "0"; DE.dataset.ct = canCallTools ? "1" : "0";
     render(); scheduleNextPoll();
     if (viewMode === "handoff_card" && handoffCard && !handoffCard.blocked) maybeAutoRelay(handoffCard, true);
