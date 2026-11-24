@@ -1,6 +1,7 @@
 import { McpAppBridge, applyDocumentTheme, applyHostFonts, applyHostStyleVariables } from "./bridge.js";
 
-const D = document, DE = D.documentElement, bridge = new McpAppBridge({ name: "context-radar-mcp", version: "1.0.0" }, {});
+const D = document, DE = D.documentElement, M = Math, st = setTimeout, ct = clearTimeout, now = Date.now, fc = (e) => e.firstElementChild, lc = (e) => e.lastElementChild, onD = (e, f, o) => D.addEventListener(e, f, o);
+const bridge = new McpAppBridge({ name: "context-radar-mcp", version: "1.0.0" }, {});
 const boot = typeof window !== "undefined" ? window.__CONTEXT_RADAR_BOOT__ : null;
 const BRAND_SVG = `<svg class="mk" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" opacity=".24" stroke-width="1.6"/><path d="M5.6 18.4A9 9 0 1 1 18.7 6M12 12l6.2-6.2" stroke="var(--ac)" stroke-width="2" stroke-linecap="round"/><circle cx="16.5" cy="9.6" r="1.7" fill="var(--ok)"/></svg>`;
 const REFRESH_SVG = `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M13.5 8a5.5 5.5 0 1 1-1.4-3.7M13.5 2.5v2.7h-2.7" stroke="currentColor" stroke-width="1.6"/></svg>`;
@@ -18,7 +19,8 @@ const subTxt = (n) => (isZh() ? `${n} 个子代理` : `${n} subagent${n === 1 ? 
 const langBtn = (en) => `<button class="lg" data-a="lng" aria-label="Language"><span class="lo${en ? " on" : ""}">EN</span><span class="lo${!en ? " on" : ""}">中文</span></button>`;
 
 const CM = "cr-cap-msg", HC = "handoff_card", HB = "handoff_blocked", DB = "dashboard", AG_M = "com.google.antigravity/message", BG_V = "--color-background-primary";
-const T_LD = ["Loading…", "加载中…"], T_OK = ["✓ Copied", "✓ 已复制"], T_CP = ["Copy /compact", "复制 /compact"], T_SC = ["Send /compact", "执行 /compact"], T_LN = ["Launch New Chat", "拉起新会话"], T_KP = ["Keep warm prefix", "保持热前缀"];
+const K_CID = "conversation_id", K_HCID = "handoff_conversation_id", K_AAH = "allow_auto_handoff", K_RSC = "running_subagent_count", K_LCT = "latest_context_tokens";
+const T_LD = ["Loading…", "加载中…"], T_OK = ["✓ Copied", "✓ 已复制"], T_CP = ["Copy /compact", "复制 /compact"], T_KP = ["Keep warm prefix", "保持热前缀"];
 const T_RD = ["Ready", "已就绪"], T_LB = ["Launching…", "拉起中…"], T_AH = ["Auto handoff", "自动接力"];
 const T_AHT = ["Auto-launch when 0 subagents active", "无活跃子代理时自动拉起新会话"];
 const T_RC = ["✓ Copied reminder", "✓ 已复制提醒"], T_WS = ["Wait for active subagents", "存在活跃子代理"];
@@ -26,21 +28,23 @@ const T_RC = ["✓ Copied reminder", "✓ 已复制提醒"], T_WS = ["Wait for a
 let viewMode = boot?.view === "handoff" ? HC : DB;
 let snapshot = boot?.mode === "snapshot" ? boot : null, lastDigest = boot?.digest || "";
 let handoffCard = null, handoffStatus = "pending", loadingInitial = !(boot?.mode === "snapshot");
-let refreshing = false, autoRefresh = true, filterTab = "active", allowAutoHandoff = boot?.settings?.allow_auto_handoff ?? true;
+let refreshing = false, autoRefresh = true, filterTab = "active", allowAutoHandoff = boot?.settings?.[K_AAH] ?? true;
 let busyGrantId = null, errorText = "", canMessage = false, ownerCid = "", copiedId = null, confirmSendId = null, microMsg = "";
 let ewmaRttMs = null, serverMs = boot?.server_ms ?? null, pollMs = 1e3, unchangedHits = 0, bgHidden = false, pollErrors = 0;
-let lastSyncTs = boot?.mode === "snapshot" ? Date.now() : 0, lastForceTs = 0, spinTimer = null, showSpinner = false;
+let lastSyncTs = boot?.mode === "snapshot" ? now() : 0, lastForceTs = 0, spinTimer = null, showSpinner = false;
 let openRowId = null, loadingKey = "", subTrayRev = 0;
 const openTrays = new Map(), cTurns = new Map(), cHot = new Map(), cDist = new Map(), cAdv = new Map(), attemptedGrants = new Set();
 const trayMap = { turns: cTurns, hotspots: cHot, advice: cAdv };
-let canCallTools = true, inFlightPoll = false, queuedForce = false, pollTimer = null, microTimer = null, copiedTimer = null;
+let canCallTools = true, inFlightPoll = false, queuedForce = false, pollTimer = null, microTimer = null, copiedTimer = null, autoCmpTimer = null;
+const pg = () => snapshot?.pending_grant;
+const cancelAutoCmp = () => { if (autoCmpTimer !== null) { ct(autoCmpTimer); autoCmpTimer = null; } };
 
 // Persistent DOM mount state (mount ONCE, patch strictly in place — zero full-shell, hero, or row-tray wipes!)
 let mountedMode = "", ui = null, lastPendingSig = "", lastHandoffSig = "";
 const rowNodes = new Map();
 let uMi, uMt, uEn, uZh, uRb, uRi, uEr, uCw, uPg, uHd, uHt, uHi, uHm, uHs, uHv, uHdBlk, uBr, uSg, uTa, uTs, uTr, uAb, uSw, uSwL, uLs, uEm, uHl;
 
-const callTool = (name, args) => bridge.callServerTool({ name, arguments: args });
+const callTool = (name, args, opts) => bridge.callServerTool({ name, arguments: args }, opts);
 const uiAct = (args) => callTool("context_radar_ui_action", args);
 const uiSc = async (a) => (await uiAct(a))?.structuredContent;
 const sendTxt = (text, meta) => bridge.sendMessage(meta ? { role: "user", content: [{ type: "text", text }], _meta: meta } : { role: "user", content: [{ type: "text", text }] });
@@ -50,19 +54,20 @@ const safeLvl = (l) => (l === "critical" || l === "warn" ? l : "ok");
 const lvlCls = (l) => (l === "critical" ? "lc" : l === "warn" ? "lw" : "");
 const dv = (c, s = "") => `<div class="${c}">${s}</div>`;
 const sp = (c, s = "", ex = "") => `<span class="${c}"${ex}>${s}</span>`;
+const shd = (c) => sp(c, "", " hidden");
 const nt = (s, c = "") => dv(`nt${c}`, s);
 const btn = (cls, act, txt, id = "", ex = "") => `<button class="bt${cls ? ` ${cls}` : ""}" data-a="${act}"${id ? ` data-i="${esc(id)}"` : ""}${ex}>${txt}</button>`;
 const bdg = (cls, txt) => sp(`bd ${cls}`, txt);
 const bx = (inner, cls = "") => dv(`bx${cls}`, inner);
-const sw = (lbl) => `<button role="switch" aria-checked="${allowAutoHandoff}" class="cr-switch cr-cap-msg${allowAutoHandoff ? " on" : ""}" data-a="aho" title="${tr(...T_AHT)}"><span class="tk"><span class="th"></span></span><span>${lbl}</span></button>`;
+const sw = (lbl) => `<button role="switch" aria-checked="${allowAutoHandoff}" class="cr-switch ${CM}${allowAutoHandoff ? " on" : ""}" data-a="aho" title="${tr(...T_AHT)}"><span class="tk"><span class="th"></span></span><span>${lbl}</span></button>`;
 
 const fmtK = (n) => { const x = num(n); return x >= 1e6 ? `${(x / 1e6).toFixed(2)}M` : x >= 1e3 ? `${(x / 1e3).toFixed(1)}k` : String(x); };
 const fmtMs = (ms) => { const v = num(ms); return !v ? "-" : v >= 1e3 ? `${(v / 1e3).toFixed(1)}s` : `${v}ms`; };
 const fmtClock = (iso) => { if (!iso) return "-"; const d = new Date(iso); return Number.isNaN(d.getTime()) ? "-" : d.toLocaleTimeString(isZh() ? "zh-CN" : "en-US", { hour12: false }); };
 const fmtAge = (ts) => {
   if (!ts) return tr("idle", "空闲");
-  const d = Math.max(0, Math.floor(Date.now() / 1e3 - ts));
-  const [n, u] = d < 60 ? [d, tr("s", "秒前")] : d < 3600 ? [Math.floor(d / 60), tr("m", "分前")] : d < 86400 ? [Math.floor(d / 3600), tr("h", "小时前")] : [Math.floor(d / 86400), tr("d", "天前")];
+  const d = M.max(0, M.floor(now() / 1e3 - ts));
+  const [n, u] = d < 60 ? [d, tr("s", "秒前")] : d < 3600 ? [M.floor(d / 60), tr("m", "分前")] : d < 86400 ? [M.floor(d / 3600), tr("h", "小时前")] : [M.floor(d / 86400), tr("d", "天前")];
   return `${n}${u}`;
 };
 const fmtMoney = (usd, cny, dec = 2, known = true) => {
@@ -91,7 +96,7 @@ function getVerdict(it) {
   const lvl = safeLvl(it.level);
   if (it.just_compacted) return { cls: "info", text: tr("Compacted", "已压缩") };
   if (it.suggest_compact || lvl === "critical") return { cls: lvl === "critical" ? "critical" : "warn", text: tr("Handoff ready", "建议交接") };
-  const ctx = num(it.latest_context_tokens);
+  const ctx = num(it[K_LCT]);
   if (ctx >= (num(it.min_compact_tokens) || 27e4) * 0.72 || (ctx >= 12e4 && getCold(it).m > 0)) return { cls: "warn", text: tr("Slice ready", "可提炼切片") };
   return { cls: "ok", text: "" };
 }
@@ -116,9 +121,9 @@ function renderSubTray(it) {
   if (tab === "turns") {
     const d = cTurns.get(cid);
     if (!d?.turns?.length) return bx(sp("nt", tr("No turns yet", "暂无轮次")));
-    const chrono = d.turns.slice(0, 24).reverse(), mx = Math.max(1, ...chrono.map((t) => num(t.context_tokens)));
+    const chrono = d.turns.slice(0, 24).reverse(), mx = M.max(1, ...chrono.map((t) => num(t.context_tokens)));
     const bars = chrono.map((t) =>
-      `<span class="sr ${t.is_checkpoint ? "ckpt" : t.is_cold_cache ? "cold" : ""}" style="height:${Math.max(12, Math.round((num(t.context_tokens) / mx) * 100))}%" title="${esc(`#${num(t.turn)} · ${fmtK(t.context_tokens)} · ${tr("Cache", "缓存")} ${num(t.cache_hit_rate).toFixed(0)}%${t.is_cold_cache ? ` (${coldKind(t)})` : ""}`)}"></span>`).join("");
+      `<span class="sr ${t.is_checkpoint ? "ckpt" : t.is_cold_cache ? "cold" : ""}" style="height:${M.max(12, M.round((num(t.context_tokens) / mx) * 100))}%" title="${esc(`#${num(t.turn)} · ${fmtK(t.context_tokens)} · ${tr("Cache", "缓存")} ${num(t.cache_hit_rate).toFixed(0)}%${t.is_cold_cache ? ` (${coldKind(t)})` : ""}`)}"></span>`).join("");
     const cellRow = (tag, arr) => arr.map((v) => `<${tag}>${v}</${tag}>`).join("");
     const rows = d.turns.slice(0, 10).map((t) => {
       const hr = num(t.cache_hit_rate).toFixed(0), cCell = !t.is_cold_cache ? `${hr}%` : `${sp("ch", `${hr}%`)} ${sp(`ct ${COLD_CLS[t.cold_cache_kind] || "turn"}`, coldKind(t), t.cold_cache_reason ? ` title="${esc(t.cold_cache_reason)}"` : "")}`;
@@ -139,12 +144,12 @@ function renderSubTray(it) {
   if (tab === "advice") {
     const p = cAdv.get(cid);
     if (!p?.found) return bx(sp("nt", esc(p?.reason || tr("Unable to evaluate", "暂无法评估"))), " ac");
-    const ok = p.gate_allowed, runSubs = num(it.running_subagent_count), subBdg = runSubs > 0 ? bdg("warn", subTxt(runSubs)) : bdg("ok", tr("0 subagents", "无子代理"));
-    const k = (v, d) => Math.round((num(v) || d) / 1e3), fm = (u, c, d) => fmtMoney(u, c, d, 1);
+    const ok = p.gate_allowed, runSubs = num(it[K_RSC]), subBdg = runSubs > 0 ? bdg("warn", subTxt(runSubs)) : bdg("ok", tr("0 subagents", "无子代理"));
+    const k = (v, d) => M.round((num(v) || d) / 1e3), fm = (u, c, d) => fmtMoney(u, c, d, 1);
     const tier = `${tr("Thresholds", "阈值")} ${k(it.min_compact_tokens, 27e4)}k/${k(it.recommend_compact_tokens, 31e4)}k/${k(it.urgent_compact_tokens, 42e4)}k · ${tr("break-even", "回本")} >=${num(p.break_even_turns)}${tr("t", "轮")}`;
     const econ = p.pricing_known !== false ? ` · ${tr("Rebuild", "重建")} ${fm(p.compact_overhead_usd, p.compact_overhead_cny, 2)} · ${tr("Saves", "省")} ${fm(p.per_turn_saving_usd, p.per_turn_saving_cny, 3)}/t` : "";
     const canLaunch = ok && canMessage && !runSubs && sameWs(it.workspace, it.workspaces), busy = loadingKey === `handoff:${cid}`;
-    return bx(`${dv("hh", dv("bds", `${bdg(ok ? "ok" : "warn", ok ? tr("Ready for handoff", "满足交接条件") : tr(...T_KP))}${subBdg}`))}${nt(esc(tier + econ))}<div class="nt wr" style="color:var(--t1)">${esc(p.headline)}</div>${(p.gate_reasons || []).map((r) => nt(`· ${esc(r)}`, " wr")).join("")}${dv("ac", `${ok ? btn("", "up", busy ? tr("Preparing…", "生成中…") : tr("Prepare /compact", "生成 /compact"), cid, busy ? " disabled" : "") : btn("", "cc", tr(...T_CP))}${canLaunch ? btn(`p ${CM}`, "ul", tr(...T_LN), cid, busy ? " disabled" : "") : ""}${sw(tr(...T_AH))}`)}`, " ac");
+    return bx(`${dv("hh", dv("bds", `${bdg(ok ? "ok" : "warn", ok ? tr("Ready for handoff", "满足交接条件") : tr(...T_KP))}${subBdg}`))}${nt(esc(tier + econ))}<div class="nt wr" style="color:var(--t1)">${esc(p.headline)}</div>${(p.gate_reasons || []).map((r) => nt(`· ${esc(r)}`, " wr")).join("")}${dv("ac", `${ok ? btn("", "up", busy ? tr("Preparing…", "生成中…") : tr("Prepare /compact", "生成 /compact"), cid, busy ? " disabled" : "") : btn("", "cc", tr(...T_CP))}${canLaunch ? btn(`p ${CM}`, "ul", tr("Launch New Chat", "拉起新会话"), cid, busy ? " disabled" : "") : ""}${sw(tr(...T_AH))}`)}`, " ac");
   }
   return "";
 }
@@ -162,14 +167,14 @@ function renderExtraActions(it) {
 
 const ce = (t) => D.createElement(t);
 const TABS = ["turns", "hotspots", "advice"];
+const IDB = '<button class="id" data-a="copy-id"></button>';
 function mountDetailBlock() {
   const el = ce("div"); el.className = "dtl";
   const pl = dv("pl", `${sp("pll")}${sp("pv")}${sp("ps")}`).repeat(3);
   const bts = TABS.map((t, i) => `<button class="bt${i === 2 ? " p" : ""} ct0" data-a="t-${t}"></button>`).join("");
-  el.innerHTML = `${dv("gg", `${dv("gt", `${dv("gf ok", "")}${sp("gk").repeat(2)}${sp("gk u")}`)}${dv("gl", "<span></span><span></span>")}`)}${dv("pls", pl)}${dv("ac", `${bts}<button class="id" data-a="copy-id"></button>${sp("ac", "", " hidden")}`)}<div hidden></div>`;
-  const [gg, pls, acts, trEl] = el.children, gt = gg.firstElementChild;
-  sa(gt, "role", "progressbar"); sa(gt, "aria-valuemin", "0"); sa(gt, "aria-valuemax", "100");
-  const [gf, t1, t2, t3] = gt.children, [g1, g2] = gg.lastElementChild.children, [bt, bh, ba, bi, ex] = acts.children;
+  el.innerHTML = `${dv("gg", `<div class="gt" role="progressbar" aria-valuemin="0" aria-valuemax="100">${dv("gf ok", "")}${sp("gk").repeat(2)}${sp("gk u")}</div>${dv("gl", "<span></span><span></span>")}`)}${dv("pls", pl)}${dv("ac", `${bts}${IDB}${shd("ac")}`)}<div hidden></div>`;
+  const [gg, pls, acts, trEl] = el.children, gt = fc(gg);
+  const [gf, t1, t2, t3] = gt.children, [g1, g2] = lc(gg).children, [bt, bh, ba, bi, ex] = acts.children;
   return [el, gt, gf, [t1, t2, t3], g1, g2, [...pls.children], [bt, bh, ba], bi, ex, trEl, "", ""];
 }
 
@@ -189,29 +194,28 @@ const setPill = (p, lbl, v1, v2, cls, tip) => {
 };
 
 function patchDetailBlock(d, it, showCopyId) {
-  const { id: cid = "", level, running_subagent_count, context_limit, latest_context_tokens, context_pct, checkpoint_count, min_compact_tokens, recommend_compact_tokens, urgent_compact_tokens, just_compacted, pre_compact_tokens, turns, cold_cache_count, median_stream_tps, peak_context_tokens, cache_hit_rate, median_ttft_ms, cost_usd, cost_cny, pricing_known, suggest_compact, is_subagent } = it;
-  const lvl = safeLvl(level), runSubs = num(running_subagent_count), lim = num(context_limit || snapshot?.thresholds?.max) || 512e3, ctx = num(latest_context_tokens), cpct = num(context_pct).toFixed(1), ckc = num(checkpoint_count);
+  const cid = it.id || "", lvl = safeLvl(it.level), runSubs = num(it[K_RSC]), lim = num(it.context_limit || snapshot?.thresholds?.max) || 512e3, ctx = num(it[K_LCT]), cpct = num(it.context_pct).toFixed(1), ckc = num(it.checkpoint_count);
   const [, gt, gf, ts, g1, g2, ps, bs, bi, ex, trEl] = d;
-  const pct = Math.min(100, Math.max(0, (ctx / lim) * 100));
-  sa(gt, "aria-label", tr("Context usage", "上下文占用")); sa(gt, "aria-valuenow", String(Math.round(pct)));
+  const pct = M.min(100, M.max(0, (ctx / lim) * 100));
+  sa(gt, "aria-label", tr("Context usage", "上下文占用")); sa(gt, "aria-valuenow", String(M.round(pct)));
   gf.className = `gf ${lvl}`; gf.style.width = `${pct.toFixed(1)}%`;
-  const tick = (el, v, d0, lb) => { const n = num(v) || d0; el.style.left = `${Math.min(100, (n / lim) * 100).toFixed(1)}%`; el.title = `${lb} ${Math.round(n / 1e3)}k`; };
-  tick(ts[0], min_compact_tokens, 27e4, tr("Floor", "下限")); tick(ts[1], recommend_compact_tokens, 31e4, tr("Target", "推荐")); tick(ts[2], urgent_compact_tokens, 42e4, tr("Urgent", "紧急"));
+  const tick = (el, v, d0, lb) => { const n = num(v) || d0; el.style.left = `${M.min(100, (n / lim) * 100).toFixed(1)}%`; el.title = `${lb} ${M.round(n / 1e3)}k`; };
+  tick(ts[0], it.min_compact_tokens, 27e4, tr("Floor", "下限")); tick(ts[1], it.recommend_compact_tokens, 31e4, tr("Target", "推荐")); tick(ts[2], it.urgent_compact_tokens, 42e4, tr("Urgent", "紧急"));
   setTxt(g1, `${fmtK(ctx)} / ${fmtK(lim)} (${cpct}%)`);
-  setTxt(g2, just_compacted && pre_compact_tokens ? `${tr("Before", "压缩前")} ${fmtK(pre_compact_tokens)}` : isZh() ? `${num(turns)} 轮` : `${num(turns)}t`);
+  setTxt(g2, it.just_compacted && it.pre_compact_tokens ? `${tr("Before", "压缩前")} ${fmtK(it.pre_compact_tokens)}` : isZh() ? `${num(it.turns)} 轮` : `${num(it.turns)}t`);
 
-  const c = getCold(it), cN = num(cold_cache_count), tps = num(median_stream_tps) > 0 ? `${num(median_stream_tps).toFixed(0)} tok/s` : "-";
+  const c = getCold(it), cN = num(it.cold_cache_count), tps = num(it.median_stream_tps) > 0 ? `${num(it.median_stream_tps).toFixed(0)} tok/s` : "-";
   const midSub = c.m > 0 && (c.s || c.r || c.w) ? (isZh() ? `（慢轮${c.s}/溢出${c.r}/切模${c.w}）` : ` (Slow ${c.s}/Spill ${c.r}/Switch ${c.w})`) : "";
   const coldTip = cN ? (isZh() ? `新轮次 ${c.t} · 中途 ${c.m}${midSub} · 压缩后 ${c.p}` : `New ${c.t} · Mid ${c.m}${midSub} · Compact ${c.p}`) : "";
-  setPill(ps[0], tr("Context", "上下文"), `${fmtK(ctx)} · ${cpct}%`, `${tr("Peak", "峰值")} ${fmtK(peak_context_tokens || ctx)}`, "", "");
-  setPill(ps[1], tr("KV Cache", "KV 缓存"), `${num(cache_hit_rate).toFixed(1)}%`, cN ? (isZh() ? `冷未命中 ${cN} 次` : `${cN} cold miss${cN === 1 ? "" : "es"}`) : tr("0 cold misses", "无冷未命中"), `ps${cN && c.m > 0 ? " ch" : ""}`, coldTip);
-  setPill(ps[2], tr("Speed & Cost", "速度与费用"), `${fmtMs(median_ttft_ms)} · ${tps}`, fmtMoney(cost_usd, cost_cny, 2, pricing_known), "", ckc ? (isZh() ? `压缩 ${ckc} 次` : `Compacted ${ckc}x`) : "");
+  setPill(ps[0], tr("Context", "上下文"), `${fmtK(ctx)} · ${cpct}%`, `${tr("Peak", "峰值")} ${fmtK(it.peak_context_tokens || ctx)}`, "", "");
+  setPill(ps[1], tr("KV Cache", "KV 缓存"), `${num(it.cache_hit_rate).toFixed(1)}%`, cN ? (isZh() ? `冷未命中 ${cN} 次` : `${cN} cold miss${cN === 1 ? "" : "es"}`) : tr("0 cold misses", "无冷未命中"), `ps${cN && c.m > 0 ? " ch" : ""}`, coldTip);
+  setPill(ps[2], tr("Speed & Cost", "速度与费用"), `${fmtMs(it.median_ttft_ms)} · ${tps}`, fmtMoney(it.cost_usd, it.cost_cny, 2, it.pricing_known), "", ckc ? (isZh() ? `压缩 ${ckc} 次` : `Compacted ${ckc}x`) : "");
 
   const cur = openTrays.get(cid) || "", tLbls = [tr("Turns", "轮次"), tr("Hotspots", "热点"), tr("Handoff", "交接")];
   for (let i = 0; i < 3; i++) { setTxt(bs[i], tLbls[i]); bs[i].dataset.i = cid; cl(bs[i], "on", cur === TABS[i]); }
   patchIdBtn(bi, cid, showCopyId);
 
-  const exSig = `${lang}|${cid}|${lvl}|${!!suggest_compact}|${!!just_compacted}|${!!is_subagent}|${canDirectMsg(it)}|${confirmSendId === cid}`;
+  const exSig = `${lang}|${cid}|${lvl}|${!!it.suggest_compact}|${!!it.just_compacted}|${!!it.is_subagent}|${canDirectMsg(it)}|${confirmSendId === cid}`;
   if (exSig !== d[11]) { d[11] = exSig; const h = renderExtraActions(it); ex.hidden = !h; ex.innerHTML = h; }
 
   const traySig = cur ? `${lang}|${cid}|${cur}|${loadingKey}|${subTrayRev}|${runSubs}|${allowAutoHandoff}|${canMessage}` : "";
@@ -222,17 +226,15 @@ function ensureDashboardMount(root) {
   if (mountedMode === DB && ui) return;
   rowNodes.clear(); lastPendingSig = ""; mountedMode = DB;
   const tabs = ["active", "subs", "archived"].map((t) => `<button role="tab" class="sb" data-a="tab" data-i="${t}"></button>`).join("");
-  root.innerHTML = dv("sh", `<header class="ms">${dv("bd0", `${BRAND_SVG}<h1>Context Radar</h1>`)}${dv("mr", `${sp("mi", "", " hidden")}${sp("mt")}${langBtn(true)}<button class="ib ct0" data-a="ref" aria-label="Refresh">${REFRESH_SVG}</button>`)}</header>${dv("er", "")}${dv("cw", "")}${dv("", "")}<section class="hr" hidden>${dv("hh", `${dv("hm", `${sp("dt idle")}${sp("tt")}<button class="id" data-a="copy-id"></button>`)}${dv("bds", `${sp("bd muted")}${sp("bd info", "", " hidden")}${sp("bd ok", "", " hidden")}`)}`)}</section>${dv("br", `${dv("sg ct0", tabs)}${dv("ac", `${btn("ct0", "aut", "")}<button role="switch" class="cr-switch cr-cap-msg" data-a="aho">${sp("tk", sp("th"))}<span></span></button>`)}`)}${dv("ls", "")}${dv("em", "")}`);
-  const sh = root.firstElementChild, [ms, er, cw, pg, he, br, ls, em] = sh.children;
-  er.hidden = cw.hidden = pg.hidden = br.hidden = ls.hidden = em.hidden = true;
-  const [mi, mt, lgBtn, rb] = ms.lastElementChild.children;
-  [uEn, uZh] = lgBtn.children;
-  const hh = he.firstElementChild;
-  [uHd, uHt, uHi] = hh.firstElementChild.children; [uHm, uHs, uHv] = hh.lastElementChild.children;
+  root.innerHTML = dv("sh", `<header class="ms">${dv("bd0", `${BRAND_SVG}<h1>Context Radar</h1>`)}${dv("mr", `${shd("mi")}${sp("mt")}${langBtn(true)}<button class="ib ct0" data-a="ref" aria-label="Refresh">${REFRESH_SVG}</button>`)}</header>${dv("er", "")}${dv("cw", "")}${dv("", "")}<section class="hr" hidden>${dv("hh", `${dv("hm", `${sp("dt idle")}${sp("tt")}${IDB}`)}${dv("bds", `${sp("bd muted")}${shd("bd info")}${shd("bd ok")}`)}`)}</section>${dv("br", `<div class="sg ct0" role="tablist">${tabs}</div>${dv("ac", `${btn("ct0", "aut", "")}<button role="switch" class="cr-switch ${CM}" data-a="aho">${sp("tk", sp("th"))}<span></span></button>`)}`)}${dv("ls", "")}${dv("em", "")}`);
+  let ms, he, lgBtn;
+  [ms, uEr, uCw, uPg, he, uBr, uLs, uEm] = fc(root).children;
+  uEr.hidden = uCw.hidden = uPg.hidden = uBr.hidden = uLs.hidden = uEm.hidden = true;
+  [uMi, uMt, lgBtn, uRb] = lc(ms).children; [uEn, uZh] = lgBtn.children; uRi = fc(uRb);
+  const hh = fc(he); [uHd, uHt, uHi] = fc(hh).children; [uHm, uHs, uHv] = lc(hh).children;
   uHdBlk = mountDetailBlock(); he.appendChild(uHdBlk[0]);
-  [uTa, uTs, uTr] = br.firstElementChild.children; sa(br.firstElementChild, "role", "tablist");
-  [uAb, uSw] = br.lastElementChild.children;
-  uMi = mi; uMt = mt; uRb = rb; uRi = rb.firstElementChild; uEr = er; uCw = cw; uPg = pg; uBr = br; uSg = br.firstElementChild; uSwL = uSw.lastElementChild; uLs = ls; uEm = em;
+  uSg = fc(uBr); [uTa, uTs, uTr] = uSg.children;
+  [uAb, uSw] = lc(uBr).children; uSwL = lc(uSw);
   ui = { he };
 }
 
@@ -240,7 +242,7 @@ function ensureHandoffMount(root) {
   if (mountedMode === HC && ui) return;
   rowNodes.clear(); lastHandoffSig = ""; mountedMode = HC;
   root.innerHTML = dv("sh inl", "<div></div>");
-  uHl = root.firstElementChild.firstElementChild;
+  uHl = fc(fc(root));
   ui = { he: null };
 }
 
@@ -249,33 +251,33 @@ function renderRelayCard(cls, active, title, cid, rightHtml, newCid, preserve, n
 }
 
 const cardActs = (canCmp, canNew, isCmpKind, cmpA, cpA, newA, gid = "", hasCp = true) =>
-  `${canCmp ? btn(isCmpKind ? `p ${CM}` : CM, cmpA, tr(...T_SC), gid) : ""}${hasCp ? btn("", cpA, tr(...T_CP)) : ""}${canNew ? btn(isCmpKind && canCmp ? CM : `p ${CM}`, newA, tr(...T_LN), gid) : ""}`;
+  `${canCmp ? btn(isCmpKind ? `p ${CM}` : CM, cmpA, tr("Send /compact", "执行 /compact"), gid) : ""}${hasCp ? btn("", cpA, tr(...T_CP)) : ""}${canNew ? btn(isCmpKind && canCmp ? CM : `p ${CM}`, newA, tr("Launch New Chat", "拉起新会话"), gid) : ""}`;
 
 function patchPendingSlot() {
-  const g = snapshot?.pending_grant;
+  const g = pg();
   if (!g || !sameWs(g.workspace, g.workspaces)) { if (!uPg.hidden) { uPg.hidden = true; uPg.innerHTML = ""; lastPendingSig = ""; } return; }
-  const { grant_id: gid, running_subagent_count: rs, handoff_conversation_id: newCid = "", compact_status: cStat = "", preserve_points: pp, resume_task: rt, compact_command: cc, conversation_id: cid, workspace: ws, workspaces: wss, kind } = g;
-  const busy = busyGrantId === gid, runSubs = num(rs), done = !!(newCid || cStat === "sent" || cStat === "acp_compacted"), canNew = !done && !runSubs && !busy, canCmp = canNew && !!cc && canDirectCid(cid, ws, wss);
-  const sig = `${lang}|${gid}|${busy}|${runSubs}|${newCid}|${cStat}|${canCmp}|${copiedId}|${pp}|${rt}`;
+  const gid = g.grant_id, newCid = g[K_HCID] || "", cStat = g.compact_status || "", cc = g.compact_command, cid = g[K_CID], isCmp = g.kind === "compact";
+  const busy = busyGrantId === gid, runSubs = num(g[K_RSC]), cDone = cStat === "sent" || cStat === "acp_compacted", done = !!(newCid || cDone), canNew = !done && !runSubs && !busy, canCmp = canNew && !!cc && canDirectCid(cid, g.workspace, g.workspaces);
+  const sig = `${lang}|${gid}|${busy}|${runSubs}|${newCid}|${cStat}|${canCmp}|${copiedId}|${g.preserve_points}|${g.resume_task}`;
   if (sig === lastPendingSig) return;
   lastPendingSig = sig;
-  const rBdg = done ? bdg("ok", tr("Done", "已完成")) : runSubs > 0 ? bdg("warn", subTxt(runSubs)) : bdg("info", busy ? tr(...T_LB) : tr("Pending", "待触发"));
+  const rBdg = done ? bdg("ok", tr("Done", "已完成")) : runSubs > 0 ? bdg("warn", subTxt(runSubs)) : bdg("info", busy ? (isCmp ? tr("Compacting…", "压缩中…") : tr(...T_LB)) : tr("Pending", "待触发"));
   uPg.hidden = false;
   uPg.innerHTML = renderRelayCard(
     `bn${done ? " dn" : ""}`, done,
-    newCid ? tr("New chat launched", "已拉起新会话") : cStat ? tr("Compact sent", "已发 /compact") : kind === "compact" ? tr("Compact ready", "压缩已就绪") : tr("Handoff ready", "交接已就绪"), cid,
+    newCid ? tr("New chat launched", "已拉起新会话") : cDone ? tr("Compact sent", "已发 /compact") : isCmp ? tr("Compact ready", "压缩已就绪") : tr("Handoff ready", "交接已就绪"), cid,
     `${rBdg}${btn("", "dis", "×", gid, ` aria-label="${tr("Dismiss", "关闭")}"`)}`,
-    newCid, pp, rt, "", cardActs(canCmp, canNew, kind === "compact", "cmp", "cpc", "lph", gid, !!cc)
+    newCid, g.preserve_points, g.resume_task, "", cardActs(canCmp, canNew, isCmp, "cmp", "cpc", "lph", gid, !!cc)
   );
 }
 
 function patchHeroSlot(hero) {
   if (!hero) { if (!ui.he.hidden) ui.he.hidden = true; return; }
-  const cid = hero.id || "", lvl = safeLvl(hero.level), v = getVerdict(hero), runSubs = num(hero.running_subagent_count), title = hero.title;
+  const cid = hero.id || "", lvl = safeLvl(hero.level), v = getVerdict(hero), runSubs = num(hero[K_RSC]), title = hero.title;
   ui.he.hidden = false; sa(ui.he, "aria-label", tr("Primary", "主会话"));
   setCls(ui.he, `hr ${lvlCls(lvl)}`); setCls(uHd, `dt ${hero.is_active ? "run" : "idle"}`);
   const tip = cid ? `${title} (${cid})` : title;
-  if (uHt.textContent !== title) setTxt(uHt, title);
+  setTxt(uHt, title);
   if (uHt.title !== tip) uHt.title = tip;
   patchIdBtn(uHi, cid, true); setTxt(uHm, hero.model_short || hero.model_display || "");
   uHs.hidden = !(runSubs > 0); if (runSubs > 0) setTxt(uHs, subTxt(runSubs));
@@ -284,9 +286,9 @@ function patchHeroSlot(hero) {
 
 function createRowEntry(cid) {
   const el = ce("div"); el.className = "it"; el.dataset.i = cid;
-  el.innerHTML = `<div class="rw" role="button" tabindex="0" data-a="row" data-i="${esc(cid)}">${sp("cv", "▸")}${sp("dt idle")}${sp("bd ac", "", " hidden")}${sp("bd muted", "", " hidden")}${sp("rt")}${sp("bd", "", " hidden")}${sp("cx")}${sp("ag")}</div><div class="ty" hidden></div>`;
-  const r = el.firstElementChild, ch = r.children;
-  return { el, r, c: ch[0], d: ch[1], p: ch[2], sb: ch[3], t: ch[4], v: ch[5], x: ch[6], a: ch[7], tr: el.lastElementChild, dt: null };
+  el.innerHTML = `<div class="rw" role="button" tabindex="0" data-a="row" data-i="${esc(cid)}">${sp("cv", "▸")}${sp("dt idle")}${shd("bd ac")}${shd("bd muted")}${sp("rt")}${shd("bd")}${sp("cx")}${sp("ag")}</div><div class="ty" hidden></div>`;
+  const r = fc(el);
+  return [el, r, r.children, lc(el), null];
 }
 
 function patchSessionList(items) {
@@ -298,52 +300,53 @@ function patchSessionList(items) {
     seen.add(cid);
     let rec = rowNodes.get(cid);
     if (!rec) { rec = createRowEntry(cid); rowNodes.set(cid, rec); }
-    const lvl = safeLvl(it.level), isOpen = openRowId === cid, v = getVerdict(it);
+    const [el, r, [c, d, p, sb, t, vEl, x, a], trBox] = rec, lvl = safeLvl(it.level), isOpen = openRowId === cid, v = getVerdict(it);
 
-    setCls(rec.r, `rw${isSub ? " sub" : ""} ${lvlCls(lvl)}`); sa(rec.r, "aria-expanded", String(isOpen));
-    setTxt(rec.c, isOpen ? "▾" : "▸"); setCls(rec.d, `dt ${it.is_active ? "run" : "idle"}`);
-    rec.p.hidden = isSub || !it.pinned; if (!rec.p.hidden) setTxt(rec.p, tr("Pinned", "置顶"));
-    rec.sb.hidden = !isSub; if (isSub) setTxt(rec.sb, tr("Subagent", "子代理"));
+    setCls(r, `rw${isSub ? " sub" : ""} ${lvlCls(lvl)}`); sa(r, "aria-expanded", String(isOpen));
+    setTxt(c, isOpen ? "▾" : "▸"); setCls(d, `dt ${it.is_active ? "run" : "idle"}`);
+    p.hidden = isSub || !it.pinned; if (!p.hidden) setTxt(p, tr("Pinned", "置顶"));
+    sb.hidden = !isSub; if (isSub) setTxt(sb, tr("Subagent", "子代理"));
     const rowTip = `${title}${wn ? ` · ${wn}` : ""} (${cid})`;
-    setTxt(rec.t, title);
-    if (rec.t.title !== rowTip) rec.t.title = rowTip;
-    patchBadge(rec.v, v.cls, v.text); setCls(rec.x, `cx ${lvl}`);
-    setTxt(rec.x, fmtK(it.latest_context_tokens)); setTxt(rec.a, fmtAge(it.sidebar_sort_ts || it.effective_last_active_ts || it.last_active_ts));
+    setTxt(t, title);
+    if (t.title !== rowTip) t.title = rowTip;
+    patchBadge(vEl, v.cls, v.text); setCls(x, `cx ${lvl}`);
+    setTxt(x, fmtK(it[K_LCT])); setTxt(a, fmtAge(it.sidebar_sort_ts || it.effective_last_active_ts || it.last_active_ts));
 
-    if (isOpen) { if (!rec.dt) { rec.dt = mountDetailBlock(); rec.tr.appendChild(rec.dt[0]); } rec.tr.hidden = false; patchDetailBlock(rec.dt, it, true); }
-    else if (!rec.tr.hidden) rec.tr.hidden = true;
+    if (isOpen) { if (!rec[4]) { rec[4] = mountDetailBlock(); trBox.appendChild(rec[4][0]); } trBox.hidden = false; patchDetailBlock(rec[4], it, true); }
+    else if (!trBox.hidden) trBox.hidden = true;
 
-    if (uLs.children[i] !== rec.el) uLs.insertBefore(rec.el, uLs.children[i] || null);
+    if (uLs.children[i] !== el) uLs.insertBefore(el, uLs.children[i] || null);
   }
-  for (const [cid, rec] of rowNodes) if (!seen.has(cid)) { rec.el.remove(); rowNodes.delete(cid); }
+  for (const [cid, rec] of rowNodes) if (!seen.has(cid)) { rec[0].remove(); rowNodes.delete(cid); }
 }
 
+const isHandoffLocked = () => /^(sen|com|old)/.test(handoffStatus);
 function patchHandoffView() {
   const c = handoffCard;
-  const sig = c ? `${lang}|${c.mode}|${c.blocked}|${c.grant_id}|${handoffStatus}|${c.handoff_conversation_id}|${c.compact_status}|${copiedId}|${microMsg}` : `${lang}|empty`;
+  const sig = c ? `${lang}|${c.mode}|${c.blocked}|${c.grant_id}|${handoffStatus}|${c[K_HCID]}|${c.compact_status}|${copiedId}|${microMsg}` : `${lang}|empty`;
   if (sig === lastHandoffSig) return;
   lastHandoffSig = sig;
   if (!c) { uHl.innerHTML = dv("em", tr(...T_LD)); return; }
-  const { mode, blocked, conversation_id: cid, reasons, running_subagent_count: rs, handoff_conversation_id: newCid = "", allow_auto_handoff: aah, kind, preserve_points: pp, resume_task: rt, scratch_note_path: snp, compact_command: cc } = c;
-  if (mode === HB || blocked) {
-    uHl.innerHTML = renderRelayCard("cd", false, tr("Handoff gated", "暂缓交接"), cid, bdg("info", tr(...T_KP)), "", "", "", "", "", (reasons || []).map((r) => nt(`· ${esc(r)}`, " wr")).join(""));
+  const cid = c[K_CID], newCid = c[K_HCID] || "";
+  if (c.mode === HB || c.blocked) {
+    uHl.innerHTML = renderRelayCard("cd", false, tr("Handoff gated", "暂缓交接"), cid, bdg("info", tr(...T_KP)), "", "", "", "", "", (c.reasons || []).map((r) => nt(`· ${esc(r)}`, " wr")).join(""));
     return;
   }
-  const runSubs = num(rs), done = handoffStatus === "sent" || handoffStatus === "compacted";
+  const runSubs = num(c[K_RSC]), done = handoffStatus === "sent" || handoffStatus === "compacted", isCmp = c.kind === "compact", runLbl = isCmp ? tr("Compacting…", "压缩中…") : tr(...T_LB);
   const badges = {
-    pending: ["info", aah ? tr(...T_LB) : tr(...T_RD)], sending: ["warn", tr(...T_LB)],
+    pending: ["info", c[K_AAH] ? runLbl : tr(...T_RD)], sending: ["warn", runLbl],
     sent: ["ok", tr("New chat started", "已拉起新会话")], compacted: ["ok", tr("Compact sent", "已发 /compact")],
     manual: ["info", runSubs > 0 ? subTxt(runSubs) : tr(...T_RD)],
-    claimed_old: ["muted", tr("Used", "已使用")], blocked: ["info", tr("Gated", "已拦截")],
+    old: ["muted", tr("Used", "已使用")], blocked: ["info", tr("Gated", "已拦截")],
   };
   const [bCls, bTxt] = badges[handoffStatus] || badges.manual;
-  const canAct = !newCid && !runSubs && !["sent", "compacted", "sending", "claimed_old"].includes(handoffStatus);
+  const canAct = !newCid && !runSubs && !isHandoffLocked();
   uHl.innerHTML = renderRelayCard(
     "cd", done,
-    kind === "compact" ? tr("Compaction Ready", "压缩已就绪") : tr("Session Handoff", "新会话交接"),
+    isCmp ? tr("Compaction Ready", "压缩已就绪") : tr("Session Handoff", "新会话交接"),
     cid, `${langBtn(!isZh())}${bdg(bCls, bTxt)}`,
-    newCid, pp, rt, snp,
-    `${cardActs(canAct && !!cc, canAct, kind === "compact", "chc", "ccc", "fhn")}${microMsg ? sp("mi", esc(microMsg)) : ""}`
+    newCid, c.preserve_points, c.resume_task, c.scratch_note_path,
+    `${cardActs(canAct && !!c.compact_command, canAct, isCmp, "chc", "ccc", "fhn")}${microMsg ? sp("mi", esc(microMsg)) : ""}`
   );
 }
 
@@ -353,7 +356,7 @@ function render() {
   if (viewMode === HC) { ensureHandoffMount(root); patchHandoffView(); return; }
 
   ensureDashboardMount(root);
-  const snap = snapshot, pollSec = Math.round(pollMs / 1e3);
+  const snap = snapshot, pollSec = M.round(pollMs / 1e3);
   const netTip = `${bgHidden ? tr("BG", "后台") + " " : ""}${pollSec}s · ${serverMs ?? "-"}/${ewmaRttMs ?? "-"}ms · ${tr("skip", "跳过")} ${unchangedHits}`;
 
   cl(uEn, "on", !isZh()); cl(uZh, "on", isZh()); sa(uRb, "aria-label", tr("Refresh", "刷新"));
@@ -396,13 +399,13 @@ function render() {
   if (!uEm.hidden) setTxt(uEm, tr("No sessions", "暂无会话"));
 }
 
-function flashMicro(msg) { microMsg = msg; render(); clearTimeout(microTimer); microTimer = setTimeout(() => { microMsg = ""; render(); }, 2200); }
+function flashMicro(msg) { microMsg = msg; render(); ct(microTimer); microTimer = st(() => { microMsg = ""; render(); }, 2200); }
 
 async function copyText(text, okMsg) {
   try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); if (okMsg) flashMicro(okMsg); return true; } } catch {}
   const ta = ce("textarea");
   ta.value = text; sa(ta, "readonly", ""); ta.style.cssText = "position:fixed;top:-9999px;opacity:0";
-  D.body.appendChild(ta); ta.focus(); ta.select(); ta.setSelectionRange(0, text.length);
+  D.body.appendChild(ta); ta.select();
   let ok = false; try { ok = D.execCommand("copy"); } catch {} finally { ta.remove(); }
   if (ok) { if (okMsg) flashMicro(okMsg); return true; }
   flashMicro(tr("Copy failed", "复制失败")); return false;
@@ -412,8 +415,8 @@ const cpCompact = (cmd = "/compact") => copyText(cmd, tr("✓ Copied /compact", 
 
 async function copyCid(cid) {
   if (!(await copyText(cid, tr("✓ Copied ID", "✓ 已复制 ID")))) return;
-  copiedId = cid; render(); clearTimeout(copiedTimer);
-  copiedTimer = setTimeout(() => { if (copiedId === cid) { copiedId = null; render(); } }, 1500);
+  copiedId = cid; render(); ct(copiedTimer);
+  copiedTimer = st(() => { if (copiedId === cid) { copiedId = null; render(); } }, 1500);
 }
 
 function findSession(cid) {
@@ -429,20 +432,21 @@ const extractRelayCid = (res) => { const c = res?._meta?.[AG_M]?.conversationId;
 
 const recAct = (action, gid, extra) => canCallTools && gid ? uiAct({ action, grant_id: gid, ...extra }).catch(() => {}) : 0;
 async function executeDispatch(p, claimMode, isInline, isCmp = false) {
-  const { grant_id: gid = "", compact_command: cmd = "/compact", handoff_prompt: hp = "", conversation_id: cid = "", workspace: ws = "", workspaces: wss, running_subagent_count: rs } = p;
-  const txt = isCmp ? cmd : hp, isMan = claimMode.startsWith("manual");
+  cancelAutoCmp();
+  const gid = p.grant_id || "", cmd = p.compact_command || "/compact", cid = p[K_CID] || "", ws = p.workspace || "";
+  const txt = isCmp ? cmd : p.handoff_prompt || "", isMan = claimMode.startsWith("manual");
   if (!txt) return;
   const fail = (msg) => { if (isInline) handoffStatus = "manual"; if (msg) flashMicro(msg); render(); };
-  if (!canMessage || (isCmp && !isInline && !canDirectCid(cid, ws, wss))) { if (isMan || isCmp) await cpCompact(cmd); return fail(""); }
-  if (!isInline && !sameWs(ws, wss)) { await copyText(cmd); return fail(tr("Other workspace", "属其他工作区")); }
-  if ((rs || 0) > 0) return fail(isMan ? tr(...T_WS) : "");
+  if (!canMessage || (isCmp && !isInline && !canDirectCid(cid, ws, p.workspaces))) { if (isMan) await cpCompact(cmd); return fail(""); }
+  if (!isInline && !sameWs(ws, p.workspaces)) { if (isMan) await copyText(cmd); return fail(isMan ? tr("Other workspace", "属其他工作区") : ""); }
+  if ((p[K_RSC] || 0) > 0) return fail(isMan ? tr(...T_WS) : "");
   if (canCallTools && gid) {
     try {
-      const sc = await uiSc({ action: "claim_grant", grant_id: gid, conversation_id: cid, workspace: snapshot?.daemon_workspace || ws, claim_mode: claimMode });
+      const sc = await uiSc({ action: "claim_grant", grant_id: gid, [K_CID]: cid, workspace: snapshot?.daemon_workspace || ws, claim_mode: claimMode });
       if (!sc?.claimed) {
         if (isInline) {
-          if (sc?.handoff_conversation_id && handoffCard) { handoffCard.handoff_conversation_id = sc.handoff_conversation_id; handoffStatus = "sent"; }
-          else handoffStatus = ["already_claimed", "already_compacted", "session_advanced"].includes(sc?.reason) ? "claimed_old" : "manual";
+          if (sc?.[K_HCID] && handoffCard) { handoffCard[K_HCID] = sc[K_HCID]; handoffStatus = "sent"; }
+          else handoffStatus = /^(already_|session_adv)/.test(sc?.reason || "") ? "old" : "manual";
           return render();
         }
         return fail(isMan ? (sc?.reason === "running_subagents_active" ? tr(...T_WS) : sc?.reason?.endsWith("mismatch") ? tr("Other workspace", "属其他工作区") : tr("Used", "已核销")) : "");
@@ -451,76 +455,101 @@ async function executeDispatch(p, claimMode, isInline, isCmp = false) {
   }
   if (isInline) handoffStatus = "sending"; else busyGrantId = gid || "pending";
   render();
+  const dst = isInline ? handoffCard : pg()?.grant_id === gid ? pg() : null;
+  const failCmp = async (st0, msg) => {
+    if (isCmp) { await recAct("record_compact", gid, { status: st0 }); if (dst) dst.compact_status = st0; await cpCompact(cmd); }
+    fail(msg);
+  };
+  const clip = (v) => String(v || "").trim().slice(0, 120);
   try {
     const res = await sendTxt(txt, isCmp ? 0 : { [AG_M]: { target: "new" } });
     if (res?.isError) {
-      if (isCmp) { await cpCompact(cmd); await recAct("record_compact", gid, { status: "fallback_copied" }); }
-      return fail(tr("Kept /compact", "已保留 /compact"));
+      const d = clip(res?.content?.[0]?.text || res?.error?.message);
+      return await failCmp(d ? `fallback_copied:${d}` : "fallback_copied", tr("Kept /compact", "已保留 /compact"));
     }
-    const pg = snapshot?.pending_grant, newCid = isCmp ? "" : extractRelayCid(res);
-    await recAct(isCmp ? "record_compact" : "record_relay", gid, isCmp ? { status: "sent" } : { handoff_conversation_id: newCid });
-    const dst = isInline ? handoffCard : pg?.grant_id === gid ? pg : null;
-    if (dst) { if (isCmp) dst.compact_status = "sent"; else dst.handoff_conversation_id = newCid; if (!isInline) dst.claimed = true; }
+    const newCid = isCmp ? "" : extractRelayCid(res);
+    await recAct(isCmp ? "record_compact" : "record_relay", gid, isCmp ? { status: "sent" } : { [K_HCID]: newCid });
+    if (dst) { if (isCmp) dst.compact_status = "sent"; else dst[K_HCID] = newCid; if (!isInline) dst.claimed = true; }
     if (isInline) handoffStatus = isCmp ? "compacted" : "sent";
     flashMicro(isCmp ? tr("✓ Sent /compact", "✓ 已发 /compact") : tr("✓ New chat launched", "✓ 已拉起新会话"));
-  } catch { if (isCmp) await cpCompact(cmd); fail(tr("Failed", "失败")); }
+  } catch (err) {
+    await failCmp(`error:${clip(err?.message || err || "failed")}`, tr("Failed", "失败"));
+  }
   finally { busyGrantId = null; render(); }
 }
 
+function canAutoRelay(p, isInline) {
+  if (!p?.grant_id || !canMessage || D.hidden) return "";
+  const isCmp = p.kind === "compact", gid = p.grant_id, cid = p[K_CID];
+  if (isCmp ? (!p.compact_command || p.acp_proxy_active) : !p.handoff_prompt) return "";
+  if (!isInline && (isCmp ? !canDirectCid(cid, p.workspace, p.workspaces) : (!sameWs(p.workspace, p.workspaces) || (ownerCid ? ownerCid !== cid : (!snapshot?.daemon_workspace || num(snapshot?.summary?.running_main_count) > 1))))) return "";
+  if (!(isInline ? !!p[K_AAH] : !!(allowAutoHandoff && p[K_AAH] !== false)) || p.auto_fire === false || p.claimed || p[K_HCID] || p.compact_status || (p[K_RSC] ?? 0) > 0 || attemptedGrants.has(gid)) return "";
+  return isCmp ? "auto_compact" : "auto_handoff";
+}
+
 function maybeAutoRelay(p, isInline) {
-  if (!p?.grant_id || !p?.handoff_prompt || p?.kind === "compact" || !canMessage || D.hidden) return;
-  const { grant_id: gid, workspace: ws, workspaces: wss, conversation_id: cid, allow_auto_handoff: aah, auto_fire, claimed, handoff_conversation_id: hcid, running_subagent_count: rs } = p;
-  if (!isInline && (!sameWs(ws, wss) || (ownerCid ? ownerCid !== cid : (!snapshot?.daemon_workspace || num(snapshot?.summary?.running_main_count) > 1)))) return;
-  if (!(isInline ? !!aah : !!(allowAutoHandoff && aah !== false)) || auto_fire === false || claimed || hcid || (rs ?? 0) > 0 || attemptedGrants.has(gid)) return;
+  const mode = canAutoRelay(p, isInline);
+  if (!mode) return;
+  const gid = p.grant_id, isCmp = mode === "auto_compact";
   attemptedGrants.add(gid);
-  void executeDispatch(p, "auto_handoff", isInline, false);
+  if (!isCmp) return void executeDispatch(p, mode, isInline, false);
+  cancelAutoCmp();
+  autoCmpTimer = st(() => {
+    autoCmpTimer = null;
+    const cur = isInline ? handoffCard : pg();
+    if (!cur || cur.grant_id !== gid || cur.claimed || cur.compact_status || cur[K_HCID] || (cur[K_RSC] ?? 0) > 0) return;
+    if (isInline && isHandoffLocked()) return;
+    if (D.hidden) { attemptedGrants.delete(gid); return; }
+    void executeDispatch(cur, mode, isInline, true);
+  }, isInline ? 1500 : 2000);
 }
 
 function applySnapshot(snap) {
-  if (typeof snap.settings?.allow_auto_handoff === "boolean") allowAutoHandoff = snap.settings.allow_auto_handoff;
+  if (typeof snap.settings?.[K_AAH] === "boolean") allowAutoHandoff = snap.settings[K_AAH];
   if (!langLocked && snap.settings?.lang) { const p = parseLoc(snap.settings.lang); if (p) { lang = p; DE.lang = lang; } }
   if (snap.digest) lastDigest = snap.digest;
   snapshot = snap;
   maybeAutoRelay(snap.pending_grant, false);
 }
 
-const nextPollMs = () => { const r = ewmaRttMs ?? 0, b = D.hidden ? (r > 800 ? 12e3 : r > 350 ? 8e3 : r > 150 ? 4e3 : 2e3) : (r > 800 ? 10e3 : r > 350 ? 5e3 : r > 150 ? 2500 : 1e3); return pollErrors > 0 ? Math.min(45e3, b * Math.pow(2, Math.min(pollErrors, 3))) : b; };
-const cancelPoll = () => { if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; } };
+const nextPollMs = () => { const r = ewmaRttMs ?? 0, b = D.hidden ? (r > 800 ? 12e3 : r > 350 ? 8e3 : r > 150 ? 4e3 : 2e3) : (r > 800 ? 10e3 : r > 350 ? 5e3 : r > 150 ? 2500 : 1e3); return pollErrors > 0 ? M.min(45e3, b * M.pow(2, M.min(pollErrors, 3))) : b; };
+const cancelPoll = () => { if (pollTimer !== null) { ct(pollTimer); pollTimer = null; } };
 
 function scheduleNextPoll() {
   cancelPoll(); bgHidden = !!D.hidden;
   if (viewMode !== DB || !autoRefresh || !canCallTools) return;
   pollMs = nextPollMs();
-  pollTimer = setTimeout(() => { pollTimer = null; void refreshSnapshot(false); }, pollMs);
+  pollTimer = st(() => { pollTimer = null; void refreshSnapshot(false); }, pollMs);
 }
 
 async function refreshSnapshot(force = false, showSynced = false) {
   if (viewMode !== DB || !canCallTools) return;
   if (inFlightPoll) { if (force) queuedForce = true; return; }
-  cancelPoll(); inFlightPoll = true; clearTimeout(spinTimer);
-  if (force || !snapshot) { refreshing = true; spinTimer = setTimeout(() => { if (refreshing) { showSpinner = true; render(); } }, 150); }
+  cancelPoll(); inFlightPoll = true; ct(spinTimer);
+  if (force || !snapshot) { refreshing = true; spinTimer = st(() => { if (refreshing) { showSpinner = true; render(); } }, 150); }
   const t0 = performance.now();
   try {
     const args = { action: "snapshot", limit: 25, show_history: filterTab === "subs", include_archived: filterTab === "archived" };
     if (force) args.fresh = true; else if (lastDigest) args.if_digest = lastDigest;
-    const res = await callTool("context_radar_overview", args);
-    const rz = (x) => Math.max(0, Math.round(x));
-    const totalMs = rz(performance.now() - t0), sc = res?.structuredContent, srvMs = rz(num(sc?.server_ms)), netRtt = Math.max(0, totalMs - srvMs);
-    serverMs = srvMs; ewmaRttMs = ewmaRttMs === null ? netRtt : Math.round(ewmaRttMs * 0.65 + netRtt * 0.35);
-    pollErrors = 0; lastSyncTs = Date.now(); clearTimeout(spinTimer); showSpinner = false;
+    const res = await callTool("context_radar_overview", args, { timeout: 15e3 });
+    const rz = (x) => M.max(0, M.round(x));
+    const totalMs = rz(performance.now() - t0), sc = res?.structuredContent, srvMs = rz(num(sc?.server_ms)), netRtt = M.max(0, totalMs - srvMs);
+    serverMs = srvMs; ewmaRttMs = ewmaRttMs === null ? netRtt : M.round(ewmaRttMs * 0.65 + netRtt * 0.35);
+    pollErrors = 0; lastSyncTs = now(); ct(spinTimer); showSpinner = false;
 
-    const doneRefresh = () => { if (refreshing) { refreshing = false; showSynced ? flashMicro(tr("✓ Synced", "✓ 已同步")) : render(); } };
+    const finish = () => { refreshing = false; showSynced ? flashMicro(tr("✓ Synced", "✓ 已同步")) : render(); };
     if (res?.isError) { errorText = tr("Sync error", "刷新失败"); refreshing = false; render(); }
     else if (sc?.unchanged || (sc?.digest && sc.digest === lastDigest && snapshot)) {
+      const hadErr = !!errorText;
       unchangedHits += 1; errorText = "";
       if (sc?.generated_at && snapshot) snapshot.generated_at = sc.generated_at;
-      doneRefresh();
+      if (refreshing) finish(); else if (hadErr) render();
     } else if (sc) {
-      applySnapshot(sc); loadingInitial = false; errorText = ""; doneRefresh();
+      applySnapshot(sc); loadingInitial = false; errorText = ""; finish();
     }
   } catch (err) {
     pollErrors += 1; errorText = `${tr("Sync:", "同步：")} ${err?.message || err}`;
-    clearTimeout(spinTimer); showSpinner = false; refreshing = false; render();
+    ct(spinTimer); showSpinner = false; refreshing = false; render();
   } finally {
     inFlightPoll = false;
     queuedForce ? ((queuedForce = false), void refreshSnapshot(true, false)) : scheduleNextPoll();
@@ -536,9 +565,9 @@ async function openTray(cid, tab) {
   if (openTrays.get(cid) === tab) { openTrays.delete(cid); return render(); }
   openTrays.set(cid, tab);
   if (!canCallTools) return render();
-  const [m, a] = { turns: ["turns", { conversation_id: cid, limit: 24 }], hotspots: ["hotspots", { conversation_id: cid, mode: "hotspots", top_k: 5 }], advice: ["prepare_handoff", { conversation_id: cid, estimated_remaining_turns: 12 }] }[tab];
+  const [m, a] = { turns: ["turns", { limit: 24 }], hotspots: ["hotspots", { mode: "hotspots", top_k: 5 }], advice: ["prepare_handoff", { estimated_remaining_turns: 12 }] }[tab];
   await withBusy(`${tab}:${cid}`, tr("Load failed", "加载失败"), async () => {
-    const res = await callTool(`context_radar_${m}`, a);
+    const res = await callTool(`context_radar_${m}`, { [K_CID]: cid, ...a });
     if (!res?.isError && res?.structuredContent) { trayMap[tab].set(cid, res.structuredContent); subTrayRev += 1; }
   });
 }
@@ -547,7 +576,7 @@ async function runDistill(cid) {
   if (!canCallTools || !cid) return;
   const rec = cHot.get(cid)?.recommended_distill_range;
   await withBusy(`distill:${cid}`, tr("Distill failed", "提炼失败"), async () => {
-    const args = { action: "distill_slice", conversation_id: cid };
+    const args = { action: "distill_slice", [K_CID]: cid };
     if (Array.isArray(rec) && rec.length === 2) { args.start_step = rec[0]; args.end_step = rec[1]; }
     const sc = await uiSc(args);
     if (sc?.found) { cDist.set(cid, sc); subTrayRev += 1; flashMicro(tr("✓ Saved to scratch/", "✓ 已写入 scratch/")); }
@@ -558,7 +587,7 @@ async function runDistill(cid) {
 async function prepareOrLaunch(cid, launchNow) {
   if (!canCallTools || !cid) return;
   await withBusy(`handoff:${cid}`, tr("Prep failed", "生成失败"), async () => {
-    const dist = cDist.get(cid), args = { action: "create_handoff", kind: launchNow ? "handoff" : "compact", conversation_id: cid, auto_fire: false, estimated_remaining_turns: 12 };
+    const dist = cDist.get(cid), args = { action: "create_handoff", kind: launchNow ? "handoff" : "compact", [K_CID]: cid, auto_fire: false, estimated_remaining_turns: 12 };
     if (dist?.saved_note_path) args.scratch_note_path = dist.saved_note_path;
     const sc = await uiSc(args);
     if (!sc || sc.blocked || sc.mode === HB) return flashMicro(sc?.reasons?.[0] || tr("Handoff gated", "暂缓交接"));
@@ -575,21 +604,21 @@ function toggleLang() {
 }
 
 async function toggleAutoHandoff() {
-  const next = !allowAutoHandoff; allowAutoHandoff = next; render();
+  const next = !allowAutoHandoff; allowAutoHandoff = next; if (!next) cancelAutoCmp(); render();
   if (!canCallTools) return;
   try {
-    const val = (await uiSc({ action: "set_prefs", allow_auto_handoff: next }))?.settings?.allow_auto_handoff;
+    const val = (await uiSc({ action: "set_prefs", [K_AAH]: next }))?.settings?.[K_AAH];
     if (typeof val === "boolean") allowAutoHandoff = val;
     flashMicro(allowAutoHandoff ? tr("✓ Auto on", "✓ 已开启接力") : tr("✓ Auto off", "✓ 已暂停接力"));
-    if (allowAutoHandoff && snapshot?.pending_grant) { snapshot.pending_grant.allow_auto_handoff = true; maybeAutoRelay(snapshot.pending_grant, false); }
+    if (allowAutoHandoff && pg()) { pg()[K_AAH] = true; maybeAutoRelay(pg(), false); }
   } catch { allowAutoHandoff = !next; flashMicro(tr("Save failed", "保存失败")); render(); }
 }
 
 const buildReminder = (it) => {
-  const lim = num(it.context_limit) || 512e3, rec = Math.round((num(it.recommend_compact_tokens) || 31e4) / 1e3);
+  const lim = num(it.context_limit) || 512e3, rec = M.round((num(it.recommend_compact_tokens) || 31e4) / 1e3);
   return isZh()
-    ? `会话《${it.title}》上下文达 ${fmtK(it.latest_context_tokens)}/${fmtK(lim)}（超 ${rec}k），请收尾或 /compact。`
-    : `Context for "${it.title}" is ${fmtK(it.latest_context_tokens)}/${fmtK(lim)} (>${rec}k); wrap up or /compact.`;
+    ? `会话《${it.title}》上下文达 ${fmtK(it[K_LCT])}/${fmtK(lim)}（超 ${rec}k），请收尾或 /compact。`
+    : `Context for "${it.title}" is ${fmtK(it[K_LCT])}/${fmtK(lim)} (>${rec}k); wrap up or /compact.`;
 };
 
 async function sendReminder(it) {
@@ -611,7 +640,7 @@ function setFilterTab(nextTab, focusTab = false) {
   void refreshSnapshot(true, false);
 }
 
-D.addEventListener("click", (ev) => {
+onD("click", (ev) => {
   const el = ev.target?.closest?.("[data-a]");
   if (!el) return;
   ev.stopPropagation();
@@ -628,25 +657,24 @@ D.addEventListener("click", (ev) => {
   if (a === "cdp" && id) { const p = cDist.get(id)?.saved_note_path; return p && void copyText(p, tr(...T_OK)); }
   if ((a === "up" || a === "ul") && id) return void prepareOrLaunch(id, a === "ul");
   if (a === "cc" || a === "ccc" || a === "cpc") {
-    const m = a === "cc" ? "/compact" : (a === "ccc" ? handoffCard : snapshot?.pending_grant)?.compact_command;
+    const m = a === "cc" ? "/compact" : (a === "ccc" ? handoffCard : pg())?.compact_command;
     return m && void cpCompact(m);
   }
-  if (a === "crm") { const it = findSession(id); return it && void copyText(buildReminder(it), tr(...T_RC)); }
-  if (a === "copy-subagent-relay") {
-    const it = findSession(id);
-    return it && void copyText(isZh() ? `子代理 ${it.agent_name || it.title} (${it.id}) 达 ${fmtK(it.latest_context_tokens)}，请切棒` : `Subagent ${it.agent_name || it.title} (${it.id}) at ${fmtK(it.latest_context_tokens)}; pass baton`, tr(...T_OK));
-  }
   if (a === "fhn" || a === "lph" || a === "chc" || a === "cmp") {
-    const isIn = a === "fhn" || a === "chc", isCmp = a === "chc" || a === "cmp", g = isIn ? handoffCard : snapshot?.pending_grant;
+    const isIn = a === "fhn" || a === "chc", isCmp = a === "chc" || a === "cmp", g = isIn ? handoffCard : pg();
     return g && void executeDispatch(g, isCmp ? "manual_compact" : "manual_handoff", isIn, isCmp);
   }
-  if (a === "dis" && id) { if (snapshot?.pending_grant?.grant_id === id) { delete snapshot.pending_grant; render(); } return recAct("dismiss_grant", id, {}); }
+  if (a === "dis" && id) { cancelAutoCmp(); if (pg()?.grant_id === id) { delete snapshot.pending_grant; render(); } return recAct("dismiss_grant", id, {}); }
   if (a === "ask") { confirmSendId = id; return render(); }
   if (a === "no") { confirmSendId = null; return render(); }
-  if (a === "yes") { const it = findSession(id); return it && void sendReminder(it); }
+  const it = findSession(id);
+  if (!it) return;
+  if (a === "crm") return void copyText(buildReminder(it), tr(...T_RC));
+  if (a === "copy-subagent-relay") return void copyText(isZh() ? `子代理 ${it.agent_name || it.title} (${it.id}) 达 ${fmtK(it[K_LCT])}，请切棒` : `Subagent ${it.agent_name || it.title} (${it.id}) at ${fmtK(it[K_LCT])}; pass baton`, tr(...T_OK));
+  if (a === "yes") return void sendReminder(it);
 });
 
-D.addEventListener("keydown", (ev) => {
+onD("keydown", (ev) => {
   if (ev.key === "Escape") {
     if (confirmSendId || openTrays.size || openRowId) { confirmSendId = null; openTrays.clear(); openRowId = null; render(); }
     return;
@@ -660,31 +688,55 @@ D.addEventListener("keydown", (ev) => {
   }
 });
 
-const forceNow = () => { const now = Date.now(); if (now - lastForceTs < 250) return; lastForceTs = now; void refreshSnapshot(true, false); };
-const syncNow = () => { bgHidden = !!D.hidden; if (viewMode === DB && canCallTools) { if (!D.hidden) forceNow(); else if (autoRefresh) scheduleNextPoll(); } render(); };
-D.addEventListener("visibilitychange", syncNow);
-window.addEventListener("focus", () => { if (!D.hidden && viewMode === DB && canCallTools) forceNow(); });
-window.addEventListener("pageshow", () => { if (!D.hidden && viewMode === DB && canCallTools) forceNow(); });
+const canForceDb = () => !D.hidden && viewMode === DB && canCallTools;
+const forceNow = () => { const t = now(); if (t - lastForceTs < 250) return; lastForceTs = t; void refreshSnapshot(true, false); };
+const onVis = () => { if (canForceDb()) forceNow(); };
+const syncNow = () => { bgHidden = !!D.hidden; if (!D.hidden) { if (viewMode === HC && handoffCard && !handoffCard.blocked) maybeAutoRelay(handoffCard, true); else if (pg()) maybeAutoRelay(pg(), false); } if (viewMode === DB && canCallTools) { if (!D.hidden) forceNow(); else if (autoRefresh) scheduleNextPoll(); } render(); };
+onD("visibilitychange", syncNow);
+onD("pointerenter", () => { if (canForceDb() && now() - lastSyncTs > 900) forceNow(); }, { passive: true });
+window.addEventListener("focus", onVis);
+window.addEventListener("pageshow", onVis);
 
-bridge.ontoolinput = (p) => { const c = p?.arguments?.conversation_id; if (typeof c === "string" && c.trim()) ownerCid = c.trim(); if (!snapshot && viewMode === "dashboard") { loadingInitial = true; render(); } };
+let obsRo = null, obsIo = null;
+function setupRevealObservers() {
+  if (typeof ResizeObserver !== "undefined") {
+    let col = !(DE.clientWidth > 0 && DE.clientHeight > 0);
+    obsRo = new ResizeObserver((es) => {
+      const r = es[es.length - 1]?.contentRect, vis = (r ? r.width : DE.clientWidth) > 0 && (r ? r.height : DE.clientHeight) > 0;
+      if (col && vis && canForceDb()) forceNow();
+      col = !vis;
+    });
+    obsRo.observe(DE);
+  }
+  if (typeof IntersectionObserver !== "undefined") {
+    let was = !!(DE.clientWidth > 0 && DE.clientHeight > 0);
+    obsIo = new IntersectionObserver((es) => {
+      const vis = !!es[es.length - 1]?.isIntersecting;
+      if (!was && vis && canForceDb()) forceNow();
+      was = vis;
+    }, { threshold: 0 });
+    obsIo.observe(DE);
+  }
+}
+
+bridge.ontoolinput = (p) => { const c = p?.arguments?.[K_CID]; if (typeof c === "string" && c.trim()) ownerCid = c.trim(); if (!snapshot && viewMode === DB) { loadingInitial = true; render(); } };
 
 bridge.ontoolresult = (result) => {
   if (result?.isError) { errorText = tr("Tool error; please refresh", "工具错误，请刷新"); loadingInitial = false; render(); return; }
   const sc = result?.structuredContent;
   if (sc && (sc.mode === HC || sc.mode === HB)) {
-    const { conversation_id: cid, lang: sl, allow_auto_handoff: aah, mode, auto_fire, running_subagent_count } = sc;
     viewMode = HC; handoffCard = sc;
-    if (cid) ownerCid = cid;
-    if (!langLocked && sl) { const p = parseLoc(sl); if (p) { lang = p; DE.lang = lang; } }
-    if (typeof aah === "boolean") allowAutoHandoff = aah;
-    handoffStatus = mode === HB ? "blocked" : aah && auto_fire !== false && !running_subagent_count ? "pending" : "manual";
+    if (sc[K_CID]) ownerCid = sc[K_CID];
+    if (!langLocked && sc.lang) { const p = parseLoc(sc.lang); if (p) { lang = p; DE.lang = lang; } }
+    if (typeof sc[K_AAH] === "boolean") allowAutoHandoff = sc[K_AAH];
+    handoffStatus = sc.mode === HB ? "blocked" : sc[K_AAH] && sc.auto_fire !== false && !sc[K_RSC] && !sc.acp_proxy_active ? "pending" : "manual";
     loadingInitial = false; cancelPoll(); render();
-    if (mode === HC) maybeAutoRelay(sc, true);
+    if (sc.mode === HC) maybeAutoRelay(sc, true);
     return;
   }
   if (sc?.mode === "snapshot") {
-    viewMode = DB; loadingInitial = false; errorText = ""; lastSyncTs = Date.now();
-    if (sc.server_ms !== undefined) serverMs = Math.max(0, Math.round(num(sc.server_ms)));
+    viewMode = DB; loadingInitial = false; errorText = ""; lastSyncTs = now();
+    if (sc.server_ms !== undefined) serverMs = M.max(0, M.round(num(sc.server_ms)));
     scheduleNextPoll();
     // Strictly skip DOM mutation when digest matches SSR boot or previous snapshot!
     if (sc.unchanged || (sc.digest && sc.digest === lastDigest && snapshot)) return;
@@ -722,10 +774,11 @@ function syncHostContext(ctx) {
   if (res) applyDocumentTheme(res);
 }
 
-bridge.onhostcontextchanged = (ctx) => syncHostContext(ctx);
-bridge.onteardown = () => { cancelPoll(); return {}; };
+bridge.onhostcontextchanged = (ctx) => { syncHostContext(ctx); if ((ctx?.containerDimensions || ctx?.displayMode) && canForceDb()) forceNow(); };
+bridge.onteardown = () => { cancelPoll(); cancelAutoCmp(); obsRo?.disconnect(); obsIo?.disconnect(); return {}; };
 
 async function bootPanel() {
+  setupRevealObservers();
   if (snapshot) applySnapshot(snapshot);
   render();
   try {
@@ -737,7 +790,7 @@ async function bootPanel() {
     DE.dataset.canMsg = canMessage ? "1" : "0"; DE.dataset.ct = canCallTools ? "1" : "0";
     render(); scheduleNextPoll();
     if (viewMode === HC && handoffCard && !handoffCard.blocked) maybeAutoRelay(handoffCard, true);
-    else if (snapshot?.pending_grant) maybeAutoRelay(snapshot.pending_grant, false);
+    else if (pg()) maybeAutoRelay(pg(), false);
     if (viewMode === DB && canCallTools) void refreshSnapshot(true, false);
   } catch (err) {
     if (!snapshot) { errorText = `${tr("Connect failed:", "连接失败：")} ${err?.message || err}`; loadingInitial = false; render(); }

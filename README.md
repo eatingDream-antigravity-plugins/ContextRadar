@@ -25,10 +25,10 @@ Context Radar puts a live status panel in Antigravity so you can see what is goi
 
 ## What it does
 
-- **Live context and cost meter**: Shows how much of your context window is used across the current chat and any running subagents, along with cache hit rate, response speed, and estimated cost. Refreshes immediately when you open or focus the panel and stays synced on new requests via lightweight `if_digest` polling.
+- **Live context and cost meter**: Shows how much of your context window is used across the current chat and any running subagents, along with cache hit rate, response speed, and estimated cost. Stays live with adaptive `if_digest` polling (1s foreground / 2s background, 15s timeout) and refreshes immediately when a kept-alive side/global pane is revealed (`ResizeObserver`, `IntersectionObserver`, `onhostcontextchanged`, and passive `pointerenter`).
 - **Explains slow turns**: Tells the difference between a normal new-turn cache miss, an unexpected mid-loop cache break, and a post-compact rebuild, so you know what actually slowed things down.
 - **Finds and trims bloated history**: Points out the specific turns that caused context spikes and lets your agent save a short summary of old work into `scratch/` instead of dragging raw logs around.
-- **Smarter `/compact` and fresh-chat handoffs**: Checks whether compacting or moving to a new conversation will actually save tokens over the next few turns, then gives you a one-click `Send /compact` / `Copy /compact` / `target:new` handoff card in Antigravity App—or executes native in-place `/compact` automatically on `agy acp` via `acp-proxy` and `acp-run`.
+- **Smarter `/compact` and fresh-chat handoffs**: Checks whether compacting or moving to a new conversation will actually save tokens over the next few turns, then dispatches via official protocols only—SEP-1865 `ui/message` (`Send /compact`, guarded auto-compact, or `target:new` handoff with automatic clipboard fallback) from a visibly mounted Antigravity App card/pane, or unattended in-place `/compact` on `agy acp` via `acp-proxy` and `acp-run`.
 - **Helpful optional guardrails**: Can gently keep the agent from backgrounding short shell commands too early, and optionally inject a short workspace status file at session start if you configure one.
 
 ## Install
@@ -71,9 +71,12 @@ You can also just ask your agent in plain language. The plugin includes an on-de
 | `context_radar_prepare_handoff` | Checks whether `/compact` or a fresh session makes sense right now. |
 | `context_radar_commit_handoff` | Creates the one-click `/compact` or new-conversation handoff card once checks pass. |
 
-### Autonomous `/compact` via Official ACP (`agy acp`)
+### Autonomous Compaction & Handoff Protocol Boundaries
 
-For **Antigravity CLI (`agy`)** and ACP-compatible editors (**Zed, JetBrains IDEs, Android Studio, Xcode, VS Code ACP Client**), Context Radar ships two official ACP v1 subcommands that execute native `/compact` (and compact-and-continue) in-place on the same ACP session with zero concurrent session conflicts:
+Context Radar strictly uses official documented protocols (never undocumented host RPCs):
+
+- **Antigravity App (SEP-1865 MCP Apps `ui/message`)**: When `context_radar_commit_handoff` passes all gates (`running_subagent_count == 0`, budget & break-even satisfied), a **visibly mounted** inline handoff card (`ui://context-radar-mcp/handoff`) or matching-owner `aux_pane` (`!document.hidden`) can atomically claim the single-use grant and dispatch `/compact` (`ui/message`) or open a fresh chat (`com.google.antigravity/message` `target: "new"`), automatically copying `/compact` to the clipboard if the host rejects the message. Because Antigravity App does not mount hidden headless iframes for collapsed tool calls and exposes no headless MCP/hook `/compact` API, fully unattended compaction without an open UI view requires ACP below.
+- **`agy` CLI & ACP Editors (Official ACP v1 `session/prompt`)**: For **Antigravity CLI (`agy`)** and ACP-compatible editors (**Zed, JetBrains IDEs, Android Studio, Xcode, VS Code ACP Client**), Context Radar ships two official ACP v1 subcommands that execute unattended native `/compact` (and compact-and-continue) in-place on the same ACP session with zero concurrent session conflicts:
 
 - **Editor transparent proxy (`acp-proxy`)** — point your editor's ACP custom agent to `context-radar-mcp acp-proxy` instead of `agy acp`:
 

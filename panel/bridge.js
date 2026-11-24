@@ -1,7 +1,7 @@
 // Lightweight SEP-1865 (2026-01-26) MCP Apps PostMessage bridge for Context Radar MCP.
 export const PROTOCOL_VERSION = "2026-01-26";
 
-const BG = "--color-background-primary";
+const BG = "--color-background-primary", NTF = "ui/notifications/";
 export function applyDocumentTheme(t) {
   if (t !== "dark" && t !== "light") return;
   const d = document, e = d.documentElement, bg = `var(${BG},${t === "light" ? "#FAF8F5" : "#141311"})`;
@@ -57,21 +57,20 @@ export class McpAppBridge {
 
   getHostCapabilities() { return this._hc; }
   getHostContext() { return this._hx; }
-  _post(p) { this._t.postMessage(p, "*"); }
+  _post(p) { this._t.postMessage({ jsonrpc: "2.0", ...p }, "*"); }
 
   async _req(m) {
     try {
-      if (m.method === "ping") return this._post({ jsonrpc: "2.0", id: m.id, result: {} });
-      if (m.method === "ui/resource-teardown") return this._post({ jsonrpc: "2.0", id: m.id, result: (await this.onteardown?.(m.params || {})) ?? {} });
-      this._post({ jsonrpc: "2.0", id: m.id, error: { code: -32601, message: m.method } });
-    } catch (e) { this._post({ jsonrpc: "2.0", id: m.id, error: { code: -32603, message: e?.message || String(e) } }); }
+      if (m.method === "ping") return this._post({ id: m.id, result: {} });
+      if (m.method === "ui/resource-teardown") return this._post({ id: m.id, result: (await this.onteardown?.(m.params || {})) ?? {} });
+      this._post({ id: m.id, error: { code: -32601, message: m.method } });
+    } catch (e) { this._post({ id: m.id, error: { code: -32603, message: e?.message || String(e) } }); }
   }
 
   _ntf({ method: k, params: p = {} }) {
-    const N = "ui/notifications/";
-    if (k === `${N}tool-input`) this.ontoolinput?.(p);
-    else if (k === `${N}tool-result`) this.ontoolresult?.(p);
-    else if (k === `${N}host-context-changed`) {
+    if (k === `${NTF}tool-input`) this.ontoolinput?.(p);
+    else if (k === `${NTF}tool-result`) this.ontoolresult?.(p);
+    else if (k === `${NTF}host-context-changed`) {
       const prev = this._hx?.styles || {};
       this._hx = { ...this._hx, ...p, styles: p.styles ? { ...prev, ...p.styles, variables: { ...(prev.variables || {}), ...(p.styles.variables || {}) } } : prev };
       this.onhostcontextchanged?.(p);
@@ -83,31 +82,32 @@ export class McpAppBridge {
     return new Promise((res, rej) => {
       const mk = () => setTimeout(() => { this._p.delete(id); rej(new Error(method)); }, timeoutMs);
       const e = { res, rej, t: mk(), rst() { clearTimeout(e.t); e.t = mk(); } };
-      this._p.set(id, e); this._post({ jsonrpc: "2.0", id, method, params });
+      this._p.set(id, e); this._post({ id, method, params });
     });
   }
 
-  notification(method, params) { this._post(params === undefined ? { jsonrpc: "2.0", method } : { jsonrpc: "2.0", method, params }); }
+  notification(method, params) { this._post(params === undefined ? { method } : { method, params }); }
   callServerTool(params, opts = {}) { return this.request("tools/call", params, { timeoutMs: opts.timeout ?? 45_000 }); }
   sendMessage(params, opts = {}) { return this.request("ui/message", params, { timeoutMs: opts.timeout ?? 30_000 }); }
 
   _autoSz() {
     if (typeof ResizeObserver === "undefined") return;
     let q = false, lw = 0, lh = 0;
+    const d = document, r = d.documentElement;
     const go = () => {
       if (q) return; q = true;
       requestAnimationFrame(() => {
         q = false;
-        const r = document.documentElement, prev = r.style.height; r.style.height = "max-content";
+        const prev = r.style.height; r.style.height = "max-content";
         const h = Math.ceil(r.getBoundingClientRect().height); r.style.height = prev;
         const w = Math.ceil(window.innerWidth);
-        if (w !== lw || h !== lh) { lw = w; lh = h; this.notification("ui/notifications/size-changed", { width: w, height: h }); }
+        if (w !== lw || h !== lh) { lw = w; lh = h; this.notification(`${NTF}size-changed`, { width: w, height: h }); }
       });
     };
     go();
     this._ro = new ResizeObserver(go);
-    this._ro.observe(document.documentElement);
-    if (document.body) this._ro.observe(document.body);
+    this._ro.observe(r);
+    if (d.body) this._ro.observe(d.body);
   }
 
   async connect() {
@@ -117,7 +117,7 @@ export class McpAppBridge {
       const r = await this.request("ui/initialize", { appInfo: this._i, appCapabilities: this._c, protocolVersion: PROTOCOL_VERSION }, { timeoutMs: 20_000 });
       if (!r || typeof r !== "object") throw new Error("Bad init");
       this._hc = r.hostCapabilities; this._hx = r.hostContext;
-      this.notification("ui/notifications/initialized");
+      this.notification(`${NTF}initialized`);
       // Only enable ResizeObserver RPCs for inline conversation frames (which report containerDimensions.maxHeight).
       if (this._o.autoResize && Boolean(r.hostContext?.containerDimensions?.maxHeight)) this._autoSz();
     } catch (e) { this.close(); throw e; }
