@@ -557,9 +557,9 @@ fn test_full_stdio_mcp_daemon_e2e_with_synthetic_fixture() {
     let html = res["result"]["contents"][0]["text"].as_str().unwrap();
     assert!(html.contains("com.google.antigravity/message"));
     assert!(html.contains("window.__CONTEXT_RADAR_BOOT__="));
-    assert!(html.contains("cr-switch"));
-    assert!(html.contains("copy-id"));
-    assert!(html.contains("copy-subagent-relay"));
+    assert!(html.contains("csw") && html.contains("role=\"switch\""));
+    assert!(html.contains("data-a=\"ci\""));
+    assert!(html.contains("Copy baton"));
 
     drop(stdin);
     assert!(proc.wait().unwrap().success());
