@@ -1067,6 +1067,43 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
         .unwrap();
     assert_eq!(o_after_pref["result"]["structuredContent"]["settings"]["allow_auto_handoff"], json!(false));
 
+    // 3) Mutate DB WITHOUT backdating SWR cache: live per-conversation disk activity stamp
+    //    MUST invalidate burst cache immediately and resources/read MUST always serve fresh SSR data!
+    thread::sleep(Duration::from_millis(20));
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (3, 15, ?1)",
+            params![make_step_meta((now + 20.0) as u64, 4_000, 175_000, 320, "swr3", 0, 0)],
+        )
+        .unwrap();
+    }
+    let o_instant = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "context_radar_overview", "arguments": {} }
+        }))
+        .unwrap();
+    let instant_digest = o_instant["result"]["structuredContent"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(
+        instant_digest, refreshed_digest,
+        "new DB/WAL write must immediately invalidate burst cache without waiting for SWR_STALE_TTL"
+    );
+    let r_open = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 5, "method": "resources/read",
+            "params": { "uri": PANEL_URI }
+        }))
+        .unwrap();
+    let html_open = r_open["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(
+        html_open.contains(&instant_digest),
+        "opening panel via resources/read must immediately embed the live latest digest"
+    );
+
     daemon.close();
 }
 

@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use serde_json::json;
 
+use context_radar_mcp::acp::{parse_and_run_acp_headless, parse_and_run_acp_proxy};
 use context_radar_mcp::engine::rates::RateTable;
 use context_radar_mcp::engine::telemetry::TelemetryEngine;
 use context_radar_mcp::guard::boot::{evaluate_boot_guard, run_boot_guard_cli};
@@ -18,6 +19,8 @@ fn print_usage() {
         "{SERVER_NAME} {SERVER_VERSION}\n\
 Usage:\n  \
 context-radar-mcp daemon [--data-dir <path>] [--panel-html <path>]\n  \
+context-radar-mcp acp-proxy [options] [-- <agy acp flags...>]\n  \
+context-radar-mcp acp-run --prompt <text> [options] [-- <agy acp flags...>]\n  \
 context-radar-mcp guard boot\n  \
 context-radar-mcp guard exec\n  \
 context-radar-mcp bench [--iterations <n>] [--data-root <path>]\n  \
@@ -180,6 +183,20 @@ fn main() {
                 process::exit(1);
             }
         }
+        "acp-proxy" => match parse_and_run_acp_proxy(&args[1..]) {
+            Ok(code) => process::exit(code),
+            Err(err) => {
+                eprintln!("[{SERVER_NAME}] acp-proxy error: {err}");
+                process::exit(1);
+            }
+        },
+        "acp-run" => match parse_and_run_acp_headless(&args[1..]) {
+            Ok(code) => process::exit(code),
+            Err(err) => {
+                eprintln!("[{SERVER_NAME}] acp-run error: {err}");
+                process::exit(1);
+            }
+        },
         "guard" => match args.get(1).map(String::as_str) {
             Some("boot") => run_boot_guard_cli(),
             Some("exec") => run_exec_gate_cli(),

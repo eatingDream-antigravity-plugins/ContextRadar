@@ -264,3 +264,23 @@ test("panel renders bilingual mid-loop sub-reasons and whisper-quiet Carbon conc
   });
   assert.deepEqual({ t: parsed.t, m: parsed.m, p: parsed.p, s: parsed.s, r: parsed.r, w: parsed.w }, { t: 1, m: 3, p: 0, s: 1, r: 1, w: 1 });
 });
+
+test("panel supports immediate open/focus refresh, continuous background polling, and official ui/message Send /compact", () => {
+  const html = fs.readFileSync(DIST_HTML, "utf8");
+  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
+
+  // 1. Instant refresh on mount, focus, pageshow, and visibility return
+  assert.ok(viewSrc.includes('window.addEventListener("focus"'), "must refresh immediately on window focus");
+  assert.ok(viewSrc.includes('window.addEventListener("pageshow"'), "must refresh immediately on pageshow");
+  assert.ok(viewSrc.includes("void refreshSnapshot(true, false)"), "bootPanel and focus must trigger immediate fresh refresh");
+
+  // 2. Background polling continues via lightweight if_digest instead of freezing forever while hidden
+  assert.equal(viewSrc.includes("pausedHidden"), false, "must not freeze polling completely when hidden");
+  assert.ok(viewSrc.includes("D.hidden ?"), "nextPollMs must adapt cadence cleanly in background");
+
+  // 3. Official ui/message Send /compact action and record_compact persistence
+  assert.ok(viewSrc.includes("record_compact"), "view.js must record compact dispatch status");
+  assert.ok(viewSrc.includes("manual_compact"), "view.js must claim grants with manual_compact mode");
+  assert.ok(html.includes("Send /compact"), "panel.html must include EN Send /compact label");
+  assert.ok(html.includes("执行 /compact"), "panel.html must include ZH Send /compact label");
+});

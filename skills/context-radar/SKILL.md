@@ -23,8 +23,9 @@ Use `context-radar-mcp` tools to inspect live context telemetry, keep KV cache p
 4. `context_radar_prepare_handoff({ conversation_id?, estimated_remaining_turns?, upcoming_noisy_tokens? })`
    - Evaluates model x reasoning-effort budget tiers, cooldown turns since last checkpoint, recent cold-rebuild protection, `running_subagent_count == 0`, and economic break-even turns.
 5. `context_radar_commit_handoff({ preserve_points, resume_task?, scratch_note_path?, conversation_id?, estimated_remaining_turns?, auto_fire?, kind?: "handoff" | "compact" })`
-   - Runs server-side hard gates before issuing a single-use replay-protected grant, a 1-click `/compact` command, and an official `target:new` handoff prompt (`ui://context-radar-mcp/handoff`).
-   - Use `auto_fire: true` for multi-phase background continuation when autonomous handoff is enabled; use `auto_fire: false` during interactive Q&A to keep the current conversation window and expose a copyable `/compact` command.
+   - Runs server-side hard gates before issuing a single-use replay-protected grant, a 1-click `Send /compact` & copyable `/compact` command, and an official `target:new` handoff prompt (`ui://context-radar-mcp/handoff`).
+   - On Antigravity App: use `kind: "handoff", auto_fire: true` for multi-phase background continuation via official `target:new`, or `auto_fire: false` during interactive Q&A to keep the current window.
+   - On `agy` CLI / ACP editors wrapped by `context-radar-mcp acp-proxy` or `acp-run`: call `kind: "compact", auto_fire: true` with `preserve_points` and `resume_task`, then end your turn cleanly so the official ACP proxy executes native in-place `/compact` on the same session and resumes automatically.
 
 ## Best Practices
 
