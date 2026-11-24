@@ -15,6 +15,9 @@ pub const DISABLE_DISK_CACHE_ENV: &str = "CONTEXT_RADAR_DISABLE_DISK_CACHE";
 pub const INDEX_CACHE_PATH_ENV: &str = "CONTEXT_RADAR_INDEX_PATH";
 pub const GRANTS_PATH_ENV: &str = "CONTEXT_RADAR_GRANTS_PATH";
 pub const PANEL_HTML_ENV: &str = "CONTEXT_RADAR_PANEL_HTML";
+pub const LANG_ENV: &str = "CONTEXT_RADAR_LANG";
+pub const WORKSPACE_ENV: &str = "CONTEXT_RADAR_WORKSPACE";
+pub const CONVERSATION_ID_ENV: &str = "CONTEXT_RADAR_CONVERSATION_ID";
 
 pub const DEFAULT_CONTEXT_LIMIT: u64 = 512_000;
 pub const DEFAULT_WARN_THRESHOLD: u64 = 220_000;
@@ -23,9 +26,10 @@ pub const DEFAULT_CRITICAL_THRESHOLD: u64 = 350_000;
 pub const DEFAULT_POST_COMPACT_BASE: u64 = 20_500;
 pub const DEFAULT_SUBAGENT_SILENT_TIMEOUT_SEC: f64 = 3600.0;
 pub const DEFAULT_FX_RATE: f64 = 7.2;
-pub const DEFAULT_CURRENCY_CODE: &str = "CNY";
-pub const DEFAULT_CURRENCY_SYMBOL: &str = "¥";
+pub const DEFAULT_CURRENCY_CODE: &str = "USD";
+pub const DEFAULT_CURRENCY_SYMBOL: &str = "$";
 
+const DATA_ROOT_CANDIDATES: &[&str] = &["antigravity", "antigravity-ide", "antigravity-cli"];
 const DISABLE_TOKENS: &[&str] = &["none", "off", "disabled", "/dev/null"];
 
 pub fn user_home_dir() -> PathBuf {
@@ -48,6 +52,50 @@ pub fn expand_tilde(raw: &str) -> String {
     trimmed.to_string()
 }
 
+fn candidate_root_activity_ns(root: &Path) -> Option<i128> {
+    if !root.is_dir() {
+        return None;
+    }
+    let mut best_ns: Option<i128> = None;
+    let mut bump = |p: &Path| {
+        if let Ok(m) = fs::metadata(p) {
+            let ns = (m.mtime() as i128) * 1_000_000_000 + (m.mtime_nsec() as i128);
+            best_ns = Some(best_ns.map_or(ns, |prev| prev.max(ns)));
+        }
+    };
+    bump(&root.join("conversation_summaries.db"));
+    bump(&root.join("conversation_summaries.db-wal"));
+    bump(&root.join("conversations"));
+    best_ns
+}
+
+pub fn select_data_root_from_home(home: &Path) -> PathBuf {
+    let gemini_dir = home.join(".gemini");
+    let mut best_active: Option<(i128, usize, PathBuf)> = None;
+    let mut first_existing_dir: Option<PathBuf> = None;
+
+    for (idx, name) in DATA_ROOT_CANDIDATES.iter().enumerate() {
+        let cand = gemini_dir.join(name);
+        if cand.is_dir() && first_existing_dir.is_none() {
+            first_existing_dir = Some(cand.clone());
+        }
+        if let Some(ts) = candidate_root_activity_ns(&cand) {
+            let take = match &best_active {
+                None => true,
+                Some((prev_ts, prev_idx, _)) => ts > *prev_ts || (ts == *prev_ts && idx < *prev_idx),
+            };
+            if take {
+                best_active = Some((ts, idx, cand));
+            }
+        }
+    }
+
+    if let Some((_, _, chosen)) = best_active {
+        return chosen;
+    }
+    first_existing_dir.unwrap_or_else(|| gemini_dir.join("antigravity"))
+}
+
 pub fn default_data_root() -> PathBuf {
     if let Ok(val) = env::var(DATA_ROOT_ENV) {
         let trimmed = val.trim();
@@ -55,7 +103,7 @@ pub fn default_data_root() -> PathBuf {
             return PathBuf::from(expand_tilde(trimmed));
         }
     }
-    user_home_dir().join(".gemini").join("antigravity")
+    select_data_root_from_home(&user_home_dir())
 }
 
 pub fn default_plugin_data_dir(data_root: &Path) -> PathBuf {
@@ -176,6 +224,7 @@ pub struct ModelRateInput {
 pub struct PricingConfig {
     pub currency_code: String,
     pub currency_symbol: String,
+    pub currency_configured: bool,
     pub fx_rate: f64,
     pub fx_rate_configured: bool,
     pub external_fxrate_path: String,
@@ -188,8 +237,9 @@ pub struct PricingConfig {
 impl Default for PricingConfig {
     fn default() -> Self {
         Self {
-            currency_code: DEFAULT_CURRENCY_CODE.to_string(),
-            currency_symbol: DEFAULT_CURRENCY_SYMBOL.to_string(),
+            currency_code: String::new(),
+            currency_symbol: String::new(),
+            currency_configured: false,
             fx_rate: DEFAULT_FX_RATE,
             fx_rate_configured: false,
             external_fxrate_path: String::new(),
@@ -247,6 +297,7 @@ pub struct GuardsConfig {
 pub struct Settings {
     pub generation: u64,
     pub source_path: String,
+    pub lang: String,
     pub context: ContextConfig,
     pub pricing: PricingConfig,
     pub budgets: BudgetsConfig,
@@ -428,11 +479,14 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
         }
     }
 
+    let lang = val_str(obj.get("lang").or_else(|| obj.get("locale")));
     let c_code = val_str(pr_obj.and_then(|o| o.get("currency_code")));
     let c_sym = val_str(pr_obj.and_then(|o| o.get("currency_symbol")));
+    let currency_configured = !c_code.is_empty() || !c_sym.is_empty();
     let pricing = PricingConfig {
-        currency_code: if c_code.is_empty() { DEFAULT_CURRENCY_CODE.to_string() } else { c_code },
-        currency_symbol: if c_sym.is_empty() { DEFAULT_CURRENCY_SYMBOL.to_string() } else { c_sym },
+        currency_code: c_code,
+        currency_symbol: c_sym,
+        currency_configured,
         fx_rate,
         fx_rate_configured: fx_configured,
         external_fxrate_path: expand_tilde(&val_str(pr_obj.and_then(|o| o.get("external_fxrate_path")))),
@@ -516,6 +570,7 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
     Settings {
         generation,
         source_path: source_path.to_string(),
+        lang,
         context,
         pricing,
         budgets,

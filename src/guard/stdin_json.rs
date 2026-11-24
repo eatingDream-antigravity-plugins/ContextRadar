@@ -14,8 +14,13 @@ struct PollFd {
 
 const POLLIN: i16 = 0x0001;
 
+#[cfg(target_os = "macos")]
+type Nfds = core::ffi::c_uint;
+#[cfg(not(target_os = "macos"))]
+type Nfds = core::ffi::c_ulong;
+
 extern "C" {
-    fn poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32;
+    fn poll(fds: *mut PollFd, nfds: Nfds, timeout: i32) -> i32;
     fn read(fd: i32, buf: *mut c_void, count: usize) -> isize;
 }
 

@@ -8,9 +8,9 @@ use std::sync::{Arc, OnceLock};
 use regex::Regex;
 use serde_json::Value;
 
+use crate::i18n::{infer_currency_symbol, resolve_active_lang, Lang};
 use crate::settings::{
-    RateOverrideRule, Settings, SettingsWatcher, DEFAULT_CONTEXT_LIMIT, DEFAULT_CURRENCY_CODE,
-    DEFAULT_CURRENCY_SYMBOL, DEFAULT_FX_RATE,
+    RateOverrideRule, Settings, SettingsWatcher, DEFAULT_CONTEXT_LIMIT, DEFAULT_FX_RATE,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +21,7 @@ pub struct RateCard {
     pub output_per_m: f64,
     pub context_limit: u64,
     pub source: String,
+    pub pricing_known: bool,
     pub tier_threshold: u64,
     pub tier_input: f64,
     pub tier_cache_read: f64,
@@ -49,6 +50,7 @@ impl RateCard {
             output_per_m,
             context_limit,
             source: "builtin".to_string(),
+            pricing_known: true,
             tier_threshold,
             tier_input,
             tier_cache_read,
@@ -62,49 +64,197 @@ fn builtin_rates_table() -> &'static (HashMap<String, RateCard>, Vec<(String, Ra
     static TABLE: OnceLock<(HashMap<String, RateCard>, Vec<(String, RateCard)>)> = OnceLock::new();
     TABLE.get_or_init(|| {
         let entries: Vec<(&str, RateCard)> = vec![
+            // Current Antigravity Gemini 4 & Orchestrator families
             (
-                "gemini-2.5-pro",
-                RateCard::builtin(1.25, 0.125, 1.25, 10.0, DEFAULT_CONTEXT_LIMIT, 200_000, 2.5, 0.25, 2.5, 15.0),
+                "gemini-4-neon",
+                RateCard::builtin(2.50, 0.25, 2.50, 15.0, DEFAULT_CONTEXT_LIMIT, 200_000, 5.0, 0.50, 5.0, 22.5),
             ),
             (
-                "gemini-2.5-flash",
-                RateCard::builtin(0.30, 0.03, 0.30, 2.50, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                "gemini-4-carbon",
+                RateCard::builtin(1.50, 0.15, 1.50, 10.0, DEFAULT_CONTEXT_LIMIT, 200_000, 3.0, 0.30, 3.0, 15.0),
             ),
             (
-                "gemini-2.5-flash-lite",
-                RateCard::builtin(0.10, 0.01, 0.10, 0.40, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                "gemini-4-argon",
+                RateCard::builtin(1.50, 0.15, 1.50, 10.0, DEFAULT_CONTEXT_LIMIT, 200_000, 3.0, 0.30, 3.0, 15.0),
+            ),
+            (
+                "gemini-4-hydrogen",
+                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 200_000, 1.0, 0.10, 1.0, 6.0),
+            ),
+            (
+                "gemini-4-pro",
+                RateCard::builtin(2.50, 0.25, 2.50, 15.0, DEFAULT_CONTEXT_LIMIT, 200_000, 5.0, 0.50, 5.0, 22.5),
+            ),
+            (
+                "gemini-4-flash-lite",
+                RateCard::builtin(0.15, 0.015, 0.15, 0.60, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "gemini-4-flash",
+                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 200_000, 1.0, 0.10, 1.0, 6.0),
+            ),
+            (
+                "gemini-pro-orchestrator-neon",
+                RateCard::builtin(2.50, 0.25, 2.50, 15.0, DEFAULT_CONTEXT_LIMIT, 200_000, 5.0, 0.50, 5.0, 22.5),
+            ),
+            (
+                "gemini-pro-orchestrator",
+                RateCard::builtin(1.50, 0.15, 1.50, 10.0, DEFAULT_CONTEXT_LIMIT, 200_000, 3.0, 0.30, 3.0, 15.0),
+            ),
+            // Gemini 3.x & 2.5 families
+            (
+                "gemini-3.8-pro",
+                RateCard::builtin(2.0, 0.20, 2.0, 12.0, DEFAULT_CONTEXT_LIMIT, 200_000, 4.0, 0.40, 4.0, 18.0),
+            ),
+            (
+                "gemini-3.8-flash",
+                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "gemini-3.5-pro",
+                RateCard::builtin(2.0, 0.20, 2.0, 12.0, DEFAULT_CONTEXT_LIMIT, 200_000, 4.0, 0.40, 4.0, 18.0),
+            ),
+            (
+                "gemini-3.5-flash",
+                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "gemini-3.1-pro",
+                RateCard::builtin(2.0, 0.20, 2.0, 12.0, DEFAULT_CONTEXT_LIMIT, 200_000, 4.0, 0.40, 4.0, 18.0),
+            ),
+            (
+                "gemini-3.1-flash",
+                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
             ),
             (
                 "gemini-3-pro",
                 RateCard::builtin(2.0, 0.20, 2.0, 12.0, DEFAULT_CONTEXT_LIMIT, 200_000, 4.0, 0.40, 4.0, 18.0),
             ),
             (
+                "gemini-3-flash-lite",
+                RateCard::builtin(0.15, 0.015, 0.15, 0.60, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
                 "gemini-3-flash",
                 RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "gemini-2.5-pro",
+                RateCard::builtin(1.25, 0.125, 1.25, 10.0, DEFAULT_CONTEXT_LIMIT, 200_000, 2.5, 0.25, 2.5, 15.0),
+            ),
+            (
+                "gemini-2.5-flash-lite",
+                RateCard::builtin(0.10, 0.01, 0.10, 0.40, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "gemini-2.5-flash",
+                RateCard::builtin(0.30, 0.03, 0.30, 2.50, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            // Anthropic Claude 4 / 4.5 / 4.6 / 5.x / 3.7 / 3.5 families
+            (
+                "claude-opus-5-5",
+                RateCard::builtin(5.0, 0.50, 6.25, 25.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-opus-5",
+                RateCard::builtin(5.0, 0.50, 6.25, 25.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-opus-4-6",
+                RateCard::builtin(5.0, 0.50, 6.25, 25.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-opus-4-5",
+                RateCard::builtin(5.0, 0.50, 6.25, 25.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
             ),
             (
                 "claude-opus-4",
                 RateCard::builtin(15.0, 1.50, 18.75, 75.0, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
             ),
             (
+                "claude-sonnet-5-5",
+                RateCard::builtin(3.0, 0.30, 3.75, 15.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-sonnet-5",
+                RateCard::builtin(3.0, 0.30, 3.75, 15.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-sonnet-4-6",
+                RateCard::builtin(3.0, 0.30, 3.75, 15.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-sonnet-4-5",
+                RateCard::builtin(3.0, 0.30, 3.75, 15.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
                 "claude-sonnet-4",
                 RateCard::builtin(3.0, 0.30, 3.75, 15.0, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-3-7-sonnet",
+                RateCard::builtin(3.0, 0.30, 3.75, 15.0, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-3-5-sonnet",
+                RateCard::builtin(3.0, 0.30, 3.75, 15.0, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-haiku-4-6",
+                RateCard::builtin(1.0, 0.10, 1.25, 5.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "claude-haiku-4-5",
+                RateCard::builtin(1.0, 0.10, 1.25, 5.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
             ),
             (
                 "claude-haiku-4",
                 RateCard::builtin(0.80, 0.08, 1.00, 4.0, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
             ),
             (
-                "gpt-4.1",
-                RateCard::builtin(2.0, 0.50, 2.0, 8.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                "claude-3-5-haiku",
+                RateCard::builtin(0.80, 0.08, 1.00, 4.0, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            // OpenAI GPT-5 / GPT-OSS / GPT-4.1 / o3 / o4 families
+            (
+                "gpt-5-pro",
+                RateCard::builtin(15.0, 1.50, 15.0, 120.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "gpt-5-mini",
+                RateCard::builtin(0.25, 0.025, 0.25, 2.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "gpt-5-nano",
+                RateCard::builtin(0.05, 0.005, 0.05, 0.40, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "gpt-5",
+                RateCard::builtin(1.25, 0.125, 1.25, 10.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "gpt-oss",
+                RateCard::builtin(0.15, 0.03, 0.15, 0.60, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
             ),
             (
                 "gpt-4.1-mini",
                 RateCard::builtin(0.40, 0.10, 0.40, 1.60, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
             ),
             (
+                "gpt-4.1",
+                RateCard::builtin(2.0, 0.50, 2.0, 8.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
                 "gpt-4o",
                 RateCard::builtin(2.50, 1.25, 2.50, 10.0, 128_000, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "o3-pro",
+                RateCard::builtin(20.0, 5.0, 20.0, 80.0, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "o3-mini",
+                RateCard::builtin(1.10, 0.55, 1.10, 4.40, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
             ),
             (
                 "o3",
@@ -113,6 +263,10 @@ fn builtin_rates_table() -> &'static (HashMap<String, RateCard>, Vec<(String, Ra
             (
                 "o4-mini",
                 RateCard::builtin(1.10, 0.275, 1.10, 4.40, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
+            ),
+            (
+                "o4",
+                RateCard::builtin(2.0, 0.50, 2.0, 8.0, 200_000, 0, 0.0, 0.0, 0.0, 0.0),
             ),
         ];
 
@@ -127,10 +281,68 @@ fn builtin_rates_table() -> &'static (HashMap<String, RateCard>, Vec<(String, Ra
     })
 }
 
+fn family_fallback_rate(cands: &[String], default_limit: u64) -> Option<RateCard> {
+    for cand in cands {
+        if cand.starts_with("gemini-4") {
+            let mut card = if cand.contains("hydrogen") || cand.contains("flash") || cand.contains("lite") {
+                RateCard::builtin(0.50, 0.05, 0.50, 3.0, default_limit, 200_000, 1.0, 0.10, 1.0, 6.0)
+            } else if cand.contains("neon") || cand.contains("pro") || cand.contains("ultra") {
+                RateCard::builtin(2.50, 0.25, 2.50, 15.0, default_limit, 200_000, 5.0, 0.50, 5.0, 22.5)
+            } else {
+                RateCard::builtin(1.50, 0.15, 1.50, 10.0, default_limit, 200_000, 3.0, 0.30, 3.0, 15.0)
+            };
+            card.source = "builtin-family".to_string();
+            return Some(card);
+        }
+        if cand.starts_with("gemini-3") {
+            let mut card = if cand.contains("flash") || cand.contains("lite") {
+                RateCard::builtin(0.50, 0.05, 0.50, 3.0, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
+            } else {
+                RateCard::builtin(2.0, 0.20, 2.0, 12.0, default_limit, 200_000, 4.0, 0.40, 4.0, 18.0)
+            };
+            card.source = "builtin-family".to_string();
+            return Some(card);
+        }
+        if cand.starts_with("claude-") {
+            let mut card = if cand.contains("opus") {
+                RateCard::builtin(5.0, 0.50, 6.25, 25.0, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
+            } else if cand.contains("haiku") {
+                RateCard::builtin(1.0, 0.10, 1.25, 5.0, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
+            } else {
+                RateCard::builtin(3.0, 0.30, 3.75, 15.0, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
+            };
+            card.source = "builtin-family".to_string();
+            return Some(card);
+        }
+        if cand.starts_with("gpt-5") {
+            let mut card = if cand.contains("nano") {
+                RateCard::builtin(0.05, 0.005, 0.05, 0.40, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
+            } else if cand.contains("mini") {
+                RateCard::builtin(0.25, 0.025, 0.25, 2.0, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
+            } else {
+                RateCard::builtin(1.25, 0.125, 1.25, 10.0, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
+            };
+            card.source = "builtin-family".to_string();
+            return Some(card);
+        }
+        if cand.starts_with("o3") || cand.starts_with("o4") {
+            let mut card = if cand.contains("mini") {
+                RateCard::builtin(1.10, 0.275, 1.10, 4.40, 200_000, 0, 0.0, 0.0, 0.0, 0.0)
+            } else {
+                RateCard::builtin(2.0, 0.50, 2.0, 8.0, 200_000, 0, 0.0, 0.0, 0.0, 0.0)
+            };
+            card.source = "builtin-family".to_string();
+            return Some(card);
+        }
+    }
+    None
+}
+
 fn effort_suffix_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"(?:-xhigh|-high|-medium|-low|-trial|-thinking|-preview)$").unwrap()
+        Regex::new(r"(?:-(?:tiered|xhigh|high|medium|low|trial|thinking|preview|exp|latest))+$")
+            .unwrap()
     })
 }
 
@@ -257,6 +469,7 @@ fn parse_external_model_entry(
         output_per_m: out_p,
         context_limit: ctx_limit,
         source,
+        pricing_known: true,
         tier_threshold,
         tier_input: t_in,
         tier_cache_read: t_cr,
@@ -322,19 +535,32 @@ impl RateTable {
         self.ext_models_sig.is_some()
     }
 
+    pub fn get_lang(&mut self) -> Lang {
+        let cfg = self.watcher.current();
+        resolve_active_lang(&cfg.lang)
+    }
+
+    pub fn is_currency_explicit(&mut self) -> bool {
+        self.watcher.current().pricing.currency_configured
+    }
+
     pub fn get_currency(&mut self) -> (String, String) {
         let cfg = self.watcher.current();
-        let code = if cfg.pricing.currency_code.is_empty() {
-            DEFAULT_CURRENCY_CODE.to_string()
-        } else {
-            cfg.pricing.currency_code.clone()
-        };
-        let sym = if cfg.pricing.currency_symbol.is_empty() {
-            DEFAULT_CURRENCY_SYMBOL.to_string()
-        } else {
-            cfg.pricing.currency_symbol.clone()
-        };
-        (code, sym)
+        if cfg.pricing.currency_configured {
+            let code = if cfg.pricing.currency_code.is_empty() {
+                "USD".to_string()
+            } else {
+                cfg.pricing.currency_code.clone()
+            };
+            let sym = if cfg.pricing.currency_symbol.is_empty() {
+                infer_currency_symbol(&code).to_string()
+            } else {
+                cfg.pricing.currency_symbol.clone()
+            };
+            return (code, sym);
+        }
+        let (code, sym) = resolve_active_lang(&cfg.lang).default_currency();
+        (code.to_string(), sym.to_string())
     }
 
     fn sync_user_models(&mut self, cfg: &Settings) {
@@ -355,6 +581,7 @@ impl RateTable {
                     cfg.context.default_limit
                 },
                 source: info.source.clone(),
+                pricing_known: info.input_per_m > 0.0 || info.output_per_m > 0.0,
                 tier_threshold: info.tier_threshold,
                 tier_input: info.tier_input,
                 tier_cache_read: info.tier_cache_read,
@@ -476,13 +703,18 @@ impl RateTable {
 
     pub fn short_model_label(&mut self, model_disp: &str, model_id: &str) -> String {
         let cfg = self.watcher.current();
+        let lang = resolve_active_lang(&cfg.lang);
         let raw = if !model_disp.trim().is_empty() {
             model_disp.trim()
         } else {
             model_id.trim()
         };
-        if raw.is_empty() {
-            return "未知".to_string();
+        if raw.is_empty() || raw == "unknown" || raw == "未知模型" {
+            return if lang.is_zh() {
+                "未知".to_string()
+            } else {
+                "Unknown".to_string()
+            };
         }
         let low = raw.to_ascii_lowercase();
         for (needle, label) in &cfg.pricing.short_labels {
@@ -552,6 +784,7 @@ impl RateTable {
                         cfg.context.default_limit
                     },
                     source: rule.source.clone(),
+                    pricing_known: rule.input_per_m > 0.0 || rule.output_per_m > 0.0,
                     tier_threshold: rule.tier_threshold,
                     tier_input: rule.tier_input,
                     tier_cache_read: rule.tier_cache_read,
@@ -577,7 +810,7 @@ impl RateTable {
             }
         }
 
-        // 3. Built-in public models
+        // 3. Built-in public & Antigravity models
         let (b_map, b_sorted) = builtin_rates_table();
         for cand in &cands {
             if let Some(card) = b_map.get(cand) {
@@ -609,6 +842,11 @@ impl RateTable {
             }
         }
 
+        // 5. Family prefix heuristic for future minor versions (gemini-4*, gemini-3*, claude-*, gpt-5*, o3*/o4*)
+        if let Some(family_card) = family_fallback_rate(&cands, cfg.context.default_limit) {
+            return family_card;
+        }
+
         RateCard {
             input_per_m: 0.0,
             cache_read_per_m: 0.0,
@@ -616,6 +854,7 @@ impl RateTable {
             output_per_m: 0.0,
             context_limit: cfg.context.default_limit,
             source: "unknown".to_string(),
+            pricing_known: false,
             tier_threshold: 0,
             tier_input: 0.0,
             tier_cache_read: 0.0,

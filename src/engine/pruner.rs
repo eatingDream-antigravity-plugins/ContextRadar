@@ -8,13 +8,15 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::ledger::journal_tail::JournalTailCache;
+use crate::i18n::{resolve_active_lang, Lang};
+use crate::ledger::journal_tail::{JournalEntry, JournalTailCache};
 use crate::ledger::{is_safe_id, TurnSample};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BloatHotspot {
     pub turn: usize,
     pub step_idx: i64,
+    pub cause_step_range: [i64; 2],
     pub delta_tokens: u64,
     pub context_after: u64,
     pub cause: String,
@@ -56,6 +58,63 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     s.chars().take(max_chars).collect()
 }
 
+fn attribute_spike_cause(
+    window_entries: &[JournalEntry],
+    prev_step: i64,
+    cur_step: i64,
+    lang: Lang,
+) -> String {
+    let zh = lang.is_zh();
+    let mut tools: Vec<String> = Vec::new();
+    let mut seen_tools: HashSet<String> = HashSet::new();
+    let mut user_inputs: Vec<String> = Vec::new();
+
+    // Attribute ONLY to steps executed BEFORE `cur_step`:
+    // - `prev_step`'s outgoing `tool_calls` (which executed right after `prev_step` and produced outputs before `cur_step`),
+    // - any intermediate tool/user steps in `(prev_step + 1) .. cur_step`.
+    // Never attribute to `cur_step`'s own unexecuted outgoing `tool_calls`!
+    for e in window_entries {
+        if e.step_index < prev_step || e.step_index >= cur_step {
+            continue;
+        }
+        let summaries = if !e.tool_summaries.is_empty() {
+            &e.tool_summaries
+        } else {
+            &e.tool_names
+        };
+        for ts in summaries {
+            if !ts.is_empty() && seen_tools.insert(ts.clone()) {
+                tools.push(ts.clone());
+            }
+        }
+        if e.step_index > prev_step && e.step_type == "USER_INPUT" && !e.snippet_short.is_empty() {
+            user_inputs.push(e.snippet_short.clone());
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if !tools.is_empty() {
+        let joined = tools.join(", ");
+        let prefix = if zh { "工具" } else { "Tools" };
+        parts.push(format!("{prefix}: {}", truncate_chars(&joined, 84)));
+    }
+    if !user_inputs.is_empty() {
+        let joined = user_inputs.join("; ");
+        let prefix = if zh { "用户" } else { "User" };
+        parts.push(format!("{prefix}: {}", truncate_chars(&joined, 64)));
+    }
+
+    if parts.is_empty() {
+        if zh {
+            "上下文累积".to_string()
+        } else {
+            "Context accumulation".to_string()
+        }
+    } else {
+        truncate_chars(&parts.join(" · "), 110)
+    }
+}
+
 pub fn analyze_hotspots(
     data_root: &Path,
     cid: &str,
@@ -63,11 +122,27 @@ pub fn analyze_hotspots(
     top_k: usize,
     journal_cache: &mut JournalTailCache,
 ) -> PrunerReport {
+    analyze_hotspots_with_lang(data_root, cid, turns, top_k, journal_cache, resolve_active_lang(""))
+}
+
+pub fn analyze_hotspots_with_lang(
+    data_root: &Path,
+    cid: &str,
+    turns: &[TurnSample],
+    top_k: usize,
+    journal_cache: &mut JournalTailCache,
+    lang: Lang,
+) -> PrunerReport {
+    let zh = lang.is_zh();
     if !is_safe_id(cid) {
         return PrunerReport {
             found: false,
             mode: "hotspots".into(),
-            error: Some("无效的会话 ID".into()),
+            error: Some(if zh {
+                "无效的会话 ID".into()
+            } else {
+                "Invalid conversation ID".into()
+            }),
             conversation_id: cid.to_string(),
             active_step_range: None,
             recommended_distill_range: None,
@@ -92,44 +167,28 @@ pub fn analyze_hotspots(
     let active_turns = &turns[start_pos..];
     let window_entries = journal_cache.get_active_window(data_root, cid);
 
-    let mut step_meta: HashMap<i64, String> = HashMap::new();
-    for e in &window_entries {
-        if !e.tool_names.is_empty() {
-            let joined = e
-                .tool_names
-                .iter()
-                .filter(|n| !n.is_empty())
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            step_meta.insert(e.step_index, format!("工具: {}", truncate_chars(&joined, 80)));
-        } else if e.step_type == "USER_INPUT" && !e.snippet_short.is_empty() {
-            step_meta.insert(e.step_index, format!("用户: {}", e.snippet_short));
-        }
-    }
-
     let mut spikes: Vec<BloatHotspot> = Vec::new();
     let mut prev_ctx = active_turns.first().map(|t| t.context_tokens()).unwrap_or(0);
+    let mut prev_step = active_turns.first().map(|t| t.step_idx).unwrap_or(0);
     for (pos, t) in active_turns.iter().enumerate() {
         let cur_ctx = t.context_tokens();
+        let cur_step = t.step_idx;
         let delta = if pos > 0 {
             cur_ctx.saturating_sub(prev_ctx)
         } else {
             cur_ctx
         };
+        let p_step = prev_step;
         prev_ctx = cur_ctx;
+        prev_step = cur_step;
         if pos == 0 || delta <= 800 {
             continue;
         }
-        let cause = step_meta
-            .get(&t.step_idx)
-            .or_else(|| step_meta.get(&(t.step_idx - 1)))
-            .or_else(|| step_meta.get(&(t.step_idx - 2)))
-            .cloned()
-            .unwrap_or_else(|| "上下文累积".into());
+        let cause = attribute_spike_cause(&window_entries, p_step, cur_step, lang);
         spikes.push(BloatHotspot {
             turn: t.turn_index,
-            step_idx: t.step_idx,
+            step_idx: cur_step,
+            cause_step_range: [p_step, (cur_step - 1).max(p_step)],
             delta_tokens: delta,
             context_after: cur_ctx,
             cause,
@@ -178,11 +237,43 @@ pub fn distill_slice(
     top_k: usize,
     journal_cache: &mut JournalTailCache,
 ) -> PrunerReport {
+    distill_slice_with_lang(
+        data_root,
+        cid,
+        turns,
+        mode,
+        start_step,
+        end_step,
+        save_note,
+        top_k,
+        journal_cache,
+        resolve_active_lang(""),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn distill_slice_with_lang(
+    data_root: &Path,
+    cid: &str,
+    turns: &[TurnSample],
+    mode: &str,
+    start_step: Option<i64>,
+    end_step: Option<i64>,
+    save_note: bool,
+    top_k: usize,
+    journal_cache: &mut JournalTailCache,
+    lang: Lang,
+) -> PrunerReport {
+    let zh = lang.is_zh();
     if !is_safe_id(cid) {
         return PrunerReport {
             found: false,
             mode: mode.to_string(),
-            error: Some("无效的会话 ID".into()),
+            error: Some(if zh {
+                "无效的会话 ID".into()
+            } else {
+                "Invalid conversation ID".into()
+            }),
             conversation_id: cid.to_string(),
             active_step_range: None,
             recommended_distill_range: None,
@@ -198,15 +289,19 @@ pub fn distill_slice(
     }
 
     if mode == "hotspots" && start_step.is_none() && end_step.is_none() {
-        return analyze_hotspots(data_root, cid, turns, top_k, journal_cache);
+        return analyze_hotspots_with_lang(data_root, cid, turns, top_k, journal_cache, lang);
     }
 
-    let entries = journal_cache.get_active_window(data_root, cid);
+    let mut entries = journal_cache.get_active_window(data_root, cid);
     if entries.is_empty() {
         return PrunerReport {
             found: false,
             mode: "distill".into(),
-            error: Some("未找到可提炼的会话轨迹文件".into()),
+            error: Some(if zh {
+                "未找到可提炼的会话轨迹文件".into()
+            } else {
+                "No transcript file found for distillation".into()
+            }),
             conversation_id: cid.to_string(),
             active_step_range: None,
             recommended_distill_range: None,
@@ -229,11 +324,16 @@ pub fn distill_slice(
         std::mem::swap(&mut s_idx, &mut e_idx);
     }
 
+    // Hydrate truncated compact lines from transcript_full.jsonl on demand
+    journal_cache.hydrate_truncated_entries(data_root, cid, &mut entries, s_idx, e_idx);
+
     let mut step_count = 0usize;
     let mut user_reqs = Vec::new();
     let mut touched_files = Vec::new();
     let mut seen_files = HashSet::new();
     let mut tool_counts: HashMap<String, usize> = HashMap::new();
+    let mut notable_targets: Vec<String> = Vec::new();
+    let mut seen_targets: HashSet<String> = HashSet::new();
     let mut conclusions = Vec::new();
     let mut errors = Vec::new();
     let mut raw_chars = 0usize;
@@ -252,6 +352,11 @@ pub fn distill_slice(
         for tname in &e.tool_names {
             *tool_counts.entry(tname.clone()).or_insert(0) += 1;
         }
+        for ts in &e.tool_summaries {
+            if ts.contains('(') && notable_targets.len() < 8 && seen_targets.insert(ts.clone()) {
+                notable_targets.push(ts.clone());
+            }
+        }
         for fpath in &e.touched_files {
             if seen_files.insert(fpath.clone()) {
                 touched_files.push(fpath.clone());
@@ -269,16 +374,39 @@ pub fn distill_slice(
         .join(", ");
 
     let est_raw_tokens = (raw_chars / 4).max(1);
-    let mut lines = vec![format!(
-        "### 局部切片提炼摘要（步 #{s_idx}–#{e_idx}，共 {step_count} 步，原文约 {}k tok → <0.5k tok，主干前缀零改动）",
-        est_raw_tokens / 1000
-    )];
+    let mut lines = vec![if zh {
+        format!(
+            "### 切片提炼摘要（步 #{s_idx}–#{e_idx}，共 {step_count} 步，原文约 {}k tok → <0.5k tok，当前会话前缀未改动）",
+            est_raw_tokens / 1000
+        )
+    } else {
+        format!(
+            "### Slice Digest (steps #{s_idx}–#{e_idx}, {step_count} steps, ~{}k raw tok → <0.5k tok, live KV prefix untouched)",
+            est_raw_tokens / 1000
+        )
+    }];
+
     if !user_reqs.is_empty() {
         let tail = &user_reqs[user_reqs.len().saturating_sub(4)..];
-        lines.push(format!("- 用户指令：{}", tail.join("；")));
+        lines.push(if zh {
+            format!("- 用户指令：{}", tail.join("；"))
+        } else {
+            format!("- User requests: {}", tail.join("; "))
+        });
     }
     if !top_tools.is_empty() {
-        lines.push(format!("- 调用统计：{top_tools}"));
+        lines.push(if zh {
+            format!("- 调用统计：{top_tools}")
+        } else {
+            format!("- Tool calls: {top_tools}")
+        });
+    }
+    if !notable_targets.is_empty() {
+        lines.push(if zh {
+            format!("- 关键操作：{}", notable_targets.join(", "))
+        } else {
+            format!("- Key actions: {}", notable_targets.join(", "))
+        });
     }
     if !touched_files.is_empty() {
         let short_files: Vec<String> = touched_files
@@ -294,15 +422,27 @@ pub fn distill_slice(
                     .to_string()
             })
             .collect();
-        lines.push(format!("- 涉及文件：{}", short_files.join(", ")));
+        lines.push(if zh {
+            format!("- 涉及文件：{}", short_files.join(", "))
+        } else {
+            format!("- Files touched: {}", short_files.join(", "))
+        });
     }
     if !errors.is_empty() {
         let tail = &errors[errors.len().saturating_sub(3)..];
-        lines.push(format!("- 异常记录：{}", tail.join("；")));
+        lines.push(if zh {
+            format!("- 异常记录：{}", tail.join("；"))
+        } else {
+            format!("- Errors: {}", tail.join("; "))
+        });
     }
     if !conclusions.is_empty() {
         let tail = &conclusions[conclusions.len().saturating_sub(4)..];
-        lines.push(format!("- 阶段结论：{}", tail.join(" | ")));
+        lines.push(if zh {
+            format!("- 阶段结论：{}", tail.join(" | "))
+        } else {
+            format!("- Conclusions: {}", tail.join(" | "))
+        });
     }
 
     let mut digest = lines.join("\n");
@@ -325,7 +465,7 @@ pub fn distill_slice(
                 let note_file = scratch_dir.join(format!("slice_{s_idx}_{e_idx}.md"));
                 if !is_symlink(&note_file) {
                     let note_body = format!(
-                        "<!-- Source conversation: {cid} | steps {s_idx}-{e_idx} | prefix-cache-safe slice -->\n{digest}\n"
+                        "<!-- Source conversation: {cid} | steps {s_idx}-{e_idx} | out-of-band scratch slice -->\n{digest}\n"
                     );
                     let write_ok = OpenOptions::new()
                         .write(true)
@@ -343,9 +483,19 @@ pub fn distill_slice(
     }
 
     let handoff_hint = if !saved_path.is_empty() {
-        format!("可将 {saved_path} 作为 scratch_note_path 传给 context_radar_commit_handoff 或供分叉子代理精读。")
+        if zh {
+            format!(
+                "可将 {saved_path} 作为 scratch_note_path 传给 context_radar_commit_handoff，或交由全新子代理 / target:new 新会话读取。"
+            )
+        } else {
+            format!(
+                "Pass {saved_path} as scratch_note_path to context_radar_commit_handoff, or read it from a fresh subagent or target:new session."
+            )
+        }
+    } else if zh {
+        "可加 save_note=true 写入 scratch/，供全新子代理或接力新会话按需读取。".into()
     } else {
-        "可加 save_note=true 保存到 scratch/，供分叉子代理或接力新会话按需精读。".into()
+        "Pass save_note=true to persist this summary under scratch/ for fresh subagents or target:new handoff chats.".into()
     };
 
     PrunerReport {
