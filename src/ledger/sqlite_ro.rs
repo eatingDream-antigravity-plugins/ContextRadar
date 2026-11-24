@@ -178,23 +178,49 @@ fn hex_nibble(b: u8) -> Option<u8> {
     }
 }
 
-fn extract_workspace(raw_uris: &str) -> String {
-    if raw_uris.is_empty() {
+fn normalize_workspace_uri(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return String::new();
     }
-    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(raw_uris) {
-        if let Some(first_val) = items.first() {
-            let first = first_val
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| first_val.to_string());
-            if let Some(rest) = first.strip_prefix("file://") {
-                return percent_decode(rest);
-            }
-            return first;
-        }
+    let decoded = if let Some(rest) = trimmed.strip_prefix("file://") {
+        percent_decode(rest)
+    } else {
+        trimmed.to_string()
+    };
+    if decoded.len() > 1 {
+        decoded.trim_end_matches('/').to_string()
+    } else {
+        decoded
     }
-    raw_uris.to_string()
+}
+
+pub fn extract_workspaces(raw_uris: &str) -> (String, Vec<String>) {
+    let trimmed = raw_uris.trim();
+    if trimmed.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(trimmed) {
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for item in items {
+            let s = item
+                .as_str()
+                .map(normalize_workspace_uri)
+                .unwrap_or_default();
+            if !s.is_empty() && seen.insert(s.clone()) {
+                out.push(s);
+            }
+        }
+        let primary = out.first().cloned().unwrap_or_default();
+        return (primary, out);
+    }
+    let single = normalize_workspace_uri(trimmed);
+    if single.is_empty() {
+        (String::new(), Vec::new())
+    } else {
+        (single.clone(), vec![single])
+    }
 }
 
 #[inline]
@@ -334,6 +360,7 @@ struct RawSummaryTuple {
     title: String,
     preview: String,
     workspace: String,
+    workspaces: Vec<String>,
     status: String,
     agent_name: String,
     parent_conversation_id: String,
@@ -483,12 +510,15 @@ impl LedgerReader {
                             } else {
                                 parents.get(&cid).cloned().unwrap_or_default()
                             };
+                            let (ws_primary, ws_all) =
+                                extract_workspaces(&row.3.unwrap_or_default());
                             raw_rows.insert(
                                 cid,
                                 RawSummaryTuple {
                                     title: row.1.unwrap_or_default().trim().to_string(),
                                     preview: row.2.unwrap_or_default().trim().to_string(),
-                                    workspace: extract_workspace(&row.3.unwrap_or_default()),
+                                    workspace: ws_primary,
+                                    workspaces: ws_all,
                                     status: row.4.unwrap_or_default(),
                                     agent_name: row.5.unwrap_or_default().trim().to_string(),
                                     parent_conversation_id: parent_id,
@@ -530,6 +560,7 @@ impl LedgerReader {
                     title,
                     preview: r.preview.clone(),
                     workspace: r.workspace.clone(),
+                    workspaces: r.workspaces.clone(),
                     status: r.status.clone(),
                     agent_name: r.agent_name.clone(),
                     parent_conversation_id: r.parent_conversation_id.clone(),

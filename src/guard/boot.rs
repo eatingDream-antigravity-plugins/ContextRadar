@@ -33,29 +33,49 @@ fn read_bounded_safe(path: &Path, ws_root: Option<&Path>) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn first_non_empty_path(v: Option<&Value>) -> String {
-    let Some(arr) = v.and_then(Value::as_array) else {
+fn clean_ws_item(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return String::new();
-    };
-    for item in arr {
-        if let Some(s) = item.as_str() {
-            let t = s.trim();
-            if !t.is_empty() {
-                return t.to_string();
-            }
-        }
     }
-    String::new()
+    if let Some(rest) = trimmed.strip_prefix("file://") {
+        // Percent-decode basic %20 etc. if URI-formatted
+        let bytes = rest.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                let hi = (bytes[i + 1] as char).to_digit(16);
+                let lo = (bytes[i + 2] as char).to_digit(16);
+                if let (Some(h), Some(l)) = (hi, lo) {
+                    out.push(((h << 4) | l) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        return String::from_utf8_lossy(&out).into_owned();
+    }
+    trimmed.to_string()
 }
 
-pub fn extract_workspace_candidate(payload: &Value) -> String {
+pub fn extract_workspace_candidates(payload: &Value) -> Vec<String> {
     let Some(obj) = payload.as_object() else {
-        return String::new();
+        return Vec::new();
     };
-    if let Some(cwd) = obj.get("cwd").and_then(Value::as_str).map(str::trim) {
-        if !cwd.is_empty() {
-            return cwd.to_string();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |raw: &str| {
+        let cleaned = clean_ws_item(raw);
+        if !cleaned.is_empty() && seen.insert(cleaned.clone()) {
+            out.push(cleaned);
         }
+    };
+
+    if let Some(cwd) = obj.get("cwd").and_then(Value::as_str) {
+        push(cwd);
     }
     for key in [
         "workspacePaths",
@@ -63,12 +83,20 @@ pub fn extract_workspace_candidate(payload: &Value) -> String {
         "workspaceRoots",
         "workspace_roots",
     ] {
-        let p = first_non_empty_path(obj.get(key));
-        if !p.is_empty() {
-            return p;
+        if let Some(arr) = obj.get(key).and_then(Value::as_array) {
+            for item in arr.iter().filter_map(Value::as_str) {
+                push(item);
+            }
         }
     }
-    String::new()
+    out
+}
+
+pub fn extract_workspace_candidate(payload: &Value) -> String {
+    extract_workspace_candidates(payload)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 fn normalize_path(raw: &str) -> PathBuf {
@@ -370,7 +398,34 @@ pub fn evaluate_boot_guard(payload: &Value, hook_cfg: &Value) -> Value {
         return json!({});
     }
 
-    let candidate = extract_workspace_candidate(payload);
+    let candidates = extract_workspace_candidates(payload);
+    let primary_cand = candidates.first().map(String::as_str).unwrap_or("");
+    let matches_any_ws = |ws_root: &str| -> Option<String> {
+        if ws_root.trim().is_empty() {
+            return Some(primary_cand.to_string());
+        }
+        for c in &candidates {
+            if is_inside_workspace(c, ws_root) {
+                return Some(c.clone());
+            }
+        }
+        None
+    };
+    let resolve_across_candidates =
+        |raw_path: &str, ws_root: &str, matched_cand: &str| -> Option<(PathBuf, Option<PathBuf>)> {
+            if !ws_root.trim().is_empty() {
+                return resolve_file_path(raw_path, ws_root);
+            }
+            for c in &candidates {
+                if let Some((tp, br)) = resolve_file_path(raw_path, c) {
+                    if tp.exists() {
+                        return Some((tp, br));
+                    }
+                }
+            }
+            resolve_file_path(raw_path, matched_cand)
+        };
+
     let mut messages: Vec<String> = Vec::new();
 
     for spec_val in state_files {
@@ -385,11 +440,12 @@ pub fn evaluate_boot_guard(payload: &Value, hook_cfg: &Value) -> Value {
             .get("workspace_root")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if !is_inside_workspace(&candidate, ws_root) {
+        let Some(matched_cand) = matches_any_ws(ws_root) else {
             continue;
-        }
-        let base_root = if !ws_root.trim().is_empty() { ws_root } else { &candidate };
-        let Some((target_path, bound_root)) = resolve_file_path(raw_path, base_root) else {
+        };
+        let Some((target_path, bound_root)) =
+            resolve_across_candidates(raw_path, ws_root, &matched_cand)
+        else {
             continue;
         };
         let Some(raw) = read_bounded_safe(&target_path, bound_root.as_deref()) else {
@@ -423,17 +479,18 @@ pub fn evaluate_boot_guard(payload: &Value, hook_cfg: &Value) -> Value {
             .get("workspace_root")
             .and_then(Value::as_str)
             .unwrap_or("");
-        if !is_inside_workspace(&candidate, ws_root) {
+        let Some(matched_cand) = matches_any_ws(ws_root) else {
             continue;
-        }
+        };
         let body = if let Some(f) = rule
             .get("file")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let base_root = if !ws_root.trim().is_empty() { ws_root } else { &candidate };
-            let Some((fpath, bound_root)) = resolve_file_path(f, base_root) else {
+            let Some((fpath, bound_root)) =
+                resolve_across_candidates(f, ws_root, &matched_cand)
+            else {
                 continue;
             };
             match read_bounded_safe(&fpath, bound_root.as_deref()) {

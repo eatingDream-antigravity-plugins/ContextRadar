@@ -15,6 +15,12 @@
       "const": 1,
       "description": "Settings schema version (1)."
     },
+    "lang": {
+      "type": "string",
+      "enum": ["auto", "en", "zh-CN"],
+      "default": "auto",
+      "description": "UI and tool output language ('auto' detects from CONTEXT_RADAR_LANG / LC_ALL / LC_MESSAGES / LANG / macOS AppleLanguages)."
+    },
     "context": {
       "type": "object",
       "description": "Context window thresholds, post-checkpoint estimation, and index cache settings.",
@@ -35,8 +41,8 @@
       "description": "Model pricing overrides, FX conversion, and optional lazy external catalogs.",
       "additionalProperties": false,
       "properties": {
-        "currency_code": { "type": "string", "default": "CNY" },
-        "currency_symbol": { "type": "string", "default": "¥" },
+        "currency_code": { "type": "string", "default": "USD" },
+        "currency_symbol": { "type": "string", "default": "$" },
         "fx_rate": { "type": "number", "exclusiveMinimum": 0, "default": 7.2 },
         "external_fxrate_path": { "type": "string" },
         "external_models_path": { "type": "string" },
@@ -230,6 +236,8 @@
             "min_sync_wait_ms": { "type": "integer", "minimum": 0, "maximum": 10000, "default": 5000 },
             "target_sync_wait_ms": { "type": "integer", "minimum": 500, "maximum": 10000, "default": 10000 },
             "respect_is_daemon": { "type": "boolean", "default": true },
+            "respect_async_builds": { "type": "boolean", "default": true },
+            "async_build_max_wait_ms": { "type": "integer", "minimum": 0, "maximum": 2000, "default": 550 },
             "replace_default_exempt_patterns": { "type": "boolean", "default": false },
             "exempt_patterns": { "type": "array", "items": { "type": "string" } }
           }

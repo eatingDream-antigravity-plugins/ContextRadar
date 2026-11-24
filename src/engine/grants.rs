@@ -1,4 +1,4 @@
-//! Single-use replay-protected relay grant store with mtime/size cache and prompt builders.
+//! Workspace- and conversation-scoped single-use relay grant store with mtime/size cache and bilingual prompt builders.
 
 use std::collections::HashMap;
 use std::env;
@@ -10,6 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::i18n::{parse_lang_tag, resolve_active_lang, Lang};
 use crate::settings::{
     default_data_root, default_plugin_data_dir, expand_tilde, GRANTS_PATH_ENV,
 };
@@ -43,28 +44,87 @@ pub fn default_grants_path_in(
     default_plugin_data_dir(&root).join("relay_grants.json")
 }
 
+fn norm_ws_str(raw: &str) -> String {
+    let t = raw.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    let stripped = t.strip_prefix("file://").unwrap_or(t);
+    if stripped.len() > 1 {
+        stripped.trim_end_matches('/').to_string()
+    } else {
+        stripped.to_string()
+    }
+}
+
+pub fn paths_overlap(a: &str, b: &str) -> bool {
+    let na = norm_ws_str(a);
+    let nb = norm_ws_str(b);
+    if na.is_empty() || nb.is_empty() {
+        return false;
+    }
+    if na == nb {
+        return true;
+    }
+    let pa = Path::new(&na);
+    let pb = Path::new(&nb);
+    pa.starts_with(pb) || pb.starts_with(pa)
+}
+
+pub fn workspaces_overlap(grant_ws: &str, grant_all: &[String], scope_ws: &str) -> bool {
+    let ns = norm_ws_str(scope_ws);
+    if ns.is_empty() {
+        return true;
+    }
+    if !grant_ws.trim().is_empty() && paths_overlap(grant_ws, &ns) {
+        return true;
+    }
+    grant_all.iter().any(|w| paths_overlap(w, &ns))
+}
+
 /// Validate and sanitize an optional `scratch_note_path` to prevent path traversal,
 /// symlink abuse, or control-character injection into handoff prompts.
 pub fn sanitize_scratch_note_path(raw: &str) -> Result<String, String> {
+    sanitize_scratch_note_path_for_lang(raw, resolve_active_lang(""))
+}
+
+pub fn sanitize_scratch_note_path_for_lang(raw: &str, lang: Lang) -> Result<String, String> {
+    let zh = lang.is_zh();
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Ok(String::new());
     }
     if trimmed.len() > 512 {
-        return Err("scratch_note_path 过长（上限 512 字节）".into());
+        return Err(if zh {
+            "scratch_note_path 过长（上限 512 字节）".into()
+        } else {
+            "scratch_note_path exceeds 512-byte maximum".into()
+        });
     }
     if trimmed.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return Err("scratch_note_path 包含非法控制字符".into());
+        return Err(if zh {
+            "scratch_note_path 包含非法控制字符".into()
+        } else {
+            "scratch_note_path contains disallowed control characters".into()
+        });
     }
     let p = Path::new(trimmed);
     for comp in p.components() {
         if matches!(comp, std::path::Component::ParentDir) {
-            return Err("scratch_note_path 禁止包含路径穿越段 '..'".into());
+            return Err(if zh {
+                "scratch_note_path 禁止包含路径穿越段 '..'".into()
+            } else {
+                "scratch_note_path must not contain '..' path traversal segments".into()
+            });
         }
     }
     if let Ok(meta) = fs::symlink_metadata(p) {
         if meta.file_type().is_symlink() {
-            return Err("scratch_note_path 禁止指向符号链接".into());
+            return Err(if zh {
+                "scratch_note_path 禁止指向符号链接".into()
+            } else {
+                "scratch_note_path must not point to a symbolic link".into()
+            });
         }
     }
     Ok(trimmed.to_string())
@@ -96,6 +156,15 @@ fn random_hex_16() -> String {
 }
 
 pub fn build_compact_command(preserve_points: &str, resume_task: &str) -> String {
+    build_compact_command_for_lang(preserve_points, resume_task, resolve_active_lang(""))
+}
+
+pub fn build_compact_command_for_lang(
+    preserve_points: &str,
+    resume_task: &str,
+    lang: Lang,
+) -> String {
+    let zh = lang.is_zh();
     let pts = preserve_points
         .lines()
         .map(str::trim)
@@ -109,8 +178,20 @@ pub fn build_compact_command(preserve_points: &str, resume_task: &str) -> String
         .collect::<Vec<_>>()
         .join(" ");
     match (!pts.is_empty(), !nxt.is_empty()) {
-        (true, true) => format!("/compact 保留关键上下文与约束：{pts}。压缩完成后请立即继续执行：{nxt}"),
-        (true, false) => format!("/compact 保留关键上下文与约束：{pts}"),
+        (true, true) => {
+            if zh {
+                format!("/compact 保留关键上下文与约束：{pts}。压缩完成后请继续执行：{nxt}")
+            } else {
+                format!("/compact Preserve key context and constraints: {pts}. After compaction, continue with: {nxt}")
+            }
+        }
+        (true, false) => {
+            if zh {
+                format!("/compact 保留关键上下文与约束：{pts}")
+            } else {
+                format!("/compact Preserve key context and constraints: {pts}")
+            }
+        }
         (false, true) => format!("/compact {nxt}"),
         (false, false) => "/compact".to_string(),
     }
@@ -123,6 +204,25 @@ pub fn build_handoff_prompt(
     scratch_note_path: &str,
     title: &str,
 ) -> String {
+    build_handoff_prompt_for_lang(
+        conversation_id,
+        preserve_points,
+        resume_task,
+        scratch_note_path,
+        title,
+        resolve_active_lang(""),
+    )
+}
+
+pub fn build_handoff_prompt_for_lang(
+    conversation_id: &str,
+    preserve_points: &str,
+    resume_task: &str,
+    scratch_note_path: &str,
+    title: &str,
+    lang: Lang,
+) -> String {
+    let zh = lang.is_zh();
     let pts = preserve_points.trim();
     let nxt = resume_task.trim();
     let note = scratch_note_path.trim();
@@ -132,42 +232,78 @@ pub fn build_handoff_prompt(
         conversation_id.trim().to_string()
     } else if !title.trim().is_empty() {
         title.trim().to_string()
-    } else {
+    } else if zh {
         "上一会话".to_string()
+    } else {
+        "previous session".to_string()
     };
 
-    let mut lines = vec![
-        format!(
-            "【上下文压缩接力】本会话承接自高上下文会话 `{src}`（通过官方 MCP App `target:new` 无缝切换以释放上下文窗口）。"
-        ),
-        String::new(),
-        "## 必须保留的关键上下文、已改文件与约束".to_string(),
-        if pts.is_empty() {
-            "（未提供额外要点）".to_string()
-        } else {
-            pts.to_string()
-        },
-    ];
-    if !note.is_empty() {
+    if zh {
+        let mut lines = vec![
+            format!(
+                "【上下文接力】本会话承接自高水位会话 `{src}`（通过官方 MCP App `target:new` 切换以释放上下文窗口）。"
+            ),
+            String::new(),
+            "## 必须保留的关键上下文、已改文件与约束".to_string(),
+            if pts.is_empty() {
+                "（未提供额外要点）".to_string()
+            } else {
+                pts.to_string()
+            },
+        ];
+        if !note.is_empty() {
+            lines.push(String::new());
+            lines.push("## 切片摘要备忘（按需读取）".to_string());
+            lines.push(format!("- `{note}`"));
+        }
         lines.push(String::new());
-        lines.push("## 历史提纯摘要文件（按需精读）".to_string());
-        lines.push(format!("- `{note}`"));
-    }
-    lines.push(String::new());
-    if !nxt.is_empty() {
-        lines.push("## 请立即继续执行的下一步任务".to_string());
-        lines.push(nxt.to_string());
+        if !nxt.is_empty() {
+            lines.push("## 下一步任务".to_string());
+            lines.push(nxt.to_string());
+        } else {
+            lines.push("## 下一步".to_string());
+            lines.push("请确认以上接力上下文已就绪，并简要汇报当前状态等待指令。".to_string());
+        }
+        lines.join("\n")
     } else {
-        lines.push("## 下一步".to_string());
-        lines.push("请确认以上接力上下文已就绪，并汇报当前状态等待进一步指令。".to_string());
+        let mut lines = vec![
+            format!(
+                "[Context Handoff] Continuing from high-context session `{src}` (launched via official MCP App `target:new` to reset the context window)."
+            ),
+            String::new(),
+            "## Key Context, Modified Files & Constraints to Preserve".to_string(),
+            if pts.is_empty() {
+                "(No additional notes provided)".to_string()
+            } else {
+                pts.to_string()
+            },
+        ];
+        if !note.is_empty() {
+            lines.push(String::new());
+            lines.push("## Distilled Slice Summary (read on demand)".to_string());
+            lines.push(format!("- `{note}`"));
+        }
+        lines.push(String::new());
+        if !nxt.is_empty() {
+            lines.push("## Next Task to Execute".to_string());
+            lines.push(nxt.to_string());
+        } else {
+            lines.push("## Next Step".to_string());
+            lines.push(
+                "Confirm the handoff context above is clear and report readiness for the next instruction."
+                    .to_string(),
+            );
+        }
+        lines.join("\n")
     }
-    lines.join("\n")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PanelPrefs {
     #[serde(default = "default_true")]
     pub allow_auto_handoff: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub lang: String,
 }
 
 fn default_true() -> bool {
@@ -178,6 +314,7 @@ impl Default for PanelPrefs {
     fn default() -> Self {
         Self {
             allow_auto_handoff: true,
+            lang: String::new(),
         }
     }
 }
@@ -187,6 +324,10 @@ pub struct RelayGrant {
     pub grant_id: String,
     pub kind: String,
     pub conversation_id: String,
+    #[serde(default)]
+    pub workspace: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<String>,
     #[serde(default)]
     pub title: String,
     pub created_at: f64,
@@ -245,6 +386,8 @@ pub struct ClaimOutcome {
     pub grant_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,9 +503,25 @@ impl RelayGrantStore {
     }
 
     pub fn update_settings(&mut self, allow_auto_handoff: Option<bool>) -> PanelPrefs {
+        self.update_settings_with_lang(allow_auto_handoff, None)
+    }
+
+    pub fn update_settings_with_lang(
+        &mut self,
+        allow_auto_handoff: Option<bool>,
+        lang: Option<&str>,
+    ) -> PanelPrefs {
         let mut data = self.load();
         if let Some(v) = allow_auto_handoff {
             data.settings.allow_auto_handoff = v;
+        }
+        if let Some(raw_lang) = lang {
+            let trimmed = raw_lang.trim();
+            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+                data.settings.lang.clear();
+            } else if let Some(parsed) = parse_lang_tag(trimmed) {
+                data.settings.lang = parsed.as_str().to_string();
+            }
         }
         self.save(&data);
         data.settings
@@ -385,19 +544,53 @@ impl RelayGrantStore {
         scratch_note_path: &str,
         title: &str,
     ) -> RelayGrant {
+        self.create_grant_scoped(
+            preserve_points,
+            resume_task,
+            auto_fire,
+            conversation_id,
+            "",
+            &[],
+            turns_count,
+            checkpoint_count,
+            kind,
+            scratch_note_path,
+            title,
+            resolve_active_lang(""),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_grant_scoped(
+        &mut self,
+        preserve_points: &str,
+        resume_task: &str,
+        auto_fire: bool,
+        conversation_id: &str,
+        workspace: &str,
+        workspaces: &[String],
+        turns_count: usize,
+        checkpoint_count: usize,
+        kind: &str,
+        scratch_note_path: &str,
+        title: &str,
+        lang: Lang,
+    ) -> RelayGrant {
         let now = now_sec();
         let mut data = self.load();
         data.grants
             .retain(|_, g| (now - g.created_at) <= GRANT_PRUNE_SEC);
 
         let grant_id = random_hex_16();
-        let compact_command = build_compact_command(preserve_points, resume_task);
-        let handoff_prompt = build_handoff_prompt(
+        let compact_command =
+            build_compact_command_for_lang(preserve_points, resume_task, lang);
+        let handoff_prompt = build_handoff_prompt_for_lang(
             conversation_id,
             preserve_points,
             resume_task,
             scratch_note_path,
             title,
+            lang,
         );
         let norm_kind = if kind == "handoff" || kind == "compact" {
             kind.to_string()
@@ -405,10 +598,19 @@ impl RelayGrantStore {
             "handoff".to_string()
         };
 
+        let norm_ws = norm_ws_str(workspace);
+        let norm_all: Vec<String> = workspaces
+            .iter()
+            .map(|w| norm_ws_str(w))
+            .filter(|w| !w.is_empty())
+            .collect();
+
         let entry = RelayGrant {
             grant_id: grant_id.clone(),
             kind: norm_kind,
             conversation_id: conversation_id.to_string(),
+            workspace: norm_ws,
+            workspaces: norm_all,
             title: title.trim().to_string(),
             created_at: now,
             ttl_sec: GRANT_TTL_SEC,
@@ -434,7 +636,18 @@ impl RelayGrantStore {
     }
 
     pub fn get_pending_grant(&mut self, now_override: Option<f64>) -> Option<RelayGrant> {
+        self.get_pending_grant_scoped(None, None, now_override)
+    }
+
+    pub fn get_pending_grant_scoped(
+        &mut self,
+        scope_cid: Option<&str>,
+        scope_workspace: Option<&str>,
+        now_override: Option<f64>,
+    ) -> Option<RelayGrant> {
         let ref_now = now_override.unwrap_or_else(now_sec);
+        let cid_f = scope_cid.map(str::trim).filter(|s| !s.is_empty());
+        let ws_f = scope_workspace.map(norm_ws_str).filter(|s| !s.is_empty());
         let data = self.load();
         let mut cands: Vec<RelayGrant> = data
             .grants
@@ -446,6 +659,22 @@ impl RelayGrantStore {
                 let age = ref_now - rec.created_at;
                 if age > rec.ttl_sec {
                     return false;
+                }
+                if let Some(cid_req) = cid_f {
+                    if rec.conversation_id != cid_req {
+                        return false;
+                    }
+                }
+                if let Some(ref ws_req) = ws_f {
+                    let has_grant_ws = !rec.workspace.is_empty() || !rec.workspaces.is_empty();
+                    if has_grant_ws {
+                        if !workspaces_overlap(&rec.workspace, &rec.workspaces, ws_req) {
+                            return false;
+                        }
+                    } else if cid_f.is_none() {
+                        // Never expose an unscoped grant to a workspace-bound side pane without an explicit conversation match.
+                        return false;
+                    }
                 }
                 if !rec.claimed {
                     return true;
@@ -482,12 +711,35 @@ impl RelayGrantStore {
         running_subagent_count: Option<usize>,
         require_auto_handoff: bool,
     ) -> ClaimOutcome {
+        self.claim_grant_scoped(
+            grant_id,
+            None,
+            None,
+            current_turns,
+            current_checkpoints,
+            running_subagent_count,
+            require_auto_handoff,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_grant_scoped(
+        &mut self,
+        grant_id: &str,
+        expected_cid: Option<&str>,
+        expected_workspace: Option<&str>,
+        current_turns: Option<usize>,
+        current_checkpoints: Option<usize>,
+        running_subagent_count: Option<usize>,
+        require_auto_handoff: bool,
+    ) -> ClaimOutcome {
         if grant_id.is_empty() {
             return ClaimOutcome {
                 claimed: false,
                 reason: Some("missing_grant_id".into()),
                 grant_id: None,
                 conversation_id: None,
+                workspace: None,
                 compact_command: None,
                 handoff_prompt: None,
                 handoff_conversation_id: None,
@@ -504,6 +756,7 @@ impl RelayGrantStore {
                 reason: Some("not_found".into()),
                 grant_id: None,
                 conversation_id: None,
+                workspace: None,
                 compact_command: None,
                 handoff_prompt: None,
                 handoff_conversation_id: None,
@@ -511,12 +764,46 @@ impl RelayGrantStore {
             };
         };
 
+        if let Some(ecid) = expected_cid.map(str::trim).filter(|s| !s.is_empty()) {
+            if !rec.conversation_id.is_empty() && rec.conversation_id != ecid {
+                return ClaimOutcome {
+                    claimed: false,
+                    reason: Some("conversation_mismatch".into()),
+                    grant_id: None,
+                    conversation_id: Some(rec.conversation_id.clone()),
+                    workspace: Some(rec.workspace.clone()),
+                    compact_command: None,
+                    handoff_prompt: None,
+                    handoff_conversation_id: None,
+                    running_subagent_count: None,
+                };
+            }
+        }
+
+        if let Some(ews) = expected_workspace.map(norm_ws_str).filter(|s| !s.is_empty()) {
+            let has_grant_ws = !rec.workspace.is_empty() || !rec.workspaces.is_empty();
+            if has_grant_ws && !workspaces_overlap(&rec.workspace, &rec.workspaces, &ews) {
+                return ClaimOutcome {
+                    claimed: false,
+                    reason: Some("workspace_mismatch".into()),
+                    grant_id: None,
+                    conversation_id: Some(rec.conversation_id.clone()),
+                    workspace: Some(rec.workspace.clone()),
+                    compact_command: None,
+                    handoff_prompt: None,
+                    handoff_conversation_id: None,
+                    running_subagent_count: None,
+                };
+            }
+        }
+
         if rec.claimed {
             return ClaimOutcome {
                 claimed: false,
                 reason: Some("already_claimed".into()),
                 grant_id: None,
                 conversation_id: None,
+                workspace: None,
                 compact_command: None,
                 handoff_prompt: None,
                 handoff_conversation_id: Some(rec.handoff_conversation_id.clone()),
@@ -530,6 +817,7 @@ impl RelayGrantStore {
                 reason: Some("expired".into()),
                 grant_id: None,
                 conversation_id: None,
+                workspace: None,
                 compact_command: None,
                 handoff_prompt: None,
                 handoff_conversation_id: None,
@@ -546,6 +834,7 @@ impl RelayGrantStore {
                     reason: Some("already_compacted".into()),
                     grant_id: None,
                     conversation_id: None,
+                    workspace: None,
                     compact_command: None,
                     handoff_prompt: None,
                     handoff_conversation_id: None,
@@ -563,6 +852,7 @@ impl RelayGrantStore {
                     reason: Some("session_advanced".into()),
                     grant_id: None,
                     conversation_id: None,
+                    workspace: None,
                     compact_command: None,
                     handoff_prompt: None,
                     handoff_conversation_id: None,
@@ -578,6 +868,7 @@ impl RelayGrantStore {
                     reason: Some("running_subagents_active".into()),
                     grant_id: None,
                     conversation_id: None,
+                    workspace: None,
                     compact_command: None,
                     handoff_prompt: None,
                     handoff_conversation_id: None,
@@ -592,6 +883,7 @@ impl RelayGrantStore {
                 reason: Some("auto_handoff_disabled".into()),
                 grant_id: None,
                 conversation_id: None,
+                workspace: None,
                 compact_command: None,
                 handoff_prompt: None,
                 handoff_conversation_id: None,
@@ -606,6 +898,7 @@ impl RelayGrantStore {
             reason: None,
             grant_id: Some(grant_id.to_string()),
             conversation_id: Some(rec.conversation_id.clone()),
+            workspace: Some(rec.workspace.clone()),
             compact_command: Some(rec.compact_command.clone()),
             handoff_prompt: Some(rec.handoff_prompt.clone()),
             handoff_conversation_id: None,
