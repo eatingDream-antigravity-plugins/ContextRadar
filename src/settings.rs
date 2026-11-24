@@ -18,6 +18,8 @@ pub const PANEL_HTML_ENV: &str = "CONTEXT_RADAR_PANEL_HTML";
 pub const LANG_ENV: &str = "CONTEXT_RADAR_LANG";
 pub const WORKSPACE_ENV: &str = "CONTEXT_RADAR_WORKSPACE";
 pub const CONVERSATION_ID_ENV: &str = "CONTEXT_RADAR_CONVERSATION_ID";
+pub const ACP_PROXY_ENV: &str = "CONTEXT_RADAR_ACP_PROXY";
+pub const AGY_BIN_ENV: &str = "AGY_BIN";
 
 pub const DEFAULT_CONTEXT_LIMIT: u64 = 512_000;
 pub const DEFAULT_WARN_THRESHOLD: u64 = 220_000;
@@ -97,13 +99,66 @@ pub fn select_data_root_from_home(home: &Path) -> PathBuf {
 }
 
 pub fn default_data_root() -> PathBuf {
+    default_data_root_for_plugin_data(None)
+}
+
+/// Infer the host Antigravity data root from a `--data-dir` path such as
+/// `~/.gemini/antigravity-cli/plugin_data/context-radar-mcp`.
+pub fn infer_data_root_from_plugin_data(plugin_data_dir: &Path) -> Option<PathBuf> {
+    let parent = plugin_data_dir.parent()?;
+    if parent.file_name().and_then(|s| s.to_str()) != Some("plugin_data") {
+        return None;
+    }
+    let root = parent.parent()?;
+    let root_name = root.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let looks_like_host = DATA_ROOT_CANDIDATES.contains(&root_name)
+        || root.join("conversations").is_dir()
+        || root.join("conversation_summaries.db").is_file();
+    if looks_like_host {
+        Some(root.to_path_buf())
+    } else {
+        None
+    }
+}
+
+pub fn default_data_root_for_plugin_data(plugin_data_dir: Option<&Path>) -> PathBuf {
     if let Ok(val) = env::var(DATA_ROOT_ENV) {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
             return PathBuf::from(expand_tilde(trimmed));
         }
     }
+    if let Some(pdd) = plugin_data_dir {
+        if let Some(inferred) = infer_data_root_from_plugin_data(pdd) {
+            return inferred;
+        }
+    }
     select_data_root_from_home(&user_home_dir())
+}
+
+pub fn resolve_agy_bin(explicit: Option<&str>) -> PathBuf {
+    if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
+        return PathBuf::from(expand_tilde(raw));
+    }
+    if let Ok(env_bin) = env::var(AGY_BIN_ENV) {
+        let trimmed = env_bin.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(expand_tilde(trimmed));
+        }
+    }
+    if let Ok(path_var) = env::var("PATH") {
+        for dir in env::split_paths(&path_var) {
+            let cand = dir.join("agy");
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    let local_bin = user_home_dir().join(".local").join("bin").join("agy");
+    if local_bin.is_file() {
+        return local_bin;
+    }
+    PathBuf::from("agy")
 }
 
 pub fn default_plugin_data_dir(data_root: &Path) -> PathBuf {
