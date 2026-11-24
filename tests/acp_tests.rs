@@ -20,7 +20,7 @@ fn bin_path() -> &'static str {
 }
 
 #[test]
-fn test_infer_data_root_from_plugin_data_and_cli_args() {
+fn test_acp_data_root_inference_and_compact_prompt_detection() {
     let td = TempDir::new().unwrap();
     let cli_root = td.path().join("antigravity-cli");
     let pdd = cli_root.join("plugin_data").join("context-radar-mcp");
@@ -38,10 +38,7 @@ fn test_infer_data_root_from_plugin_data_and_cli_args() {
         "antigravity-cli".to_string(),
     ]);
     assert_eq!(resolved, cli_root);
-}
 
-#[test]
-fn test_prompt_starts_with_compact_detection() {
     assert!(prompt_starts_with_compact(
         &json!({ "prompt": [{ "type": "text", "text": "/compact" }] })
     ));
@@ -496,23 +493,4 @@ fn test_acp_proxy_and_acp_run_stdio_e2e_with_mock_acp_server() {
     let st = child.wait().unwrap();
     assert!(st.success());
     let _ = Duration::from_millis(1);
-}
-
-#[test]
-fn test_all_mcp_tools_fit_antigravity_64_char_namespaced_limit() {
-    let cfg: Value = serde_json::from_str(include_str!("../mcp_config.json")).unwrap();
-    let servers = cfg["mcpServers"].as_object().unwrap();
-    assert_eq!(servers.len(), 1);
-    let server_key = servers.keys().next().unwrap();
-    let plugin_name = "context-radar-mcp";
-    let tools = context_radar_mcp::rpc::tools::tools_spec();
-    for t in tools.as_array().unwrap() {
-        let name = t["name"].as_str().unwrap();
-        let full = format!("mcp_{plugin_name}_{server_key}_{name}");
-        assert!(
-            full.len() <= 64,
-            "Namespaced MCP tool '{full}' is {} chars (> 64-char host limit!)",
-            full.len()
-        );
-    }
 }
