@@ -25,10 +25,10 @@ Context Radar 在 Antigravity 里提供了一个实时面板，把上下文占�
 
 ## 它能帮你做什么
 
-- **实时看清上下文和消耗**：在侧边栏直观查看当前会话和子 Agent 的上下文占比、缓存命中率、输出速度和估算费用；打开/切回面板时立即刷新，并在后台保持轻量 `if_digest` 轮询与按会话 WAL 变更感知，避免显示延迟。
+- **实时看清上下文和消耗**：在侧边栏直观查看当前会话和子 Agent 的上下文占比、缓存命中率、输出速度和估算费用；采用前台 1s / 后台 2s 自适应 `if_digest` 轮询（15s 超时防卡死）与按会话 WAL 变更感知，并在保活侧边栏/全局面板重新显现时通过 `ResizeObserver`、`IntersectionObserver`、`onhostcontextchanged` 与被动 `pointerenter` 立即触发刷新，避免界面停滞。
 - **定位变慢的原因**：自动区分"新的一轮正常未命中""对话中途意外断缓存"和"压缩后的首次重建"，一眼知道慢在哪。
 - **找出撑大上下文的罪魁祸首**：快速定位哪几轮历史最占空间，让 Agent 把早期冗长记录浓缩成简短摘要存到 `scratch/`，不用带着一堆旧日志继续跑。
-- **判断 `/compact` 或换新对话划不划算**：结合当前模型预算和回本轮数给出建议；在 Antigravity App 中提供一键「执行 /compact」「复制 /compact」与官方 `target:new` 新会话交接卡片，在 `agy CLI` 与 ACP 编辑器中则可通过 `acp-proxy` / `acp-run` 全自动原地执行官方 `/compact`。
+- **判断 `/compact` 或换新对话划不划算**：结合当前模型预算和回本轮数给出建议；严格遵循官方协议——在 Antigravity App 可见挂载卡片或归属侧边栏中通过 SEP-1865 `ui/message` 触发受保护的 `/compact` 或 `target:new` 新会话交接（失败自动复制 `/compact` 兜底），在 `agy CLI` 与 ACP 编辑器中则通过 `acp-proxy` / `acp-run` 全自动原地执行官方 `/compact`。
 - **顺手的小保护**：防止 Agent 把几秒钟就能跑完的命令过早丢到后台；如果你在配置里指定了工作区状态文件，也能在开新会话时自动带入。
 
 ## 安装
@@ -71,9 +71,12 @@ CONTEXT_RADAR_VERSION=v1.0.0 ANTIGRAVITY_PLUGINS_DIR=~/.gemini/config/plugins \
 | `context_radar_prepare_handoff` | 评估现在执行 `/compact` 或开新对话是否划算。 |
 | `context_radar_commit_handoff` | 条件满足后生成 `/compact` 或新对话交接卡片。 |
 
-### 通过官方 ACP 协议实现 Agent 自主原地 `/compact`（`agy acp`）
+### 自主压缩与交接的官方协议边界（Antigravity App vs `agy acp`）
 
-针对 **Antigravity CLI（`agy`）** 与支持 ACP 的编辑器（**Zed、JetBrains IDE、Android Studio、Xcode、VS Code ACP Client**），Context Radar 内置了两个完全遵循官方 ACP v1 协议的子命令，可在同一条 ACP 会话连接上安全执行原生 `/compact`（含 compact-and-continue 自动续跑）：
+Context Radar 严格仅使用官方文档化协议（不依赖任何未公开宿主 RPC）：
+
+- **Antigravity App（SEP-1865 MCP Apps `ui/message`）**：当 `context_radar_commit_handoff` 通过全部硬门槛（`running_subagent_count == 0`、预算与回本轮数达标）后，**可见挂载**的内联交接卡片（`ui://context-radar-mcp/handoff`）或归属匹配的侧边栏 `aux_pane`（`!document.hidden`）可原子核销单次票据，通过官方 `ui/message` 触发 `/compact` 或通过 `com.google.antigravity/message`（`target: "new"`）拉起新会话，若宿主拒绝则自动复制 `/compact` 到剪贴板兜底。由于 Antigravity App 不会为折叠工具调用静默挂载无头 iframe，也未提供无 UI 场景的 MCP/Hook `/compact` 接口，因此在无可见面板时的无人值守原地压缩需使用下方官方 ACP 方案。
+- **`agy` CLI 与 ACP 编辑器（官方 ACP v1 `session/prompt`）**：针对 **Antigravity CLI（`agy`）** 与支持 ACP 的编辑器（**Zed、JetBrains IDE、Android Studio、Xcode、VS Code ACP Client**），Context Radar 内置了两个完全遵循官方 ACP v1 协议的子命令，可在同一条 ACP 会话连接上安全执行无人值守原生 `/compact`（含 compact-and-continue 自动续跑）：
 
 - **编辑器透明代理（`acp-proxy`）**：将编辑器的自定义 ACP Agent 启动命令从 `agy acp` 改为 `context-radar-mcp acp-proxy`：
 
