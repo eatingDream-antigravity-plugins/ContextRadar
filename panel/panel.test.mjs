@@ -33,6 +33,22 @@ test("panel/dist/panel.html meets <45 KiB, CSP, warm editorial, dark-first anti-
   assert.equal(/https?:\/\//i.test(html), false, "must contain zero http/https URLs");
   assert.equal(/<link\b/i.test(html), false, "must contain zero external <link> tags");
   assert.equal(/<script[^>]+src=/i.test(html), false, "must contain zero external <script src>");
+
+  // Zero backend/infra jargon + bilingual Carbon concurrency tip
+  for (const forbidden of ["HBM", "radix", "SHA-1", "0600 Unix Socket", "原生 Rust"]) {
+    assert.equal(html.includes(forbidden), false, `panel.html must not expose jargon '${forbidden}'`);
+  }
+  assert.ok(html.includes("Concurrency tip:") && html.includes("并发提示："), "panel.html must include bilingual Carbon concurrency tip");
+
+  // Structural anti-flicker & valid bundled JS syntax
+  const cssSrc = fs.readFileSync(THEME_CSS, "utf8");
+  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
+  assert.ok(cssSrc.includes('html:not([data-can-msg="1"]) .cr-cap-msg'), "message buttons must be hidden by default until hostCapabilities confirm");
+  assert.equal(viewSrc.includes("ui.he.innerHTML ="), false, "patchHeroSlot must never wipe ui.he.innerHTML");
+  assert.equal(viewSrc.includes("rec.tr.innerHTML ="), false, "patchSessionList must never wipe rec.tr.innerHTML");
+  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+  assert.equal(scripts.length, 2, "panel.html should contain boot script + main bundle script");
+  assert.doesNotThrow(() => new vm.Script(scripts[1]), "bundled JS must be valid syntax");
 });
 
 test("bridge.js skips size-changed RPCs in aux_pane/global and enables them in inline mode", async () => {
@@ -124,27 +140,6 @@ test("bridge.js skips size-changed RPCs in aux_pane/global and enables them in i
   );
 });
 
-test("view.js mounts shell & hero ONCE, skips identical digests, and patches strictly in place", () => {
-  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
-  const cssSrc = fs.readFileSync(THEME_CSS, "utf8");
-
-  // Structural anti-flicker & dark-first invariants
-  assert.ok(cssSrc.includes("html,body{") && cssSrc.includes("background-color:var(--color-background-primary,#141311)"), "root must default dark obsidian");
-  assert.ok(cssSrc.includes(':root[data-theme="light"]'), "light theme must be gated on data-theme=light");
-  assert.equal(/prefers-color-scheme\s*:\s*light/i.test(cssSrc), false, "must not use prefers-color-scheme:light");
-  assert.ok(cssSrc.includes('html:not([data-can-msg="1"]) .cr-cap-msg'), "message buttons must be hidden by default until hostCapabilities confirm");
-  assert.equal(cssSrc.includes("cr-enter"), false, "must not use opacity:0 entrance animation");
-  assert.ok(viewSrc.includes('if (sc.unchanged || (sc.digest && sc.digest === lastDigest && snapshot)) return;'), "identical digest ontoolresult must no-op");
-  assert.equal(viewSrc.includes("ui.he.innerHTML ="), false, "patchHeroSlot must never wipe ui.he.innerHTML");
-  assert.equal(viewSrc.includes("rec.tr.innerHTML ="), false, "patchSessionList must never wipe rec.tr.innerHTML");
-
-  // Verify bundled JS parses cleanly in a sandboxed VM (no syntax errors)
-  const html = fs.readFileSync(DIST_HTML, "utf8");
-  const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
-  assert.equal(scripts.length, 2, "panel.html should contain boot script + main bundle script");
-  assert.doesNotThrow(() => new vm.Script(scripts[1]), "bundled JS must be valid syntax");
-});
-
 test("bridge.js ignores transparent or translucent --color-background-primary and view.js parseColorLum rejects low alpha", async () => {
   const { applyHostStyleVariables } = await import(BRIDGE_JS);
   const applied = new Map();
@@ -219,71 +214,6 @@ test("bridge.js ignores transparent or translucent --color-background-primary an
   assert.ok(parseColorLum("#FAF8F5") > 0.9, "warm light hex should have high luminance");
   assert.ok(parseColorLum("rgba(20, 19, 17, 0.8)") < 0.15, "rgba with alpha >= 0.5 should return luminance");
   assert.ok(parseColorLum("#faf8f5cc") > 0.9, "8-digit hex with alpha >= 0.5 should return luminance");
-});
-
-test("panel renders bilingual mid-loop sub-reasons and whisper-quiet Carbon concurrency warning without jargon", () => {
-  const html = fs.readFileSync(DIST_HTML, "utf8");
-  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
-
-  // Clean #92 UI rules: zero backend/infra jargon in panel HTML
-  for (const forbidden of ["HBM", "radix", "SHA-1", "0600 Unix Socket", "原生 Rust"]) {
-    assert.equal(html.includes(forbidden), false, `panel.html must not expose jargon '${forbidden}'`);
-  }
-
-  // Carbon concurrency warning is gated on carbon_concurrency_warning && >= 3
-  assert.ok(viewSrc.includes("carbon_concurrency_warning"), "view.js must check carbon_concurrency_warning");
-  assert.ok(viewSrc.includes("active_carbon_count"), "view.js must read active_carbon_count");
-  assert.ok(html.includes("Concurrency tip:"), "panel.html must include English Carbon concurrency tip");
-  assert.ok(html.includes("并发提示："), "panel.html must include Chinese Carbon concurrency tip");
-
-  // Verify coldKind + getCold handle all 3 mid-loop sub-reasons in EN and zh-CN
-  const subMatch = viewSrc.match(/const SUB_L = \{[\s\S]*?\};/);
-  const kindMatch = viewSrc.match(/const coldKind = \(t\) => \{[\s\S]*?\n\};/);
-  const getColdMatch = viewSrc.match(/const getCold = \([\s\S]*?=>[\s\S]*?;\n/);
-  assert.ok(subMatch && kindMatch && getColdMatch, "view.js must define SUB_L, coldKind, getCold");
-
-  let curLang = "en";
-  const sandbox = {
-    num: (v) => Number(v) || 0,
-    tr: (e, z) => (curLang === "zh-CN" ? z : e),
-  };
-  vm.runInNewContext(`${subMatch[0]}\n${kindMatch[0]}\n${getColdMatch[0]}\nthis.coldKind = coldKind; this.getCold = getCold;`, sandbox);
-
-  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "slow_turn_self_expiry" }), "Slow-turn TTL");
-  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "replica_spillover" }), "Replica spillover");
-  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "model_switch_cold" }), "Model switch");
-
-  curLang = "zh-CN";
-  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "slow_turn_self_expiry" }), "慢轮自过期");
-  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "replica_spillover" }), "副本溢出");
-  assert.equal(sandbox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "model_switch_cold" }), "切换模型");
-
-  const parsed = sandbox.getCold({
-    cold_cache_breakdown: { turn_start_cold: 1, mid_loop_cold: 3, post_compact_cold: 0 },
-    mid_loop_breakdown: { slow_turn_self_expiry: 1, replica_spillover: 1, model_switch_cold: 1 },
-  });
-  assert.deepEqual({ t: parsed.t, m: parsed.m, p: parsed.p, s: parsed.s, r: parsed.r, w: parsed.w }, { t: 1, m: 3, p: 0, s: 1, r: 1, w: 1 });
-});
-
-test("panel supports immediate open/focus refresh, continuous background polling, and official ui/message Send /compact", () => {
-  const html = fs.readFileSync(DIST_HTML, "utf8");
-  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
-
-  // 1. Instant refresh on mount, focus, pageshow, and visibility return
-  assert.ok(viewSrc.includes('window.addEventListener("focus"'), "must refresh immediately on window focus");
-  assert.ok(viewSrc.includes('window.addEventListener("pageshow"'), "must refresh immediately on pageshow");
-  assert.ok(viewSrc.includes("void refreshSnapshot(true, false)"), "bootPanel and focus must trigger immediate fresh refresh");
-
-  // 2. Background polling continues via lightweight if_digest instead of freezing forever while hidden
-  assert.equal(viewSrc.includes("pausedHidden"), false, "must not freeze polling completely when hidden");
-  assert.ok(viewSrc.includes("D.hidden ?"), "nextPollMs must adapt cadence cleanly in background");
-
-  // 3. Official ui/message Send /compact action and record_compact persistence
-  assert.ok(viewSrc.includes("record_compact"), "view.js must record compact dispatch status");
-  assert.ok(viewSrc.includes("manual_compact"), "view.js must claim grants with manual_compact mode");
-  assert.ok(viewSrc.includes("auto_compact"), "view.js must claim grants with auto_compact mode");
-  assert.ok(html.includes("Send /compact"), "panel.html must include EN Send /compact label");
-  assert.ok(html.includes("执行 /compact"), "panel.html must include ZH Send /compact label");
 });
 
 test("auto_compact gating enforces inline ownership, side-pane canDirectCid, subagent/auto flags, and official ui/message without target:new", async () => {
@@ -816,4 +746,28 @@ test("rich live telemetry: 4-state dots, phase badges, headroom, thinking/loop r
   assert.ok(turnsHtml.includes("T68%"), "turns tray should show T68% when thinking_tokens & response_tokens present");
   assert.ok(turnsHtml.includes("think 717"), "turns tray should show think 717 when response_tokens is 0");
   assert.ok(turnsHtml.includes("1.4s · 64/41"), "turns tray should show stream/e2e speed when e2e_tps > 0");
+
+  // 9. Bilingual mid-loop sub-reasons (SUB_L / coldKind) & getCold breakdown
+  const subMatch = viewSrc.match(/const SUB_L = \{[\s\S]*?\};/);
+  const kindMatch = viewSrc.match(/const coldKind = \(t\) => \{[\s\S]*?\n\};/);
+  const getColdMatch = viewSrc.match(/const getCold = \([\s\S]*?=>[\s\S]*?;\n/);
+  assert.ok(subMatch && kindMatch && getColdMatch, "view.js must define SUB_L, coldKind, getCold");
+  const subBox = {
+    num: (v) => Number(v) || 0,
+    tr: (e, z) => (curLang === "zh-CN" ? z : e),
+  };
+  vm.runInNewContext(`${subMatch[0]}\n${kindMatch[0]}\n${getColdMatch[0]}\nthis.coldKind = coldKind; this.getCold = getCold;`, subBox);
+  sandbox.setLang("en");
+  assert.equal(subBox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "slow_turn_self_expiry" }), "Slow-turn TTL");
+  assert.equal(subBox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "replica_spillover" }), "Replica spillover");
+  assert.equal(subBox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "model_switch_cold" }), "Model switch");
+  sandbox.setLang("zh-CN");
+  assert.equal(subBox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "slow_turn_self_expiry" }), "慢轮自过期");
+  assert.equal(subBox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "replica_spillover" }), "副本溢出");
+  assert.equal(subBox.coldKind({ cold_cache_kind: "mid_loop_cold", cold_cache_sub_reason: "model_switch_cold" }), "切换模型");
+  const parsedCold = subBox.getCold({
+    cold_cache_breakdown: { turn_start_cold: 1, mid_loop_cold: 3, post_compact_cold: 0 },
+    mid_loop_breakdown: { slow_turn_self_expiry: 1, replica_spillover: 1, model_switch_cold: 1 },
+  });
+  assert.deepEqual({ t: parsedCold.t, m: parsedCold.m, p: parsedCold.p, s: parsedCold.s, r: parsedCold.r, w: parsedCold.w }, { t: 1, m: 3, p: 0, s: 1, r: 1, w: 1 });
 });

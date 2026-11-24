@@ -65,7 +65,7 @@ fn make_step_meta(ts_sec: u64, in_tok: u64, cr_tok: u64, out_tok: u64, resp_id: 
 }
 
 #[test]
-fn test_exec_gate_wait_thresholds_and_decision_ask() {
+fn test_exec_gate_thresholds_background_patterns_and_custom_config() {
     for wait_ms in [5000, 8000, 10000] {
         let res = evaluate_exec_gate(
             &json!({
@@ -96,10 +96,7 @@ fn test_exec_gate_wait_thresholds_and_decision_ask() {
             json!({ "decision": "ask", "overwrite": { "WaitMsBeforeAsync": 10000 } })
         );
     }
-}
 
-#[test]
-fn test_exec_gate_is_daemon_background_patterns_and_custom_config() {
     assert_eq!(
         evaluate_exec_gate(
             &json!({
@@ -247,25 +244,23 @@ fn test_boot_guard_zero_config_silence_state_table_bullets_and_extra_rules() {
     assert!(msg.contains("[TODO] Sprint | • Finish cache layer | • Verify latency"));
     assert!(msg.contains("[hints] Prefer parallel conflict-free workers"));
     assert!(msg.len() <= 1600);
-}
 
-#[test]
-fn test_truncate_utf8_and_balanced_json_scanner() {
+    // UTF-8 safe truncation used by boot guard max_bytes limits
     let s = "中文测试字符".repeat(50);
     let out = truncate_utf8(&s, 40);
     assert!(out.len() <= 40);
     assert!(out.ends_with("..."));
     assert_eq!(truncate_utf8("abcdef", 2), "..");
+}
 
+#[test]
+fn test_hooks_cli_e2e_env_override_and_open_pipe_fast_completion() {
+    // Balanced JSON scanner powering open-pipe hook stdin completion
     let mut scanner = JsonBalanceScanner::new();
     assert!(!scanner.push(br#"  {"text":"brace } inside \"quote\"" "#));
     assert!(!scanner.is_complete());
     assert!(scanner.push(br#", "nested":{"arr":[1,2,3]}} "#));
     assert!(scanner.is_complete());
-}
-
-#[test]
-fn test_hooks_cli_e2e_env_override_and_open_pipe_fast_completion() {
     let td = TempDir::new().unwrap();
     let cfg_path = td.path().join("settings.json");
     fs::write(td.path().join("STATUS.md"), "# Active\n- Task 1\n").unwrap();
@@ -503,6 +498,20 @@ fn test_full_stdio_mcp_daemon_e2e_with_synthetic_fixture() {
         .find(|t| t["name"] == "context_radar_ui_action")
         .unwrap();
     assert_eq!(ui_act["_meta"]["ui"]["visibility"], json!(["app"]));
+
+    // Every MCP tool must fit Antigravity's 64-char namespaced tool limit
+    let mcp_cfg: Value = serde_json::from_str(include_str!("../mcp_config.json")).unwrap();
+    let servers = mcp_cfg["mcpServers"].as_object().unwrap();
+    assert_eq!(servers.len(), 1);
+    let server_key = servers.keys().next().unwrap();
+    for name in &names {
+        let full = format!("mcp_context-radar-mcp_{server_key}_{name}");
+        assert!(
+            full.len() <= 64,
+            "Namespaced MCP tool '{full}' is {} chars (> 64-char host limit!)",
+            full.len()
+        );
+    }
 
     let resources = rpc(json!({ "jsonrpc": "2.0", "id": 21, "method": "resources/list" }));
     for r in resources["result"]["resources"].as_array().unwrap() {

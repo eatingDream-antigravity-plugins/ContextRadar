@@ -1,5 +1,4 @@
 <div align="center">
-
 <img src="assets/logo.svg" alt="Context Radar MCP" width="80" height="80">
 
 # Context Radar MCP
@@ -14,71 +13,42 @@
 [English](README.md) | 简体中文
 
 <img src="docs/social-preview.png" alt="Context Radar MCP 面板预览" width="860">
-
 </div>
-
-## 为什么做这个插件
-
-用 Antigravity 写代码聊久了，经常会遇到回复突然变慢、消耗涨得莫名其妙，但界面上很难看清到底卡在哪里。有时候是一次读入太多内容把窗口撑大了，有时候是中途不小心打断了缓存，还有时候过早点了 `/compact`，反而白白丢掉了热缓存。
-
-Context Radar 在 Antigravity 里提供了一个实时面板，把上下文占用、缓存命中情况和每一轮的变化摊开给你看，也能帮 Agent 判断什么时候该整理历史、什么时候该换新对话。
 
 ## 它能帮你做什么
 
-- **实时四态遥测、剩余余量与消耗面板**：通过 O(log N) 索引只读 SQLite 探测实时展示主会话与子 Agent 的四态运行/压缩指示（`ready` 就绪 / `running` 运行中 [LLM·工具·压缩中] / `waiting` 等待 / `error` 异常）、上下文剩余余量（`余 Xk`）、思考与正文输出占比（`思考 %`）、流式 + 端到端速度（Stream / E2E tok/s）、本轮多步循环汇总及估算费用；采用前台 1s / 后台 2s 自适应 `if_digest` 轮询（15s 超时防卡死）与按会话 WAL 变更感知，并在保活侧边栏/全局面板重新显现时通过 `ResizeObserver`、`IntersectionObserver`、`onhostcontextchanged` 与被动 `pointerenter` 立即触发刷新，避免界面停滞。
-- **定位变慢原因与跨模型压缩提示**：自动区分"新的一轮正常未命中""对话中途意外断缓存"和"压缩后的首次重建"，自动识别跨模型 `/compact` 并给出静默内联提示，同时展示检查点摘要体积（`KB`），一眼知道慢在哪。
-- **找出撑大上下文的罪魁祸首**：快速定位哪几轮历史最占空间，让 Agent 把早期冗长记录浓缩成简短摘要存到 `scratch/`，不用带着一堆旧日志继续跑。
-- **判断 `/compact` 或换新对话划不划算**：结合当前模型预算和回本轮数给出建议；严格遵循官方协议——在 Antigravity App 可见挂载卡片或归属侧边栏中通过 SEP-1865 `ui/message` 触发受保护的 `/compact` 或 `target:new` 新会话交接（失败自动复制 `/compact` 兜底），在 `agy CLI` 与 ACP 编辑器中则通过 `acp-proxy` / `acp-run` 全自动原地执行官方 `/compact`。
-- **顺手的小保护**：防止 Agent 把几秒钟就能跑完的命令过早丢到后台；如果你在配置里指定了工作区状态文件，也能在开新会话时自动带入。
+Antigravity 长对话一旦上下文膨胀或提示词缓存悄悄断掉，就会变慢且费用飙升。Context Radar 提供实时侧边栏面板和 MCP 工具，让你和 Agent 看清缓存与水位变化，只在真正划算时整理历史或压缩会话。
+
+- **实时四态遥测与余量监控**：实时展示主会话与运行中子 Agent 的四态运行/压缩状态（`ready` / `running` [LLM·工具·压缩中] / `waiting` / `error`）、上下文余量、思考与正文输出占比、流式/端到端速度、本轮多步循环汇总及估算费用。
+- **定位变慢原因与跨模型压缩提示**：自动区分新轮次正常未命中、对话中途意外断缓存与压缩后首次重建，识别跨模型 `/compact` 缓存重置并展示检查点摘要体积（`KB`）。
+- **热点排查与不破缓存提炼**：定位撑大上下文的轮次，将早期冗长历史浓缩为简短摘要存入 `scratch/`，保持当前会话 KV 前缀完整复用。
+- **带门槛的 `/compact` 与新会话交接**：结合模型预算与回本轮数判断是否值得操作，严格通过官方协议执行 `/compact` 或新对话交接。
+- **可选护栏**：温和提醒避免把短命令过早转入后台，并支持在会话启动时自动注入自定义工作区状态文件。
 
 ## 安装
-
-### macOS 与 Linux（推荐）
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar-mcp/main/scripts/install.sh | sh
 ```
 
-脚本会自动下载对应平台的预编译程序（支持 macOS Apple Silicon、macOS Intel 和 Linux x86_64），校验 SHA-256 后安装到 `~/.gemini/config/plugins/context-radar-mcp`。装完后重启或重载 Antigravity 即可启用。
-
-如需指定版本或自定义插件目录：
-
-```sh
-CONTEXT_RADAR_VERSION=v1.0.0 ANTIGRAVITY_PLUGINS_DIR=~/.gemini/config/plugins \
-  curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar-mcp/main/scripts/install.sh | sh
-```
+脚本会下载经 SHA-256 校验的预编译程序（支持 macOS Apple Silicon、macOS Intel、Linux x86_64）并安装到 `~/.gemini/config/plugins/context-radar-mcp`，完成后重启或重载 Antigravity 即可。可通过 `CONTEXT_RADAR_VERSION=vX.Y.Z` 或 `ANTIGRAVITY_PLUGINS_DIR=...` 指定版本或安装目录。
 
 ## 怎么用
 
-### 在 Antigravity 里直接用
-
-在侧边栏打开 **Context Radar** 面板，就能实时看到上下文水位、最近几轮的变化趋势和缓存状态。
-
-平时也可以直接跟 Agent 说话，插件自带按需加载的 Skill，Agent 会自己调用对应工具来排查：
-
-- *"打开 Context Radar，看看现在上下文还剩多少。"*
-- *"刚才几轮怎么这么慢？是不是缓存断了？"*
-- *"查一下哪几轮最占上下文，帮我整理一份摘要。"*
-- *"现在适合 `/compact` 还是直接交接到新对话？"*
-
-### 提供给 Agent 的工具
+在侧边栏打开 **Context Radar** 面板，或直接对 Agent 提问，例如 *"刚才几轮怎么这么慢？"*、*"找出最占上下文的轮次并整理摘要"* 或 *"现在适合 `/compact` 吗？"*。
 
 | 工具 | 作用 |
 | :--- | :--- |
-| `context_radar_overview` | 打开实时面板，返回四态运行/压缩状态、上下文余量、思考占比、流式/端到端速度、本轮循环汇总与子 Agent 概览。 |
-| `context_radar_turns` | 按轮次查看 Token 增长、思考与正文拆分、缓存命中、冷启动原因、流式/端到端速度和估算费用。 |
-| `context_radar_hotspots` | 找出历史里最占空间的片段，并按需整理成摘要写入 `scratch/`。 |
-| `context_radar_prepare_handoff` | 评估现在执行 `/compact` 或开新对话是否划算。 |
-| `context_radar_commit_handoff` | 条件满足后生成 `/compact` 或新对话交接卡片。 |
+| `context_radar_overview` | 打开实时面板，返回四态状态、上下文余量、思考占比、流式/端到端速度、本轮循环汇总与子 Agent 概览。 |
+| `context_radar_turns` | 按轮次拆分 Token 占用、思考/正文占比、缓存命中、冷启动原因、速度与估算费用。 |
+| `context_radar_hotspots` | 定位上下文激增片段，并按需将选定区间提炼为摘要写入 `scratch/`。 |
+| `context_radar_prepare_handoff` | 评估当前执行 `/compact` 或开新对话是否满足预算与回本条件。 |
+| `context_radar_commit_handoff` | 校验硬门槛后签发作用域绑定的单次 `/compact` 或新对话交接票据。 |
 
-### 自主压缩与交接的官方协议边界（Antigravity App vs `agy acp`）
+### 自主压缩与交接（仅使用官方协议）
 
-Context Radar 严格仅使用官方文档化协议（不依赖任何未公开宿主 RPC）：
-
-- **Antigravity App（SEP-1865 MCP Apps `ui/message`）**：当 `context_radar_commit_handoff` 通过全部硬门槛（`running_subagent_count == 0`、预算与回本轮数达标）后，**可见挂载**的内联交接卡片（`ui://context-radar-mcp/handoff`）或归属匹配的侧边栏 `aux_pane`（`!document.hidden`）可原子核销单次票据，通过官方 `ui/message` 触发 `/compact` 或通过 `com.google.antigravity/message`（`target: "new"`）拉起新会话，若宿主拒绝则自动复制 `/compact` 到剪贴板兜底。由于 Antigravity App 不会为折叠工具调用静默挂载无头 iframe，也未提供无 UI 场景的 MCP/Hook `/compact` 接口，因此在无可见面板时的无人值守原地压缩需使用下方官方 ACP 方案。
-- **`agy` CLI 与 ACP 编辑器（官方 ACP v1 `session/prompt`）**：针对 **Antigravity CLI（`agy`）** 与支持 ACP 的编辑器（**Zed、JetBrains IDE、Android Studio、Xcode、VS Code ACP Client**），Context Radar 内置了两个完全遵循官方 ACP v1 协议的子命令，可在同一条 ACP 会话连接上安全执行无人值守原生 `/compact`（含 compact-and-continue 自动续跑）：
-
-- **编辑器透明代理（`acp-proxy`）**：将编辑器的自定义 ACP Agent 启动命令从 `agy acp` 改为 `context-radar-mcp acp-proxy`：
+- **Antigravity App（SEP-1865 `ui/message`）**：通过全部硬门槛（`running_subagent_count == 0`、预算与回本达标）后，可见挂载的内联交接卡片（`ui://context-radar-mcp/handoff`）或归属匹配的侧边栏（`!document.hidden`）会核销单次票据并触发 `/compact`（失败自动复制兜底）或拉起新对话（`com.google.antigravity/message`，`target: "new"`）。由于 Antigravity App 不会为折叠工具调用静默挂载无头 iframe，也未提供无 UI 的 MCP/Hook `/compact` 接口，无人值守压缩需使用下方官方 ACP 方案。
+- **`agy` CLI 与 ACP 编辑器（ACP v1 `session/prompt`）**：在 Antigravity CLI（`agy`）及支持 ACP 的编辑器（Zed、JetBrains、Android Studio、Xcode、VS Code ACP）中，将自定义 ACP Agent 指向 `acp-proxy`（替代 `agy acp`），即可在同一连接上自动核销 `auto_fire` 票据并原地执行原生 `/compact`；也可通过 `acp-run` 无头托管长任务：
 
 ```json
 {
@@ -87,44 +57,27 @@ Context Radar 严格仅使用官方文档化协议（不依赖任何未公开宿
 }
 ```
 
-当 Agent 在对话中调用 `context_radar_commit_handoff(kind: "compact", auto_fire: true, ...)` 并结束本轮回复后，`acp-proxy` 会自动核销单次票据，并在同一条 ACP 连接上注入原生 `session/prompt` `/compact ...` 完成原地压缩并无缝续跑，无需并发读写冲突。
-
-- **无头 CLI / CI 编排器（`acp-run`）**：在终端或自动化流水线中直接托管长任务并自动压缩：
-
 ```sh
 ~/.gemini/config/plugins/context-radar-mcp/bin/context-radar-mcp acp-run \
   --cwd /path/to/project --auto-approve --prompt "完成迁移并运行完整验证"
 ```
 
-## 自定义配置（可选）
+## 自定义配置与安全边界
 
-装好就能直接用，不需要任何配置文件。插件会根据系统语言自动切换中英文界面与对应币种（`USD` `$` / `CNY` `¥`），并自动发现 `~/.gemini/antigravity`、`~/.gemini/antigravity-ide` 和 `~/.gemini/antigravity-cli` 数据目录。
+开箱即用，自动识别系统语言（`en` / `zh-CN`）、币种（`USD` / `CNY`）以及 Antigravity 数据目录（`~/.gemini/antigravity{,-ide,-cli}`）。如需自定义单价、预警阈值或启动提示，可将 [settings.example.json](settings.example.json) 复制到 `~/.config/context-radar-mcp/settings.json`（或通过 `CONTEXT_RADAR_DATA_ROOT` / `CONTEXT_RADAR_CONFIG` 覆盖）。
 
-如果你想修改模型单价、显示币种、预警阈值或工作区启动提示，可以把 [settings.example.json](settings.example.json) 复制到 `~/.config/context-radar-mcp/settings.json` 按需修改；也可通过 `CONTEXT_RADAR_DATA_ROOT` 指定数据目录，或用 `CONTEXT_RADAR_CONFIG` 指定配置文件路径。
-
-## 实现原理与安全边界
-
-插件完全在本地运行，不发任何网络请求，也没有遥测统计：
-
-- **全程只读数据库（Read-only SQLite）**：读取 Antigravity 会话数据库时严格使用 `SQLITE_OPEN_READ_ONLY` 只读模式并增量 tail 对话日志，绝不修改或锁住原始聊天记录。
-- **为什么用 `scratch/` 旁路提炼来保护 KV 前缀**：在对话中途直接删改历史消息会打断模型提示词的 KV 缓存，导致下一轮高延迟冷重建。`context_radar_hotspots` 改为把早期冗长片段旁路浓缩写入 `scratch/` 笔记，保持当前会话 KV 前缀完整复用，同时让新子代理或 `target:new` 接力会话按需精读。
-- **工作区与会话双绑定的单次交接票据**：所有接力票据均绑定 `conversation_id` 与 `workspace` 并以 `0600` 权限保存在本地插件数据目录，防止多窗口或跨项目侧边栏误触发其他项目的交接。
-- **安全的 `PreToolUse` 等待守护**：内置 Hook 仅在短命令过早转入后台时温和提醒，对明确标注后台守护或异步构建的命令自动放行，不修改系统配置也不干涉进程状态。
+- **纯本地只读访问**：零网络请求、零遥测；严格使用 `SQLITE_OPEN_READ_ONLY` 只读打开会话数据库，并增量 tail WAL/JSONL 日志。
+- **不破缓存的 `scratch/` 旁路提炼**：不删改线上历史消息，而是将旧片段提炼到 `scratch/`，保住当前 KV 前缀热缓存并供新会话或子 Agent 按需读取。
+- **作用域票据与安全护栏**：单次交接票据绑定 `conversation_id` 与 `workspace` 并以 `0600` 权限存盘；可选 `PreToolUse` 等待守护自动放行后台守护进程与异步构建。
 
 ## 从源码构建
 
 需要 Rust（`cargo`）和 Node.js 20+（仅用于打包和测试前端面板）。
 
 ```sh
-git clone https://github.com/eatingDream-antigravity-plugins/context-radar-mcp.git
-cd context-radar-mcp
+git clone https://github.com/eatingDream-antigravity-plugins/context-radar-mcp.git && cd context-radar-mcp
 node panel/pack.mjs && node --test panel/panel.test.mjs
-cargo test --locked
-cargo build --release --locked
+cargo test --locked && cargo build --release --locked
 ```
 
-## 参与贡献与许可证
-
-欢迎提 PR 或反馈问题，详情见 [CONTRIBUTING.md](CONTRIBUTING.md)、[CHANGELOG.md](CHANGELOG.md) 和 [SECURITY.md](SECURITY.md)。
-
-本项目基于 [MIT License](LICENSE) 开源。
+欢迎提 PR 或反馈问题，详情见 [CONTRIBUTING.md](CONTRIBUTING.md)、[CHANGELOG.md](CHANGELOG.md) 和 [SECURITY.md](SECURITY.md)。本项目基于 [MIT License](LICENSE) 开源。
