@@ -73,13 +73,18 @@ CONTEXT_RADAR_VERSION=v1.0.0 ANTIGRAVITY_PLUGINS_DIR=~/.gemini/config/plugins \
 
 ## 自定义配置（可选）
 
-装好就能直接用，不需要任何配置文件。如果你想改模型单价、显示币种、预警阈值或工作区启动提示，可以把 [settings.example.json](settings.example.json) 复制到 `~/.config/context-radar-mcp/settings.json` 按需修改。
+装好就能直接用，不需要任何配置文件。插件会根据系统语言自动切换中英文界面与对应币种（`USD` `$` / `CNY` `¥`），并自动发现 `~/.gemini/antigravity`、`~/.gemini/antigravity-ide` 和 `~/.gemini/antigravity-cli` 数据目录。
 
-如果你的 Antigravity 数据目录不在默认位置，可以通过 `CONTEXT_RADAR_DATA_ROOT` 指定（默认 `~/.gemini/antigravity`），也可以用 `CONTEXT_RADAR_CONFIG` 指定自定义配置文件路径。
+如果你想修改模型单价、显示币种、预警阈值或工作区启动提示，可以把 [settings.example.json](settings.example.json) 复制到 `~/.config/context-radar-mcp/settings.json` 按需修改；也可通过 `CONTEXT_RADAR_DATA_ROOT` 指定数据目录，或用 `CONTEXT_RADAR_CONFIG` 指定配置文件路径。
 
-## 隐私与安全
+## 实现原理与安全边界
 
-插件完全在本地运行，不发任何网络请求，也没有遥测统计。读取 Antigravity 本地数据库时全程只读，不会修改或锁住你的聊天记录。
+插件完全在本地运行，不发任何网络请求，也没有遥测统计：
+
+- **全程只读数据库（Read-only SQLite）**：读取 Antigravity 会话数据库时严格使用 `SQLITE_OPEN_READ_ONLY` 只读模式并增量 tail 对话日志，绝不修改或锁住原始聊天记录。
+- **为什么用 `scratch/` 旁路提炼来保护 KV 前缀**：在对话中途直接删改历史消息会打断模型提示词的 KV 缓存，导致下一轮高延迟冷重建。`context_radar_hotspots` 改为把早期冗长片段旁路浓缩写入 `scratch/` 笔记，保持当前会话 KV 前缀完整复用，同时让新子代理或 `target:new` 接力会话按需精读。
+- **工作区与会话双绑定的单次交接票据**：所有接力票据均绑定 `conversation_id` 与 `workspace` 并以 `0600` 权限保存在本地插件数据目录，防止多窗口或跨项目侧边栏误触发其他项目的交接。
+- **安全的 `PreToolUse` 等待守护**：内置 Hook 仅在短命令过早转入后台时温和提醒，对明确标注后台守护或异步构建的命令自动放行，不修改系统配置也不干涉进程状态。
 
 ## 从源码构建
 

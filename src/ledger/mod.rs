@@ -70,6 +70,7 @@ pub struct SummaryRecord {
     pub title: String,
     pub preview: String,
     pub workspace: String,
+    pub workspaces: Vec<String>,
     pub status: String,
     pub agent_name: String,
     pub parent_conversation_id: String,
@@ -88,6 +89,18 @@ impl SummaryRecord {
         self.nesting_depth > 0
             || !self.parent_conversation_id.is_empty()
             || (!self.agent_name.is_empty() && self.last_user_input_step_index < 0)
+    }
+
+    pub fn matches_workspace_filter(&self, needle_lower: &str) -> bool {
+        if needle_lower.is_empty() {
+            return true;
+        }
+        if self.workspace.to_ascii_lowercase().contains(needle_lower) {
+            return true;
+        }
+        self.workspaces
+            .iter()
+            .any(|w| w.to_ascii_lowercase().contains(needle_lower))
     }
 }
 

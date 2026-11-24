@@ -1,6 +1,7 @@
 {
   "$schema": "./settings.schema.json",
   "version": 1,
+  "lang": "auto",
   "context": {
     "default_limit": 512000,
     "warn_threshold": 220000,

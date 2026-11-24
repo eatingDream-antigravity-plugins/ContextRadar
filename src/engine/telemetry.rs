@@ -1,4 +1,4 @@
-//! Session/turn telemetry aggregation, 3-way cold-cache attribution, and multi-level snapshot cache.
+//! Session/turn telemetry aggregation, 3-way (+ partial drop) cold-cache attribution, and multi-level snapshot cache.
 
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -10,14 +10,16 @@ use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use serde::Serialize;
 
 use crate::engine::budget::resolve_budget_tier;
-use crate::engine::grants::{PanelPrefs, RelayGrant};
+use crate::engine::grants::{workspaces_overlap, PanelPrefs, RelayGrant};
 use crate::engine::rates::RateTable;
+use crate::i18n::{resolve_active_lang, Lang};
 use crate::ledger::index_db::DbVersionSig;
 use crate::ledger::sqlite_ro::{stat_db_stamp, FileStamp, LedgerReader};
 use crate::ledger::{is_safe_id, SummaryRecord, TurnSample};
 use crate::settings::{
     default_data_root, default_plugin_data_dir, expand_tilde, SettingsWatcher,
-    DEFAULT_CONTEXT_LIMIT, DISABLE_DISK_CACHE_ENV, INDEX_CACHE_PATH_ENV,
+    CONVERSATION_ID_ENV, DEFAULT_CONTEXT_LIMIT, DISABLE_DISK_CACHE_ENV, INDEX_CACHE_PATH_ENV,
+    WORKSPACE_ENV,
 };
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -46,19 +48,89 @@ impl ColdCacheKind {
     }
 
     pub fn label_and_reason(self) -> (&'static str, &'static str) {
+        self.label_and_reason_for_lang(resolve_active_lang(""), false)
+    }
+
+    pub fn label_and_reason_for_lang(self, lang: Lang, partial: bool) -> (&'static str, &'static str) {
+        let zh = lang.is_zh();
         match self {
             Self::None => ("", ""),
-            Self::TurnStart => (
-                "跨回合冷",
-                "跨回合唤醒首步 cr=0：服务端副本漂移或 >5m TTL 过期",
-            ),
-            Self::MidLoop => (
-                "途中破缓",
-                "同回合工具链中途 cr=0：中途触发子目录规则注入破前缀或副本切换",
-            ),
-            Self::PostCompact => ("压后重建", "CHECKPOINT 压缩后首步必然重建缓存"),
+            Self::TurnStart => {
+                if zh {
+                    (
+                        "新轮次未命中",
+                        if partial {
+                            "跨轮次唤醒缓存部分失效并触发重写入"
+                        } else {
+                            "跨轮次首步缓存未命中（>5m TTL 过期或副本切换）"
+                        },
+                    )
+                } else {
+                    (
+                        "New-turn miss",
+                        if partial {
+                            "Partial prefix miss across user turns with cache rebuild"
+                        } else {
+                            "First step of a new turn missed cache (>5m TTL expiry or replica shift)"
+                        },
+                    )
+                }
+            }
+            Self::MidLoop => {
+                if partial {
+                    if zh {
+                        (
+                            "中途前缀跌落",
+                            "同轮中途 cache_read 相比上步缓存前缀骤降并伴随大额重写入",
+                        )
+                    } else {
+                        (
+                            "Partial prefix drop",
+                            "Mid-turn sharp drop in cache_read vs prior cached prefix with large cache rebuild",
+                        )
+                    }
+                } else if zh {
+                    (
+                        "中途断缓存",
+                        "同轮工具链中途缓存归零（中途规则注入改变前缀或副本漂移）",
+                    )
+                } else {
+                    (
+                        "Mid-turn break",
+                        "Mid-loop cache miss (rule/tool injection mutated prefix or replica shifted)",
+                    )
+                }
+            }
+            Self::PostCompact => {
+                if zh {
+                    ("压缩后重建", "CHECKPOINT 压缩后首步重建缓存前缀")
+                } else {
+                    ("Post-compact", "Expected cache rebuild on first turn after CHECKPOINT")
+                }
+            }
         }
     }
+}
+
+/// Detect partial prefix cache drops where a small static prefix still hits (`cache_read > 0`),
+/// but `cache_read` drops sharply (`>= 35%` and `>= 20k` tokens) relative to the prior turn's
+/// cached prefix (`cache_read + cache_write >= 24k`) and triggers a large rebuild (`cache_write >= 16k`
+/// or `cache_write + input_tokens >= 24k` at `< 65%` hit rate).
+pub fn is_partial_prefix_drop(prev_t: Option<&TurnSample>, t: &TurnSample) -> bool {
+    let Some(prev) = prev_t else { return false };
+    if t.is_checkpoint || prev.is_checkpoint || t.after_checkpoint || t.cache_read == 0 {
+        return false;
+    }
+    let prev_cached = prev.cache_read.saturating_add(prev.cache_write);
+    if prev_cached < 24_000 {
+        return false;
+    }
+    let drop_tokens = prev_cached.saturating_sub(t.cache_read);
+    if drop_tokens < 20_000 || (t.cache_read as f64) > (prev_cached as f64) * 0.65 {
+        return false;
+    }
+    t.cache_write >= 16_000
+        || (t.cache_write.saturating_add(t.input_tokens) >= 24_000 && t.cache_hit_rate() < 65.0)
 }
 
 #[inline]
@@ -86,7 +158,6 @@ pub fn parse_iso_ts(raw: &str) -> f64 {
         }
         return (dt.timestamp() as f64) + (dt.timestamp_subsec_nanos() as f64) * 1e-9;
     }
-    // Try space-separated / timezone-less timestamps from SQLite datetime columns
     let normalized = text.replace(' ', "T");
     if let Ok(dt) = DateTime::parse_from_rfc3339(&format!("{normalized}Z")) {
         if dt.year() < 2000 {
@@ -156,12 +227,14 @@ pub fn classify_cold_cache_turns(
     let mut results = Vec::with_capacity(turns.len());
 
     for (i, t) in turns.iter().enumerate() {
-        if !t.is_cold_cache() {
+        let prev_t = if i > 0 { Some(&turns[i - 1]) } else { None };
+        let full_cold = t.is_cold_cache();
+        let partial_cold = !full_cold && is_partial_prefix_drop(prev_t, t);
+        if !full_cold && !partial_cold {
             results.push(ColdCacheKind::None);
             continue;
         }
 
-        let prev_t = if i > 0 { Some(&turns[i - 1]) } else { None };
         let prev_step = prev_t.map(|p| p.step_idx).unwrap_or(-1);
 
         let mut saw_ckpt_between = false;
@@ -191,8 +264,22 @@ pub fn classify_cold_cache_turns(
             || t.after_turn_start == Some(true)
             || saw_user_or_sys_between
         {
-            results.push(ColdCacheKind::TurnStart);
-        } else if t.after_turn_start == Some(false) || has_t_steps {
+            // Partial prefix drop right at a new turn after >=300s idle is a TurnStart TTL drop;
+            // otherwise a sharp partial drop with active cache_write during a quick exchange is MidLoop.
+            if partial_cold {
+                let gap = match prev_t {
+                    Some(p) if t.timestamp > 0.0 && p.timestamp > 0.0 => t.timestamp - p.timestamp,
+                    _ => 0.0,
+                };
+                if gap >= 300.0 {
+                    results.push(ColdCacheKind::TurnStart);
+                } else {
+                    results.push(ColdCacheKind::MidLoop);
+                }
+            } else {
+                results.push(ColdCacheKind::TurnStart);
+            }
+        } else if t.after_turn_start == Some(false) || has_t_steps || partial_cold {
             results.push(ColdCacheKind::MidLoop);
         } else {
             let gap = match prev_t {
@@ -253,10 +340,13 @@ pub struct SessionTelemetry {
     pub pinned: bool,
     pub status: String,
     pub workspace: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub workspaces: Vec<String>,
     pub workspace_name: String,
     pub model: String,
     pub model_display: String,
     pub model_short: String,
+    pub pricing_known: bool,
     pub profile_label: String,
     pub min_compact_tokens: u64,
     pub recommend_compact_tokens: u64,
@@ -287,6 +377,7 @@ pub struct SessionTelemetry {
     pub total_output_tokens: u64,
     pub cost_usd: f64,
     pub cost_cny: f64,
+    pub currency_code: String,
     pub currency_symbol: String,
     pub summary_modified_ts: f64,
     pub sidebar_sort_ts: f64,
@@ -299,9 +390,12 @@ pub struct SessionTelemetry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_last_active_ts: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_cost_usd: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub group_cost_cny: Option<f64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn build_session_telemetry(
     cid: &str,
     summary: Option<&SummaryRecord>,
@@ -313,7 +407,9 @@ pub fn build_session_telemetry(
     transcript_step_types: Option<&HashMap<i64, String>>,
 ) -> SessionTelemetry {
     let cfg = rates.current_settings();
-    let (_, currency_sym) = rates.get_currency();
+    let lang = rates.get_lang();
+    let zh = lang.is_zh();
+    let (currency_code, currency_sym) = rates.get_currency();
 
     let latest = turns.last();
     let mut checkpoint_count = 0usize;
@@ -342,7 +438,11 @@ pub fn build_session_telemetry(
 
     let peak_ctx = turns.iter().map(|t| t.context_tokens()).max().unwrap_or(0);
     let model_id = latest.map(|t| t.model.as_str()).unwrap_or("unknown");
-    let model_disp = latest.map(|t| t.model_display.as_str()).unwrap_or("未知模型");
+    let default_disp = if zh { "未知模型" } else { "Unknown Model" };
+    let model_disp = latest
+        .map(|t| t.model_display.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(default_disp);
     let price = rates.resolve_rate(model_id, model_disp);
     let ctx_limit = if price.context_limit > 0 {
         price.context_limit
@@ -410,10 +510,12 @@ pub fn build_session_telemetry(
         None => 1.min(turns.len()),
     };
     let post_ckpt_turns = &turns[post_ckpt_start..];
+    let post_ckpt_kinds = &cold_kinds[post_ckpt_start..];
     let recent_start = post_ckpt_turns.len().saturating_sub(3);
     let recent_cold_rebuild = post_ckpt_turns[recent_start..]
         .iter()
-        .any(|t| t.is_cold_cache() && t.context_tokens() >= 60_000);
+        .zip(post_ckpt_kinds[recent_start..].iter())
+        .any(|(t, &k)| k != ColdCacheKind::None && t.context_tokens() >= 60_000);
 
     let med_ttft = median_u64(&mut ttfts);
     let med_tps = round_dp(median_f64(&mut tps_vals), 1);
@@ -443,14 +545,20 @@ pub fn build_session_telemetry(
     let archived = summary.map(|s| s.archived).unwrap_or(false);
     let pinned = summary.map(|s| s.pinned).unwrap_or(false);
     let workspace = summary.map(|s| s.workspace.clone()).unwrap_or_default();
+    let workspaces = summary.map(|s| s.workspaces.clone()).unwrap_or_default();
     let workspace_name = if workspace.is_empty() {
         String::new()
     } else {
-        Path::new(workspace.trim_end_matches('/'))
+        let base = Path::new(workspace.trim_end_matches('/'))
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
-            .to_string()
+            .to_string();
+        if workspaces.len() > 1 && !base.is_empty() {
+            format!("{base} (+{})", workspaces.len() - 1)
+        } else {
+            base
+        }
     };
 
     let short_id: String = cid.chars().take(8).collect();
@@ -460,8 +568,10 @@ pub fn build_session_telemetry(
         agent_name.clone()
     } else if let Some(s) = summary.filter(|s| !s.preview.is_empty()) {
         s.preview.chars().take(48).collect()
-    } else {
+    } else if zh {
         format!("会话 {short_id}")
+    } else {
+        format!("Session {short_id}")
     };
 
     let summary_mod_ts = summary
@@ -479,7 +589,12 @@ pub fn build_session_telemetry(
     let last_iso = format_utc_iso(last_ts);
 
     let is_active = if is_subagent {
-        is_subagent_active(summary, last_ts, now_ts, cfg.context.subagent_silent_timeout_sec)
+        is_subagent_active(
+            summary,
+            last_ts,
+            now_ts,
+            cfg.context.subagent_silent_timeout_sec,
+        )
     } else {
         is_running || not_fully_idle
     };
@@ -518,10 +633,12 @@ pub fn build_session_telemetry(
         pinned,
         status: summary.map(|s| s.status.clone()).unwrap_or_default(),
         workspace,
+        workspaces,
         workspace_name,
         model: model_id.to_string(),
         model_display: model_disp.to_string(),
         model_short,
+        pricing_known: price.pricing_known,
         profile_label: prof.label,
         min_compact_tokens: prof.min_ctx,
         recommend_compact_tokens: prof.recommend_ctx,
@@ -552,6 +669,7 @@ pub fn build_session_telemetry(
         total_output_tokens: total_out,
         cost_usd: round_dp(total_usd, 4),
         cost_cny: round_dp(total_cny, 2),
+        currency_code,
         currency_symbol: currency_sym,
         summary_modified_ts: round_dp(summary_mod_ts, 3),
         sidebar_sort_ts: round_dp(last_ts, 3),
@@ -561,6 +679,7 @@ pub fn build_session_telemetry(
         running_subagent_count: 0,
         history_subagent_count: 0,
         effective_last_active_ts: None,
+        group_cost_usd: None,
         group_cost_cny: None,
     }
 }
@@ -580,6 +699,7 @@ pub struct TurnViewRow {
     pub output_tokens: u64,
     pub cache_hit_rate: f64,
     pub is_cold_cache: bool,
+    pub is_partial_cold: bool,
     pub cold_cache_kind: String,
     pub cold_cache_label: String,
     pub cold_cache_reason: String,
@@ -588,6 +708,7 @@ pub struct TurnViewRow {
     pub stream_tps: f64,
     pub cost_usd: f64,
     pub cost_cny: f64,
+    pub currency_code: String,
     pub currency_symbol: String,
 }
 
@@ -599,7 +720,8 @@ pub fn format_turn_rows(
     transcript_step_types: Option<&HashMap<i64, String>>,
 ) -> Vec<TurnViewRow> {
     let cold_kinds = classify_cold_cache_turns(turns, transcript_step_types);
-    let (_, currency_sym) = rates.get_currency();
+    let lang = rates.get_lang();
+    let (currency_code, currency_sym) = rates.get_currency();
     let start = turns.len().saturating_sub(limit);
     let mut rows = Vec::with_capacity(turns.len() - start);
     for (t, &c_kind) in turns[start..].iter().zip(cold_kinds[start..].iter()).rev() {
@@ -611,7 +733,9 @@ pub fn format_turn_rows(
             t.output_tokens,
             &t.model_display,
         );
-        let (c_label, c_reason) = c_kind.label_and_reason();
+        let is_cold = c_kind != ColdCacheKind::None;
+        let is_partial = is_cold && t.cache_read > 0;
+        let (c_label, c_reason) = c_kind.label_and_reason_for_lang(lang, is_partial);
         rows.push(TurnViewRow {
             turn: t.turn_index,
             step_idx: t.step_idx,
@@ -625,7 +749,8 @@ pub fn format_turn_rows(
             cache_write_tokens: t.cache_write,
             output_tokens: t.output_tokens,
             cache_hit_rate: round_dp(t.cache_hit_rate(), 1),
-            is_cold_cache: t.is_cold_cache(),
+            is_cold_cache: is_cold,
+            is_partial_cold: is_partial,
             cold_cache_kind: c_kind.as_str().to_string(),
             cold_cache_label: c_label.to_string(),
             cold_cache_reason: c_reason.to_string(),
@@ -634,6 +759,7 @@ pub fn format_turn_rows(
             stream_tps: round_dp(t.stream_tps(), 1),
             cost_usd: round_dp(usd, 4),
             cost_cny: round_dp(usd * fx_rate, 3),
+            currency_code: currency_code.clone(),
             currency_symbol: currency_sym.clone(),
         });
     }
@@ -659,6 +785,7 @@ pub struct SnapshotSummary {
     pub running_subagent_count: usize,
     pub compact_needed_count: usize,
     pub critical_count: usize,
+    pub total_cost_usd: f64,
     pub total_cost_cny: f64,
 }
 
@@ -676,10 +803,14 @@ pub struct OverviewSnapshot {
     pub server_ms: u64,
     pub generated_at: String,
     pub generated_ts: f64,
+    pub lang: String,
     pub fx_rate: f64,
     pub fx_source: String,
     pub currency_code: String,
     pub currency_symbol: String,
+    pub currency_explicit: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub daemon_workspace: String,
     pub show_history_subagents: bool,
     pub thresholds: SnapshotThresholds,
     pub summary: SnapshotSummary,
@@ -711,6 +842,8 @@ struct MetricsCacheKey {
     summary: Option<SummaryRecord>,
     fx_micros: i64,
     settings_gen: u64,
+    lang: Lang,
+    currency_code: String,
 }
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
@@ -726,9 +859,12 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 pub fn compute_snapshot_digest(snap: &OverviewSnapshot) -> String {
     #[derive(Serialize)]
     struct StableView<'a> {
+        lang: &'a str,
         fx_rate: f64,
         currency_code: &'a str,
         currency_symbol: &'a str,
+        currency_explicit: bool,
+        daemon_workspace: &'a str,
         show_history_subagents: bool,
         thresholds: &'a SnapshotThresholds,
         summary: &'a SnapshotSummary,
@@ -739,9 +875,12 @@ pub fn compute_snapshot_digest(snap: &OverviewSnapshot) -> String {
     }
 
     let stable = StableView {
+        lang: &snap.lang,
         fx_rate: snap.fx_rate,
         currency_code: &snap.currency_code,
         currency_symbol: &snap.currency_symbol,
+        currency_explicit: snap.currency_explicit,
+        daemon_workspace: &snap.daemon_workspace,
         show_history_subagents: snap.show_history_subagents,
         thresholds: &snap.thresholds,
         summary: &snap.summary,
@@ -789,9 +928,25 @@ fn resolve_disk_cache_path(
     Some(base.join("index_cache.sqlite"))
 }
 
+fn detect_initial_workspace() -> (Option<String>, bool) {
+    if let Ok(ov) = env::var(WORKSPACE_ENV) {
+        let trimmed = ov.trim();
+        if !trimmed.is_empty() {
+            return (Some(expand_tilde(trimmed)), true);
+        }
+    }
+    let cwd = env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty());
+    (cwd, false)
+}
+
 pub struct TelemetryEngine {
     pub ledger: LedgerReader,
     pub rates: RateTable,
+    preferred_workspace: Option<String>,
+    workspace_explicit: bool,
     metrics_cache: HashMap<String, (MetricsCacheKey, SessionTelemetry)>,
 }
 
@@ -820,10 +975,40 @@ impl TelemetryEngine {
             explicit_disk_cache,
         );
         let ledger = LedgerReader::new(root, disk_path);
+        let (preferred_workspace, workspace_explicit) = detect_initial_workspace();
         Self {
             ledger,
             rates: rate_table,
+            preferred_workspace,
+            workspace_explicit,
             metrics_cache: HashMap::new(),
+        }
+    }
+
+    pub fn set_preferred_workspace(&mut self, workspace: Option<String>, explicit: bool) {
+        self.preferred_workspace = workspace.filter(|s| !s.trim().is_empty());
+        self.workspace_explicit = explicit;
+    }
+
+    /// Return the workspace bound to this daemon process ONLY when explicitly set via
+    /// `CONTEXT_RADAR_WORKSPACE` / `set_preferred_workspace` OR when `current_dir` matches at least
+    /// one known session in `conversation_summaries.db` (so synthetic test fixtures are unaffected).
+    pub fn effective_daemon_workspace(&mut self) -> Option<String> {
+        let cand = self.preferred_workspace.as_deref()?.trim();
+        if cand.is_empty() {
+            return None;
+        }
+        if self.workspace_explicit {
+            return Some(cand.to_string());
+        }
+        let summaries = self.ledger.read_summaries();
+        let matched = summaries
+            .values()
+            .any(|s| (!s.workspace.is_empty() || !s.workspaces.is_empty()) && workspaces_overlap(&s.workspace, &s.workspaces, cand));
+        if matched {
+            Some(cand.to_string())
+        } else {
+            None
         }
     }
 
@@ -836,10 +1021,11 @@ impl TelemetryEngine {
         cid: &str,
         turns: &[TurnSample],
     ) -> Option<HashMap<i64, String>> {
-        if turns
-            .iter()
-            .any(|t| t.is_cold_cache() && t.after_turn_start.is_none())
-        {
+        let needs_scan = turns.iter().enumerate().any(|(i, t)| {
+            let prev = if i > 0 { Some(&turns[i - 1]) } else { None };
+            (t.is_cold_cache() || is_partial_prefix_drop(prev, t)) && t.after_turn_start.is_none()
+        });
+        if needs_scan {
             let root = self.ledger.data_root.clone();
             Some(self.ledger.journal_cache.get_step_types(&root, cid))
         } else {
@@ -857,11 +1043,15 @@ impl TelemetryEngine {
         ref_now: f64,
     ) -> SessionTelemetry {
         let cfg = self.rates.current_settings();
+        let lang = self.rates.get_lang();
+        let (currency_code, _) = self.rates.get_currency();
         let cache_key = MetricsCacheKey {
             db_stamp: stamp.map(|s| (s.dev, s.ino, s.sig.clone())),
             summary: summary.cloned(),
             fx_micros: (fx_rate * 1_000_000.0).round() as i64,
             settings_gen: cfg.generation,
+            lang,
+            currency_code,
         };
         if let Some((prev_key, prev_tel)) = self.metrics_cache.get(cid) {
             if *prev_key == cache_key {
@@ -915,7 +1105,11 @@ impl TelemetryEngine {
         (turns.len(), ckpts)
     }
 
-    pub fn get_running_subagent_count(&mut self, parent_cid: &str, now_override: Option<f64>) -> usize {
+    pub fn get_running_subagent_count(
+        &mut self,
+        parent_cid: &str,
+        now_override: Option<f64>,
+    ) -> usize {
         if parent_cid.is_empty() || !is_safe_id(parent_cid) {
             return 0;
         }
@@ -942,6 +1136,40 @@ impl TelemetryEngine {
         count
     }
 
+    /// Return IDs of main sessions concurrently in `CASCADE_RUN_STATUS_RUNNING` within the active
+    /// workspace scope (modified within 120s), used to detect ambiguous omitted `conversation_id` on `commit_handoff`.
+    pub fn ambiguous_running_mains_in_scope(&mut self, now_override: Option<f64>) -> Vec<String> {
+        let ref_now = now_override.unwrap_or_else(now_epoch_sec);
+        let eff_ws = self.effective_daemon_workspace();
+        let summaries = self.ledger.read_summaries();
+        let (file_mtimes, _) = self.ledger.scan_dir();
+        let mut ids: Vec<(f64, String)> = Vec::new();
+        for (cid, s) in summaries.iter() {
+            if s.is_subagent() || s.killed || s.status != "CASCADE_RUN_STATUS_RUNNING" {
+                continue;
+            }
+            let Some(&mtime) = file_mtimes.get(cid) else { continue };
+            let ts = parse_iso_ts(&s.last_modified_time).max(mtime);
+            if ref_now > 0.0 && ts > 0.0 && (ref_now - ts) > 120.0 {
+                continue;
+            }
+            if let Some(ref ws) = eff_ws {
+                if (!s.workspace.is_empty() || !s.workspaces.is_empty())
+                    && !workspaces_overlap(&s.workspace, &s.workspaces, ws)
+                {
+                    continue;
+                }
+            }
+            ids.push((ts, cid.clone()));
+        }
+        ids.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        ids.into_iter().map(|(_, c)| c).collect()
+    }
+
     pub fn resolve_session_fast(
         &mut self,
         cid: &str,
@@ -949,6 +1177,7 @@ impl TelemetryEngine {
     ) -> Option<SessionTelemetry> {
         let ref_now = now_override.unwrap_or_else(now_epoch_sec);
         let (fx_rate, _) = self.rates.get_fx_rate();
+        let eff_ws = self.effective_daemon_workspace();
         let summaries = self.ledger.read_summaries();
         let target = cid.trim();
 
@@ -1004,37 +1233,95 @@ impl TelemetryEngine {
                 }
             }
         } else {
-            let (file_mtimes, file_stamps) = self.ledger.scan_dir();
-            let mut active_mains: Vec<(f64, String)> = Vec::new();
-            let mut all_mains: Vec<(f64, String)> = Vec::new();
-            for (scid, mtime) in &file_mtimes {
-                let s = summaries.get(scid);
-                if s.map(|r| r.is_subagent()).unwrap_or(false) {
-                    continue;
+            if let Ok(env_cid) = env::var(CONVERSATION_ID_ENV) {
+                let trimmed = env_cid.trim();
+                if is_safe_id(trimmed) {
+                    if let Some(st) = stat_db_stamp(&self.ledger.db_path(trimmed)) {
+                        resolved_cid = trimmed.to_string();
+                        prefetched = Some(st);
+                    }
                 }
-                let s_ts = s.map(|r| parse_iso_ts(&r.last_modified_time)).unwrap_or(0.0);
-                let ts = s_ts.max(*mtime);
-                let is_act = s
-                    .map(|r| !r.killed && (r.status == "CASCADE_RUN_STATUS_RUNNING" || r.not_fully_idle))
-                    .unwrap_or(false);
-                if is_act {
-                    active_mains.push((ts, scid.clone()));
-                }
-                all_mains.push((ts, scid.clone()));
             }
-            let pool = if !active_mains.is_empty() {
-                &mut active_mains
-            } else {
-                &mut all_mains
-            };
-            if !pool.is_empty() {
-                pool.sort_by(|a, b| {
-                    b.0.partial_cmp(&a.0)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then_with(|| b.1.cmp(&a.1))
-                });
-                resolved_cid = pool[0].1.clone();
-                prefetched = file_stamps.get(&resolved_cid).cloned();
+
+            if resolved_cid.is_empty() {
+                let (file_mtimes, file_stamps) = self.ledger.scan_dir();
+                // Candidate tuple: (strictly_running, eff_mtime, ts, cid)
+                let mut ws_active: Vec<(bool, f64, f64, String)> = Vec::new();
+                let mut ws_mains: Vec<(bool, f64, f64, String)> = Vec::new();
+                let mut any_active: Vec<(bool, f64, f64, String)> = Vec::new();
+                let mut any_mains: Vec<(bool, f64, f64, String)> = Vec::new();
+
+                for (scid, mtime) in &file_mtimes {
+                    let s = summaries.get(scid);
+                    let is_sub = s.map(|r| r.is_subagent()).unwrap_or(false);
+                    let strictly_running = s
+                        .map(|r| !r.killed && r.status == "CASCADE_RUN_STATUS_RUNNING")
+                        .unwrap_or(false);
+
+                    // Parked/idle subagents never steal default resolution from main sessions,
+                    // whereas an actively executing (`CASCADE_RUN_STATUS_RUNNING`) subagent CAN
+                    // resolve when its DB was updated most recently (so a subagent omitting
+                    // `conversation_id` receives `"subagent_handoff"` baton-pass guidance).
+                    if is_sub && !strictly_running {
+                        continue;
+                    }
+
+                    let s_ts = s.map(|r| parse_iso_ts(&r.last_modified_time)).unwrap_or(0.0);
+                    let ts = s_ts.max(*mtime);
+                    let is_act = if is_sub {
+                        strictly_running
+                    } else {
+                        s.map(|r| {
+                            !r.killed
+                                && (r.status == "CASCADE_RUN_STATUS_RUNNING" || r.not_fully_idle)
+                        })
+                        .unwrap_or(false)
+                    };
+
+                    let in_ws = match (&eff_ws, s) {
+                        (Some(ws), Some(r))
+                            if !r.workspace.is_empty() || !r.workspaces.is_empty() =>
+                        {
+                            workspaces_overlap(&r.workspace, &r.workspaces, ws)
+                        }
+                        _ => false,
+                    };
+
+                    let item = (strictly_running, *mtime, ts, scid.clone());
+                    if is_act {
+                        if in_ws {
+                            ws_active.push(item.clone());
+                        }
+                        any_active.push(item.clone());
+                    }
+                    if !is_sub {
+                        if in_ws {
+                            ws_mains.push(item.clone());
+                        }
+                        any_mains.push(item);
+                    }
+                }
+
+                let pool = if !ws_active.is_empty() {
+                    &mut ws_active
+                } else if !ws_mains.is_empty() {
+                    &mut ws_mains
+                } else if !any_active.is_empty() {
+                    &mut any_active
+                } else {
+                    &mut any_mains
+                };
+
+                if !pool.is_empty() {
+                    pool.sort_by(|a, b| {
+                        b.0.cmp(&a.0)
+                            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+                            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+                            .then_with(|| b.3.cmp(&a.3))
+                    });
+                    resolved_cid = pool[0].3.clone();
+                    prefetched = file_stamps.get(&resolved_cid).cloned();
+                }
             }
         }
 
@@ -1073,8 +1360,11 @@ impl TelemetryEngine {
         let ref_now = now_override.unwrap_or_else(now_epoch_sec);
         let ws_filter = workspace_filter.trim().to_ascii_lowercase();
         let cfg = self.rates.current_settings();
+        let lang = self.rates.get_lang();
         let (fx_rate, fx_source) = self.rates.get_fx_rate();
         let (currency_code, currency_sym) = self.rates.get_currency();
+        let currency_explicit = self.rates.is_currency_explicit();
+        let daemon_workspace = self.effective_daemon_workspace().unwrap_or_default();
         let summaries = self.ledger.read_summaries();
         let (file_mtimes, file_stamps) = self.ledger.scan_dir();
 
@@ -1088,7 +1378,12 @@ impl TelemetryEngine {
             let Some(&mtime) = file_mtimes.get(cid) else { continue };
             if s.is_subagent() {
                 let eff_ts = parse_iso_ts(&s.last_modified_time).max(mtime);
-                if is_subagent_active(Some(s), eff_ts, ref_now, cfg.context.subagent_silent_timeout_sec) {
+                if is_subagent_active(
+                    Some(s),
+                    eff_ts,
+                    ref_now,
+                    cfg.context.subagent_silent_timeout_sec,
+                ) {
                     running_ids.insert(cid.clone());
                 }
             } else if !s.killed
@@ -1104,8 +1399,7 @@ impl TelemetryEngine {
                 file_mtimes.contains_key(*cid)
                     && s.is_subagent()
                     && !running_ids.contains(*cid)
-                    && (ws_filter.is_empty()
-                        || s.workspace.to_ascii_lowercase().contains(&ws_filter))
+                    && s.matches_workspace_filter(&ws_filter)
             })
             .count();
 
@@ -1150,7 +1444,7 @@ impl TelemetryEngine {
             let s = summaries.get(&cid);
             if !ws_filter.is_empty() {
                 let matched = s
-                    .map(|r| r.workspace.to_ascii_lowercase().contains(&ws_filter))
+                    .map(|r| r.matches_workspace_filter(&ws_filter))
                     .unwrap_or(false);
                 if !matched {
                     continue;
@@ -1254,21 +1548,29 @@ impl TelemetryEngine {
                 .map(|x| x.last_active_ts)
                 .fold(m.last_active_ts, f64::max);
             let sort_ts = m.summary_modified_ts.max(eff_ts);
-            let group_cost = m.cost_cny + subs.iter().map(|x| x.cost_cny).sum::<f64>();
+            let group_usd = m.cost_usd + subs.iter().map(|x| x.cost_usd).sum::<f64>();
+            let group_cny = m.cost_cny + subs.iter().map(|x| x.cost_cny).sum::<f64>();
 
             m.running_subagent_count = run_subs;
             m.history_subagent_count = hist_subs;
             m.is_active = m.is_active || run_subs > 0;
             m.effective_last_active_ts = Some(round_dp(eff_ts, 3));
             m.sidebar_sort_ts = round_dp(sort_ts, 3);
-            m.group_cost_cny = Some(round_dp(group_cost, 2));
+            m.group_cost_usd = Some(round_dp(group_usd, 4));
+            m.group_cost_cny = Some(round_dp(group_cny, 2));
             m.subagents = subs;
             sessions.push(m);
         }
 
+        // Prefer sessions belonging to this daemon's active workspace at the top when pinned is equal
         sessions.sort_by(|a, b| {
+            let a_ws = !daemon_workspace.is_empty()
+                && workspaces_overlap(&a.workspace, &a.workspaces, &daemon_workspace);
+            let b_ws = !daemon_workspace.is_empty()
+                && workspaces_overlap(&b.workspace, &b.workspaces, &daemon_workspace);
             b.pinned
                 .cmp(&a.pinned)
+                .then_with(|| (b.is_active && b_ws).cmp(&(a.is_active && a_ws)))
                 .then_with(|| {
                     b.sidebar_sort_ts
                         .partial_cmp(&a.sidebar_sort_ts)
@@ -1289,6 +1591,7 @@ impl TelemetryEngine {
         let mut running_subagent_count = 0usize;
         let mut compact_needed_count = 0usize;
         let mut critical_count = 0usize;
+        let mut total_cost_usd = 0.0f64;
         let mut total_cost_cny = 0.0f64;
 
         let mut accum = |item: &SessionTelemetry| {
@@ -1301,6 +1604,7 @@ impl TelemetryEngine {
             if item.level == "critical" {
                 critical_count += 1;
             }
+            total_cost_usd += item.cost_usd;
             total_cost_cny += item.cost_cny;
         };
         for s in &sessions {
@@ -1321,10 +1625,13 @@ impl TelemetryEngine {
             server_ms: t0.elapsed().as_millis() as u64,
             generated_at: format_utc_iso(now_epoch_sec()),
             generated_ts: round_dp(ref_now, 3),
+            lang: lang.as_str().to_string(),
             fx_rate: round_dp(fx_rate, 4),
             fx_source,
             currency_code,
             currency_symbol: currency_sym,
+            currency_explicit,
+            daemon_workspace,
             show_history_subagents: show_history,
             thresholds: SnapshotThresholds {
                 warn: cfg.context.warn_threshold,
@@ -1346,6 +1653,7 @@ impl TelemetryEngine {
                 running_subagent_count,
                 compact_needed_count,
                 critical_count,
+                total_cost_usd: round_dp(total_cost_usd, 4),
                 total_cost_cny: round_dp(total_cost_cny, 2),
             },
             sessions,
@@ -1358,6 +1666,8 @@ impl TelemetryEngine {
     }
 
     pub fn get_session_turns(&mut self, cid: &str, limit: usize) -> SessionTurnsPayload {
+        let lang = self.rates.get_lang();
+        let zh = lang.is_zh();
         let trimmed = cid.trim();
         let resolved = if trimmed.is_empty() {
             match self.resolve_session_fast("", None) {
@@ -1365,7 +1675,11 @@ impl TelemetryEngine {
                 None => {
                     return SessionTurnsPayload {
                         mode: "turns".into(),
-                        error: Some("未找到目标会话".into()),
+                        error: Some(if zh {
+                            "未找到目标会话".into()
+                        } else {
+                            "Target session not found".into()
+                        }),
                         conversation_id: String::new(),
                         session: None,
                         total_turns: 0,
@@ -1381,7 +1695,11 @@ impl TelemetryEngine {
         if !is_safe_id(&resolved) {
             return SessionTurnsPayload {
                 mode: "turns".into(),
-                error: Some("无效的会话 ID".into()),
+                error: Some(if zh {
+                    "无效的会话 ID".into()
+                } else {
+                    "Invalid conversation ID".into()
+                }),
                 conversation_id: resolved,
                 session: None,
                 total_turns: 0,

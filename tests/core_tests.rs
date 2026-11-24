@@ -9,14 +9,16 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use context_radar_mcp::engine::budget::{
-    builtin_tiers, evaluate_handoff_gate, prepare_handoff_plan, resolve_budget_tier,
+    builtin_tiers, compute_economics, evaluate_handoff_gate, prepare_handoff_plan,
+    resolve_budget_tier,
 };
 use context_radar_mcp::engine::grants::{build_handoff_prompt, RelayGrantStore};
-use context_radar_mcp::engine::pruner::distill_slice;
+use context_radar_mcp::engine::pruner::{analyze_hotspots_with_lang, distill_slice};
 use context_radar_mcp::engine::rates::RateTable;
 use context_radar_mcp::engine::telemetry::{
     build_session_telemetry, format_turn_rows, ColdCacheBreakdown, TelemetryEngine,
 };
+use context_radar_mcp::i18n::{resolve_lang_from_sources, Lang};
 use context_radar_mcp::ledger::journal_tail::JournalTailCache;
 use context_radar_mcp::ledger::sqlite_ro::open_host_readonly;
 use context_radar_mcp::ledger::TurnSample;
@@ -383,7 +385,10 @@ fn test_generic_tiers_and_hard_gates() {
     sub.latest_context_tokens = 455_600;
     let sub_gate = evaluate_handoff_gate(Some(&sub), 20, &mut rates);
     assert!(!sub_gate.allowed);
-    assert!(sub_gate.reasons.iter().any(|r| r.contains("切棒")));
+    assert!(sub_gate
+        .reasons
+        .iter()
+        .any(|r| r.contains("切棒") || r.contains("baton")));
     assert_eq!(prepare_handoff_plan(Some(&sub), 12, 0, &mut rates).action, "subagent_handoff");
 
     // 3) Block when running_subagent_count > 0 (even at urgent context!)
@@ -699,16 +704,35 @@ fn test_active_subagent_filtering_and_three_way_cold_cache() {
 
 #[repr(C)]
 struct Timespec {
-    tv_sec: i64,
-    tv_nsec: i64,
+    tv_sec: core::ffi::c_long,
+    tv_nsec: core::ffi::c_long,
 }
+#[cfg(target_os = "macos")]
+const AT_FDCWD_PLAT: i32 = -2;
+#[cfg(not(target_os = "macos"))]
+const AT_FDCWD_PLAT: i32 = -100;
+
 extern "C" {
-    fn utimensat(dirfd: i32, path: *const i8, times: *const Timespec, flag: i32) -> i32;
+    fn utimensat(
+        dirfd: i32,
+        path: *const core::ffi::c_char,
+        times: *const Timespec,
+        flag: i32,
+    ) -> i32;
 }
 fn filetime_set(path: &Path, sec: i64) -> bool {
     let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
-    let ts = [Timespec { tv_sec: sec, tv_nsec: 0 }, Timespec { tv_sec: sec, tv_nsec: 0 }];
-    unsafe { utimensat(-2 /* AT_FDCWD on macOS */, c.as_ptr(), ts.as_ptr(), 0) == 0 }
+    let ts = [
+        Timespec {
+            tv_sec: sec as core::ffi::c_long,
+            tv_nsec: 0,
+        },
+        Timespec {
+            tv_sec: sec as core::ffi::c_long,
+            tv_nsec: 0,
+        },
+    ];
+    unsafe { utimensat(AT_FDCWD_PLAT, c.as_ptr(), ts.as_ptr(), 0) == 0 }
 }
 
 #[test]
@@ -870,7 +894,9 @@ fn test_ssr_boot_data_injection_xss_escaping_and_digest_dedup() {
         }))
         .unwrap();
     let h_html = r_handoff["result"]["contents"][0]["text"].as_str().unwrap();
-    assert!(h_html.contains(r#"window.__CONTEXT_RADAR_BOOT__={"view":"handoff"};"#));
+    assert!(h_html.contains("window.__CONTEXT_RADAR_BOOT__={"));
+    assert!(h_html.contains(r#""view":"handoff""#));
+    assert!(h_html.contains(r#""lang":"#));
 
     // 3) Digest dedup: first call gets full snapshot + digest
     let s1 = daemon
@@ -1089,4 +1115,204 @@ fn test_security_path_traversal_and_symlink_guards() {
         context_radar_mcp::guard::boot::evaluate_boot_guard(&json!({ "cwd": ws.path().to_string_lossy() }), &cfg),
         json!({})
     );
+}
+
+#[test]
+fn test_live_antigravity_models_unpriced_break_even_and_i18n() {
+    let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
+    let cfg = rates.current_settings();
+
+    for (id, disp, exp_tier) in [
+        ("gemini-4-neon-high", "Gemini 4 Neon (High)", "flagship"),
+        ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)", "high_reasoning"),
+        ("gemini-4-carbon-high", "Gemini 4 Carbon (High)", "standard"),
+        ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)", "standard"),
+        ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)", "fast"),
+        ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)", "fast_reasoning"),
+        ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", "fast"),
+        ("gemini-pro-orchestrator-neon", "Gemini Pro Orchestrator", "flagship"),
+        ("claude-opus-5-5-high", "Claude Opus 5.5", "claude_tier"),
+        ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5", "claude_tier"),
+        ("gpt-oss-120b-medium", "GPT OSS 120B (Medium)", "standard"),
+    ] {
+        let card = rates.resolve_rate(id, disp);
+        assert!(card.pricing_known, "expected known pricing for {id}");
+        assert_eq!(resolve_budget_tier(id, disp, &cfg).profile_id, exp_tier, "tier mismatch for {id}");
+    }
+
+    // Unknown brand-new model must NEVER deadlock at break_even_turns = 999
+    let unknown_card = rates.resolve_rate("future-brand-new-model-9", "Future Brand New");
+    assert!(!unknown_card.pricing_known);
+    let econ = compute_economics(320_000, "future-brand-new-model-9", "Future Brand New", &mut rates);
+    assert!(!econ.pricing_known);
+    assert!(
+        (2..=12).contains(&econ.break_even_turns),
+        "expected token-physics break-even in 2..=12, got {}",
+        econ.break_even_turns
+    );
+
+    let mut s = build_session_telemetry(
+        "90000000-0000-0000-0000-000000000009",
+        None,
+        &[],
+        100.0,
+        7.2,
+        &mut rates,
+        120.0,
+        None,
+    );
+    s.model = "future-brand-new-model-9".into();
+    s.model_display = "Future Brand New".into();
+    s.latest_context_tokens = 340_000;
+    s.turns = 30;
+    s.turns_since_compact = 30;
+    let gate = evaluate_handoff_gate(Some(&s), 12, &mut rates);
+    assert!(gate.allowed, "unpriced model at 340k should pass handoff gate: {:?}", gate.reasons);
+
+    // i18n locale & currency resolution
+    assert_eq!(resolve_lang_from_sources("", None, Some("zh_CN.UTF-8"), None, None, None), Lang::ZhCn);
+    assert_eq!(resolve_lang_from_sources("", None, Some("en_US.UTF-8"), None, None, None), Lang::En);
+    assert_eq!(Lang::ZhCn.default_currency(), ("CNY", "¥"));
+    assert_eq!(Lang::En.default_currency(), ("USD", "$"));
+}
+
+#[test]
+fn test_hotspot_attribution_excludes_outgoing_step_and_detects_partial_cold() {
+    let td = TempDir::new().unwrap();
+    let cid = "91000000-0000-0000-0000-000000000010";
+    let log_dir = td.path().join("brain").join(cid).join(".system_generated").join("logs");
+    fs::create_dir_all(&log_dir).unwrap();
+    let transcript = [
+        json!({
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [{"name": "run_command", "arguments": {"CommandLine": "cargo test --workspace"}}]
+        }),
+        json!({
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "tool_calls": [{"name": "read_file", "arguments": {"Path": "/tmp/unexecuted_outgoing.rs"}}]
+        }),
+    ]
+    .iter()
+    .map(|v| serde_json::to_string(v).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n");
+    fs::write(log_dir.join("transcript.jsonl"), transcript).unwrap();
+
+    let turns = vec![
+        TurnSample {
+            turn_index: 1,
+            step_idx: 1,
+            timestamp: 100.0,
+            model: "gemini-4-carbon-high".into(),
+            model_display: "Gemini 4 Carbon (High)".into(),
+            input_tokens: 10_000,
+            cache_read: 90_000,
+            cache_write: 0,
+            output_tokens: 200,
+            ttft_ms: 1000,
+            total_ms: 2000,
+            response_id: "r1".into(),
+            step_type: 15,
+            is_checkpoint: false,
+            after_turn_start: Some(false),
+            after_checkpoint: false,
+        },
+        TurnSample {
+            turn_index: 2,
+            step_idx: 2,
+            timestamp: 105.0,
+            model: "gemini-4-carbon-high".into(),
+            model_display: "Gemini 4 Carbon (High)".into(),
+            input_tokens: 5_000,
+            cache_read: 30_000,
+            cache_write: 95_000,
+            output_tokens: 300,
+            ttft_ms: 4000,
+            total_ms: 5000,
+            response_id: "r2".into(),
+            step_type: 15,
+            is_checkpoint: false,
+            after_turn_start: Some(false),
+            after_checkpoint: false,
+        },
+    ];
+
+    let mut jcache = JournalTailCache::new(16);
+    let rep = analyze_hotspots_with_lang(td.path(), cid, &turns, 5, &mut jcache, Lang::En);
+    assert!(rep.found);
+    let hotspots = rep.hotspots.unwrap();
+    assert_eq!(hotspots.len(), 1);
+    assert!(hotspots[0].cause.contains("run_command"), "got: {}", hotspots[0].cause);
+    assert!(
+        !hotspots[0].cause.contains("unexecuted_outgoing.rs"),
+        "must not attribute turn 2's own unexecuted outgoing tool call: {}",
+        hotspots[0].cause
+    );
+
+    let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
+    let rows = format_turn_rows(&turns, 10, 7.2, &mut rates, None);
+    assert!(rows[0].is_cold_cache);
+    assert!(rows[0].is_partial_cold);
+    assert_eq!(rows[0].cold_cache_kind, "mid_loop_cold");
+}
+
+#[test]
+fn test_scoped_relay_grants_reject_cross_workspace_and_cross_conversation() {
+    let td = TempDir::new().unwrap();
+    let mut gs = RelayGrantStore::new(td.path().join("relay_grants.json"));
+    let cid_a = "92000000-0000-0000-0000-000000000011";
+    let grant = gs.create_grant_scoped(
+        "Keep A",
+        "Finish A",
+        true,
+        cid_a,
+        "/workspace/project-a",
+        &["/workspace/project-a".to_string()],
+        30,
+        0,
+        "handoff",
+        "",
+        "Project A",
+        Lang::En,
+    );
+
+    assert!(gs.get_pending_grant_scoped(None, Some("/workspace/project-b"), None).is_none());
+    assert!(gs.get_pending_grant_scoped(None, Some("/workspace/project-a"), None).is_some());
+
+    let wrong_cid = gs.claim_grant_scoped(
+        &grant.grant_id,
+        Some("92000000-0000-0000-0000-000000000099"),
+        Some("/workspace/project-a"),
+        Some(30),
+        Some(0),
+        Some(0),
+        true,
+    );
+    assert!(!wrong_cid.claimed);
+    assert_eq!(wrong_cid.reason.as_deref(), Some("conversation_mismatch"));
+
+    let wrong_ws = gs.claim_grant_scoped(
+        &grant.grant_id,
+        Some(cid_a),
+        Some("/workspace/project-b"),
+        Some(30),
+        Some(0),
+        Some(0),
+        true,
+    );
+    assert!(!wrong_ws.claimed);
+    assert_eq!(wrong_ws.reason.as_deref(), Some("workspace_mismatch"));
+
+    let ok = gs.claim_grant_scoped(
+        &grant.grant_id,
+        Some(cid_a),
+        Some("/workspace/project-a"),
+        Some(30),
+        Some(0),
+        Some(0),
+        true,
+    );
+    assert!(ok.claimed);
 }

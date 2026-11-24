@@ -10,6 +10,7 @@ use crate::settings::load_settings_once;
 
 const DEFAULT_MIN_SYNC_WAIT_MS: u64 = 5000;
 const DEFAULT_TARGET_SYNC_WAIT_MS: u64 = 10000;
+const DEFAULT_ASYNC_BUILD_MAX_WAIT_MS: u64 = 550;
 
 const DEFAULT_EXEMPT_PATTERNS: &[&str] = &[
     r"(?:^|[;&|]\s*)nohup\b",
@@ -23,6 +24,22 @@ const DEFAULT_EXEMPT_PATTERNS: &[&str] = &[
     r"[^>&]\s*&\s*$",
 ];
 
+/// Finite heavy build/test/install commands that Antigravity agents intentionally background
+/// using `WaitMsBeforeAsync: 500` (`IsDaemon: false`).
+const DEFAULT_FINITE_BG_BUILD_PATTERNS: &[&str] = &[
+    r"\bcargo\s+(?:build|test|check|clippy|bench|install|doc)\b",
+    r"\b(?:pytest|py\.test|tox|nox)\b",
+    r"\bpython3?\s+-m\s+(?:pytest|unittest)\b",
+    r"\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:build|test|ci|install|pack|lint|typecheck)\b",
+    r"\bgo\s+(?:build|test|install)\b",
+    r"\b(?:gradle|./gradlew|mvn|./mvnw|cmake|ninja|bazel|xcodebuild)\b",
+    r"(?:^|[;&|]\s*)make(?:\s+|$)",
+    r"\bswift\s+(?:build|test)\b",
+    r"\bdocker\s+(?:build|buildx\s+build|pull|compose\s+build)\b",
+    r"\b(?:pip|pip3|conda|mamba|uv)\s+(?:install|sync|build)\b",
+    r"\b(?:tsc|webpack|rollup|esbuild|vite\s+build|next\s+build)\b",
+];
+
 fn default_exempt_regexes() -> &'static Vec<Regex> {
     static RES: OnceLock<Vec<Regex>> = OnceLock::new();
     RES.get_or_init(|| {
@@ -31,6 +48,50 @@ fn default_exempt_regexes() -> &'static Vec<Regex> {
             .map(|p| Regex::new(p).expect("valid default exempt regex"))
             .collect()
     })
+}
+
+fn finite_bg_build_regexes() -> &'static Vec<Regex> {
+    static RES: OnceLock<Vec<Regex>> = OnceLock::new();
+    RES.get_or_init(|| {
+        DEFAULT_FINITE_BG_BUILD_PATTERNS
+            .iter()
+            .map(|p| Regex::new(p).expect("valid finite bg build regex"))
+            .collect()
+    })
+}
+
+pub fn is_deliberate_async_build(
+    wait_ms: u64,
+    command_line: &str,
+    tool_summary: &str,
+    hook_cfg: Option<&Value>,
+) -> bool {
+    let cfg = hook_cfg.and_then(Value::as_object);
+    if cfg
+        .and_then(|o| o.get("respect_async_builds"))
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        return false;
+    }
+    let max_async_wait = cfg
+        .and_then(|o| o.get("async_build_max_wait_ms"))
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_ASYNC_BUILD_MAX_WAIT_MS);
+    if wait_ms > max_async_wait {
+        return false;
+    }
+    let sum_low = tool_summary.trim().to_ascii_lowercase();
+    if sum_low.contains("background") || sum_low.contains("async") {
+        return true;
+    }
+    let trimmed = command_line.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    finite_bg_build_regexes()
+        .iter()
+        .any(|re| re.is_match(trimmed))
 }
 
 pub fn is_explicit_background_command(command_line: &str, hook_cfg: Option<&Value>) -> bool {
@@ -155,7 +216,13 @@ pub fn evaluate_exec_gate(payload: &Value, hook_cfg: Option<&Value>) -> Value {
         .get("CommandLine")
         .and_then(Value::as_str)
         .unwrap_or("");
-    if is_explicit_background_command(cmd, hook_cfg) {
+    let summary = args
+        .get("toolSummary")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if is_explicit_background_command(cmd, hook_cfg)
+        || is_deliberate_async_build(wait_ms, cmd, summary, hook_cfg)
+    {
         return pass();
     }
 

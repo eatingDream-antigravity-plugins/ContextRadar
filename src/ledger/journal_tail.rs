@@ -1,4 +1,4 @@
-//! Incremental inode/offset-tracked reader for transcript.jsonl with 256 KiB reverse CHECKPOINT seek.
+//! Incremental inode/offset-tracked reader for transcript.jsonl (+ targeted transcript_full.jsonl hydration) with 256 KiB reverse CHECKPOINT seek.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -72,7 +72,9 @@ pub struct JournalEntry {
     pub snippet_short: String,
     pub snippet_long: String,
     pub tool_names: Vec<String>,
+    pub tool_summaries: Vec<String>,
     pub touched_files: Vec<String>,
+    pub has_truncated_fields: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -102,6 +104,15 @@ pub fn transcript_path(data_root: &Path, cid: &str) -> PathBuf {
         .join(".system_generated")
         .join("logs")
         .join("transcript.jsonl")
+}
+
+pub fn transcript_full_path(data_root: &Path, cid: &str) -> PathBuf {
+    data_root
+        .join("brain")
+        .join(cid)
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript_full.jsonl")
 }
 
 fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -197,6 +208,135 @@ fn trim_ascii(mut s: &[u8]) -> &[u8] {
     s
 }
 
+fn short_basename(raw_path: &str) -> String {
+    let trimmed = raw_path.trim().trim_end_matches('/');
+    Path::new(trimmed)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn strip_cd_prefix(cmd: &str) -> &str {
+    let trimmed = cmd.trim();
+    if let Some(rest) = trimmed.strip_prefix("cd ") {
+        if let Some(idx) = rest.find("&&") {
+            let after = rest[idx + 2..].trim();
+            if !after.is_empty() {
+                return after;
+            }
+        }
+    }
+    trimmed
+}
+
+fn summarize_tool_call(
+    name: &str,
+    args: Option<&serde_json::Map<String, Value>>,
+    touched_files: &mut Vec<String>,
+    seen_files: &mut HashSet<String>,
+) -> String {
+    let Some(args) = args else {
+        return name.to_string();
+    };
+
+    let mut path_labels: Vec<String> = Vec::new();
+    for key in ["Path", "path", "ScriptPath", "TargetFile", "file"] {
+        if let Some(val) = args.get(key).and_then(Value::as_str).map(str::trim) {
+            if !val.is_empty() {
+                if seen_files.insert(val.to_string()) {
+                    touched_files.push(val.to_string());
+                }
+                path_labels.push(short_basename(val));
+            }
+        }
+    }
+    for key in ["paths", "Paths", "files"] {
+        if let Some(arr) = args.get(key).and_then(Value::as_array) {
+            for item in arr.iter().filter_map(Value::as_str).map(str::trim) {
+                if !item.is_empty() {
+                    if seen_files.insert(item.to_string()) {
+                        touched_files.push(item.to_string());
+                    }
+                    path_labels.push(short_basename(item));
+                }
+            }
+        }
+    }
+    if !path_labels.is_empty() {
+        let head: Vec<String> = path_labels.iter().take(2).cloned().collect();
+        let extra = path_labels.len().saturating_sub(2);
+        let joined = if extra > 0 {
+            format!("{}+{}", head.join(","), extra)
+        } else {
+            head.join(",")
+        };
+        return format!("{name}({})", clean_snippet(&joined, 36));
+    }
+
+    for key in ["CommandLine", "command", "cmd"] {
+        if let Some(val) = args.get(key).and_then(Value::as_str) {
+            let cleaned = clean_snippet(strip_cd_prefix(val), 36);
+            if !cleaned.is_empty() {
+                return format!("{name}({cleaned})");
+            }
+        }
+    }
+
+    if let Some(arr) = args.get("queries").and_then(Value::as_array) {
+        let qs: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|s| clean_snippet(s, 18))
+            .filter(|s| !s.is_empty())
+            .take(2)
+            .collect();
+        if !qs.is_empty() {
+            return format!("{name}({})", qs.join(","));
+        }
+    }
+    for key in ["query", "Query", "pattern", "Pattern"] {
+        if let Some(val) = args.get(key).and_then(Value::as_str) {
+            let cleaned = clean_snippet(val, 28);
+            if !cleaned.is_empty() {
+                return format!("{name}({cleaned})");
+            }
+        }
+    }
+
+    for key in ["url", "Url", "Uri", "uri"] {
+        if let Some(val) = args.get(key).and_then(Value::as_str) {
+            let cleaned = clean_snippet(val, 32);
+            if !cleaned.is_empty() {
+                return format!("{name}({cleaned})");
+            }
+        }
+    }
+
+    for key in ["Recipient", "recipient", "SubagentName", "AgentName"] {
+        if let Some(val) = args.get(key).and_then(Value::as_str) {
+            let cleaned = clean_snippet(val, 24);
+            if !cleaned.is_empty() {
+                return format!("{name}({cleaned})");
+            }
+        }
+    }
+
+    if let Some(act) = args.get("action").and_then(Value::as_str).map(str::trim) {
+        if !act.is_empty() {
+            if let Some(nm) = args.get("name").and_then(Value::as_str).map(str::trim) {
+                if !nm.is_empty() {
+                    return format!("{name}({act}:{nm})");
+                }
+            }
+            return format!("{name}({act})");
+        }
+    }
+
+    name.to_string()
+}
+
 fn project_entry(obj: &serde_json::Map<String, Value>) -> Option<JournalEntry> {
     let step_index = obj.get("step_index")?.as_i64()?;
     let step_type = obj
@@ -210,7 +350,13 @@ fn project_entry(obj: &serde_json::Map<String, Value>) -> Option<JournalEntry> {
         .unwrap_or("")
         .to_string();
     let content = obj.get("content").and_then(Value::as_str).unwrap_or("");
-    let raw_chars = content.chars().count();
+    let thinking = obj.get("thinking").and_then(Value::as_str).unwrap_or("");
+    let raw_chars = content.chars().count().saturating_add(thinking.chars().count() / 4);
+    let has_truncated_fields = obj
+        .get("truncated_fields")
+        .and_then(Value::as_array)
+        .map(|a| !a.is_empty())
+        .unwrap_or(false);
 
     let mut snippet_short = String::new();
     let mut snippet_long = String::new();
@@ -224,6 +370,7 @@ fn project_entry(obj: &serde_json::Map<String, Value>) -> Option<JournalEntry> {
     }
 
     let mut tool_names = Vec::new();
+    let mut tool_summaries = Vec::new();
     let mut touched_files = Vec::new();
     let mut seen_files = HashSet::new();
     if let Some(tcs) = obj.get("tool_calls").and_then(Value::as_array) {
@@ -235,15 +382,12 @@ fn project_entry(obj: &serde_json::Map<String, Value>) -> Option<JournalEntry> {
                 .filter(|s| !s.is_empty())
                 .unwrap_or("unknown");
             tool_names.push(name.to_string());
-            if let Some(args) = tco.get("args").and_then(Value::as_object) {
-                for key in ["Path", "path", "ScriptPath"] {
-                    if let Some(val) = args.get(key).and_then(Value::as_str) {
-                        if !val.is_empty() && seen_files.insert(val.to_string()) {
-                            touched_files.push(val.to_string());
-                        }
-                    }
-                }
-            }
+            let args_obj = tco
+                .get("args")
+                .or_else(|| tco.get("arguments"))
+                .and_then(Value::as_object);
+            let summary = summarize_tool_call(name, args_obj, &mut touched_files, &mut seen_files);
+            tool_summaries.push(summary);
         }
     }
 
@@ -255,7 +399,9 @@ fn project_entry(obj: &serde_json::Map<String, Value>) -> Option<JournalEntry> {
         snippet_short,
         snippet_long,
         tool_names,
+        tool_summaries,
         touched_files,
+        has_truncated_fields,
     })
 }
 
@@ -287,10 +433,13 @@ fn extract_json_int_field(buf: &[u8], key: &[u8]) -> Option<i64> {
         i += 1;
     }
     let start = i;
+    if i < buf.len() && buf[i] == b'-' {
+        i += 1;
+    }
     while i < buf.len() && buf[i].is_ascii_digit() {
         i += 1;
     }
-    if i == start {
+    if i == start || (i == start + 1 && buf[start] == b'-') {
         return None;
     }
     std::str::from_utf8(&buf[start..i]).ok()?.parse::<i64>().ok()
@@ -484,6 +633,94 @@ impl JournalTailCache {
         Self::touch_order(&mut self.windows_order, &tpath);
         self.evict_windows();
         result
+    }
+
+    /// Hydrate ONLY entries within `s_idx..=e_idx` that set `truncated_fields` in `transcript.jsonl`
+    /// by reading the corresponding full lines from `transcript_full.jsonl`.
+    pub fn hydrate_truncated_entries(
+        &self,
+        data_root: &Path,
+        cid: &str,
+        entries: &mut [JournalEntry],
+        s_idx: i64,
+        e_idx: i64,
+    ) {
+        if !is_safe_id(cid) {
+            return;
+        }
+        let mut needed: HashSet<i64> = entries
+            .iter()
+            .filter(|e| e.step_index >= s_idx && e.step_index <= e_idx && e.has_truncated_fields)
+            .map(|e| e.step_index)
+            .collect();
+        if needed.is_empty() {
+            return;
+        }
+
+        let fpath = transcript_full_path(data_root, cid);
+        let Ok(meta) = fs::symlink_metadata(&fpath) else {
+            return;
+        };
+        if !meta.file_type().is_file() {
+            return;
+        }
+        let Ok(mut file) = File::open(&fpath) else {
+            return;
+        };
+        let start_offset = find_after_last_checkpoint_offset(&mut file, meta.size());
+        if file.seek(SeekFrom::Start(start_offset)).is_err() {
+            return;
+        }
+
+        let max_needed = needed.iter().copied().max().unwrap_or(e_idx);
+        let mut hydrated: HashMap<i64, JournalEntry> = HashMap::with_capacity(needed.len());
+        let mut reader = BufReader::new(file);
+        let mut raw_line = Vec::with_capacity(8192);
+
+        while !needed.is_empty() {
+            raw_line.clear();
+            let n = match reader.read_until(b'\n', &mut raw_line) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if n == 0 {
+                break;
+            }
+            let stripped = trim_ascii(&raw_line);
+            if stripped.is_empty() {
+                continue;
+            }
+            let head_len = stripped.len().min(512);
+            if let Some(sidx) = extract_json_int_field(&stripped[..head_len], b"\"step_index\"") {
+                if !needed.contains(&sidx) {
+                    if sidx > max_needed {
+                        break;
+                    }
+                    continue;
+                }
+            }
+            if let Ok(Value::Object(map)) = serde_json::from_slice::<Value>(stripped) {
+                if let Some(sidx) = map.get("step_index").and_then(Value::as_i64) {
+                    if needed.remove(&sidx) {
+                        if let Some(full_entry) = project_entry(&map) {
+                            hydrated.insert(sidx, full_entry);
+                        }
+                    } else if sidx > max_needed {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if hydrated.is_empty() {
+            return;
+        }
+        for entry in entries.iter_mut() {
+            if let Some(full) = hydrated.remove(&entry.step_index) {
+                *entry = full;
+            }
+        }
     }
 
     /// Return `step_index -> step_type` map using fast header extraction and incremental tailing.

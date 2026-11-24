@@ -73,13 +73,18 @@ You can also just ask your agent in plain language. The plugin includes an on-de
 
 ## Configuration (optional)
 
-No config file is needed out of the box. If you want custom model pricing, display currency, budget thresholds, or workspace startup notes, copy [settings.example.json](settings.example.json) to `~/.config/context-radar-mcp/settings.json`.
+No config file is needed out of the box. Language (`en` / `zh-CN`) and display currency (`USD` `$` / `CNY` `¥`) are auto-detected from your locale, and Antigravity's data folder is auto-discovered across `~/.gemini/antigravity`, `~/.gemini/antigravity-ide`, and `~/.gemini/antigravity-cli`.
 
-If your Antigravity data lives in a non-default folder, you can override it with `CONTEXT_RADAR_DATA_ROOT` (defaults to `~/.gemini/antigravity`) or point to a custom settings file with `CONTEXT_RADAR_CONFIG`.
+If you want custom model pricing, display currency, budget thresholds, or workspace startup notes, copy [settings.example.json](settings.example.json) to `~/.config/context-radar-mcp/settings.json`. You can override the data directory with `CONTEXT_RADAR_DATA_ROOT` or point to a custom settings file with `CONTEXT_RADAR_CONFIG`.
 
-## Privacy
+## How It Works & Safety Principles
 
-Everything runs locally on your machine with zero network requests and no telemetry. Context Radar opens Antigravity's local database strictly in read-only mode, so it never edits or locks your conversation history.
+Everything runs locally on your machine with zero network requests and no telemetry:
+
+- **Strictly read-only database access**: Context Radar opens Antigravity's SQLite ledger using `SQLITE_OPEN_READ_ONLY` (plus read-only WAL inspection) and tails transcript JSONL files without modifying or locking your conversation history.
+- **Prefix-safe `scratch/` distillation**: Editing or deleting messages mid-conversation invalidates the model's prompt KV cache and triggers an expensive cold rebuild. Instead, `context_radar_hotspots` writes compact summaries out-of-band under `scratch/` so the live KV prefix stays untouched while fresh subagents or `target:new` handoff chats can read the digest on demand.
+- **Scoped single-use relay grants**: Handoff grants are bound to both `conversation_id` and `workspace` and stored locally in `0600` files under plugin data, preventing cross-project side panes from triggering or hijacking another workspace's handoff.
+- **Safe `PreToolUse` wait guard**: The optional hook only advises against prematurely backgrounding quick shell commands (and automatically allows explicit daemons and async builds), without altering system configuration or killing processes.
 
 ## Build from source
 

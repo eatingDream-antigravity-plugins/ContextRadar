@@ -1,4 +1,4 @@
-//! JSON-RPC 2.0 MCP stdio server with startup pre-warm, zero-block SWR cache, SSR boot-data injection, and digest deduplication.
+//! JSON-RPC 2.0 MCP stdio server with startup pre-warm, zero-block SWR cache, SSR boot-data injection, scoped relay grants, and digest deduplication.
 
 use std::env;
 use std::fs;
@@ -14,10 +14,11 @@ use serde_json::{json, Map, Value};
 
 use crate::engine::budget::{evaluate_handoff_gate, prepare_handoff_plan};
 use crate::engine::grants::{
-    default_grants_path_in, sanitize_scratch_note_path, RelayGrantStore,
+    default_grants_path_in, sanitize_scratch_note_path_for_lang, RelayGrantStore,
 };
-use crate::engine::pruner::distill_slice;
+use crate::engine::pruner::distill_slice_with_lang;
 use crate::engine::telemetry::{compute_snapshot_digest, OverviewSnapshot, TelemetryEngine};
+use crate::i18n::select_display_cost;
 use crate::rpc::tools::{
     fmt_k, resources_spec, summarize_snapshot_text, tools_spec, APP_MIME, HANDOFF_URI, PANEL_URI,
 };
@@ -264,11 +265,19 @@ fn attach_grant_and_rehash_inner(
     engine: &mut TelemetryEngine,
     grants: &mut RelayGrantStore,
     snap: &mut OverviewSnapshot,
+    scope_cid: Option<&str>,
+    scope_ws_override: Option<&str>,
 ) {
     let settings = grants.get_settings();
     snap.settings = Some(settings.clone());
     snap.pending_grant = None;
-    if let Some(mut pending) = grants.get_pending_grant(None) {
+
+    let daemon_ws = engine.effective_daemon_workspace();
+    let eff_ws = scope_ws_override
+        .filter(|s| !s.trim().is_empty())
+        .or(daemon_ws.as_deref());
+
+    if let Some(mut pending) = grants.get_pending_grant_scoped(scope_cid, eff_ws, None) {
         let cid = pending.conversation_id.clone();
         let mut valid = true;
         if !cid.is_empty() && !pending.claimed {
@@ -354,10 +363,6 @@ impl McpDaemon {
         }
     }
 
-    /// Spawn the single-flight background pre-warm & Stale-While-Revalidate refresh thread.
-    /// Immediately pre-loads `panel/dist/panel.html`, opens host SQLite strictly read-only,
-    /// warms the active sessions snapshot + SSR boot HTML into RAM, and then sleeps until
-    /// woken by a stale read (zero idle CPU burn).
     pub fn start_prewarm(&self) {
         let Ok(mut slot) = self.swr.worker.lock() else {
             return;
@@ -396,12 +401,11 @@ impl McpDaemon {
                     let html_loaded = hub.load_html(&panel_path).ok();
 
                     let rev_before = hub.grants_rev();
-                    let mut snap =
-                        bg_engine.build_overview_snapshot(25, false, false, "", None);
-                    attach_grant_and_rehash_inner(bg_engine, bg_grants, &mut snap);
+                    let mut snap = bg_engine.build_overview_snapshot(25, false, false, "", None);
+                    attach_grant_and_rehash_inner(bg_engine, bg_grants, &mut snap, None, None);
                     let rev_after = hub.grants_rev();
                     if rev_after != rev_before {
-                        attach_grant_and_rehash_inner(bg_engine, bg_grants, &mut snap);
+                        attach_grant_and_rehash_inner(bg_engine, bg_grants, &mut snap, None, None);
                     }
                     let final_rev = hub.grants_rev();
                     snap.stale = false;
@@ -422,7 +426,6 @@ impl McpDaemon {
                     hub.put_cached(snap, final_rev);
                 };
 
-                // Immediate startup pre-warm pass before waiting for SWR triggers.
                 run_refresh(&mut bg_engine, &mut bg_grants, &hub, &panel_override);
 
                 let (lock, cvar) = &hub.signal;
@@ -477,14 +480,25 @@ impl McpDaemon {
             .unwrap_or_else(default_panel_html_path)
     }
 
-    fn attach_grant_and_rehash(&mut self, snap: &mut OverviewSnapshot) {
-        attach_grant_and_rehash_inner(&mut self.engine, &mut self.grants, snap);
+    fn attach_grant_and_rehash(
+        &mut self,
+        snap: &mut OverviewSnapshot,
+        scope_cid: Option<&str>,
+        scope_ws: Option<&str>,
+    ) {
+        attach_grant_and_rehash_inner(
+            &mut self.engine,
+            &mut self.grants,
+            snap,
+            scope_cid,
+            scope_ws,
+        );
     }
 
     fn on_grants_mutated(&mut self) {
         let new_rev = self.swr.bump_grants_rev();
         if let Some(mut cached) = self.swr.get_cached() {
-            self.attach_grant_and_rehash(&mut cached.snap);
+            self.attach_grant_and_rehash(&mut cached.snap, None, None);
             if let Ok(mut g) = self.swr.cached.write() {
                 cached.grants_rev = new_rev;
                 *g = Some(cached);
@@ -492,16 +506,18 @@ impl McpDaemon {
         }
     }
 
-    /// Return a cached default overview snapshot ONLY when strictly fresh (`< SWR_STALE_TTL`).
-    /// Never serves stale data so the panel never displays delayed numbers or jumps after boot.
     fn get_fresh_default_snapshot(&mut self) -> Option<OverviewSnapshot> {
         let mut cached = self.swr.get_cached()?;
         if cached.built_at.elapsed() >= SWR_STALE_TTL {
             return None;
         }
+        let active_lang = self.engine.rates.get_lang().as_str();
+        if cached.snap.lang != active_lang {
+            return None;
+        }
         let cur_rev = self.swr.grants_rev();
         if cached.grants_rev != cur_rev {
-            self.attach_grant_and_rehash(&mut cached.snap);
+            self.attach_grant_and_rehash(&mut cached.snap, None, None);
             if let Ok(mut g) = self.swr.cached.write() {
                 cached.grants_rev = cur_rev;
                 *g = Some(cached.clone());
@@ -515,16 +531,31 @@ impl McpDaemon {
         &mut self,
         grant_id: &str,
         hint_cid: &str,
+        hint_ws: &str,
         claim_mode: &str,
     ) -> Value {
+        let grant_rec = self.grants.find_grant(grant_id);
         let cid = if !hint_cid.is_empty() {
             hint_cid.to_string()
         } else {
-            self.grants
-                .find_grant(grant_id)
-                .map(|g| g.conversation_id)
+            grant_rec
+                .as_ref()
+                .map(|g| g.conversation_id.clone())
                 .unwrap_or_default()
         };
+
+        let daemon_ws = self.engine.effective_daemon_workspace();
+        let expected_ws = if !hint_ws.is_empty() {
+            Some(hint_ws)
+        } else {
+            daemon_ws.as_deref()
+        };
+        let expected_cid = if !hint_cid.is_empty() {
+            Some(hint_cid)
+        } else {
+            None
+        };
+
         let (cur_turns, cur_ckpts) = if !cid.is_empty() {
             let (t, c) = self.engine.get_turn_and_checkpoint_counts(&cid);
             (Some(t), Some(c))
@@ -542,8 +573,10 @@ impl McpDaemon {
         } else {
             None
         };
-        let outcome = self.grants.claim_grant(
+        let outcome = self.grants.claim_grant_scoped(
             grant_id,
+            expected_cid,
+            expected_ws,
             cur_turns,
             cur_ckpts,
             check_subs,
@@ -573,16 +606,27 @@ impl McpDaemon {
     }
 
     fn handle_ui_action(&mut self, act: &str, args: &Map<String, Value>) -> Value {
+        let lang = self.engine.rates.get_lang();
+        let zh = lang.is_zh();
         match act {
             "set_prefs" => {
                 let allow = args.get("allow_auto_handoff").and_then(Value::as_bool);
-                let updated = self.grants.update_settings(allow);
+                let lang_pref = args.get("lang").and_then(Value::as_str);
+                let updated = self.grants.update_settings_with_lang(allow, lang_pref);
                 self.on_grants_mutated();
+                let msg = if zh {
+                    format!(
+                        "已更新面板偏好：allow_auto_handoff={}",
+                        updated.allow_auto_handoff
+                    )
+                } else {
+                    format!(
+                        "Updated panel preferences: allow_auto_handoff={}",
+                        updated.allow_auto_handoff
+                    )
+                };
                 json!({
-                    "content": [{
-                        "type": "text",
-                        "text": format!("已更新面板偏好：allow_auto_handoff={}", updated.allow_auto_handoff)
-                    }],
+                    "content": [{ "type": "text", "text": msg }],
                     "structuredContent": { "mode": "prefs", "settings": updated },
                     "isError": false
                 })
@@ -625,25 +669,95 @@ impl McpDaemon {
             "claim_grant" => self.claim_with_live_check(
                 &str_arg(args, "grant_id"),
                 &str_arg(args, "conversation_id"),
+                &str_arg(args, "workspace"),
                 &str_arg_or(args, "claim_mode", "manual"),
             ),
+            "distill_slice" => {
+                let cid_arg = str_arg(args, "conversation_id");
+                let target = self.engine.resolve_session_fast(&cid_arg, None);
+                let cid = target
+                    .as_ref()
+                    .map(|t| t.id.clone())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(cid_arg);
+                if cid.is_empty() {
+                    return json!({
+                        "content": [{ "type": "text", "text": if zh { "未找到目标会话" } else { "Target session not found" } }],
+                        "isError": true
+                    });
+                }
+                let turns = self.engine.ledger.read_turns(&cid, None);
+                let start_step = args.get("start_step").and_then(Value::as_i64);
+                let end_step = args.get("end_step").and_then(Value::as_i64);
+                let root = self.engine.ledger.data_root.clone();
+                let res = distill_slice_with_lang(
+                    &root,
+                    &cid,
+                    &turns,
+                    "distill",
+                    start_step,
+                    end_step,
+                    true,
+                    8,
+                    &mut self.engine.ledger.journal_cache,
+                    lang,
+                );
+                let is_err = !res.found;
+                let txt = if is_err {
+                    res.error
+                        .clone()
+                        .unwrap_or_else(|| if zh { "提炼失败".into() } else { "Distillation failed".into() })
+                } else {
+                    res.saved_note_path.clone().unwrap_or_default()
+                };
+                json!({
+                    "content": [{ "type": "text", "text": txt }],
+                    "structuredContent": res,
+                    "isError": is_err
+                })
+            }
+            "create_handoff" => {
+                let mut synth = args.clone();
+                let cid_arg = str_arg(args, "conversation_id");
+                if str_arg(args, "preserve_points").is_empty() {
+                    let target = self.engine.resolve_session_fast(&cid_arg, None);
+                    let title = target
+                        .as_ref()
+                        .map(|t| t.title.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("current session");
+                    let default_pts = if zh {
+                        format!("保留会话《{title}》当前进展、已修改文件、验证结果与工程约束")
+                    } else {
+                        format!("Preserve progress, modified files, verification state, and constraints from '{title}'")
+                    };
+                    synth.insert("preserve_points".into(), Value::String(default_pts));
+                }
+                if !synth.contains_key("auto_fire") {
+                    synth.insert("auto_fire".into(), Value::Bool(false));
+                }
+                let kind = str_arg_or(&synth, "kind", "handoff");
+                self.prepare_commit_handoff(&synth, &kind)
+            }
             _ => json!({
-                "content": [{ "type": "text", "text": format!("未知 UI 操作：{act}") }],
+                "content": [{ "type": "text", "text": if zh { format!("未知 UI 操作：{act}") } else { format!("Unknown UI action: {act}") } }],
                 "isError": true
             }),
         }
     }
 
     fn prepare_commit_handoff(&mut self, args: &Map<String, Value>, kind: &str) -> Value {
+        let lang = self.engine.rates.get_lang();
+        let zh = lang.is_zh();
         let preserve = str_arg(args, "preserve_points");
         if preserve.is_empty() {
             return json!({
-                "content": [{ "type": "text", "text": "preserve_points 不能为空" }],
+                "content": [{ "type": "text", "text": if zh { "preserve_points 不能为空" } else { "preserve_points must not be empty" } }],
                 "isError": true
             });
         }
         let raw_scratch = str_arg(args, "scratch_note_path");
-        let scratch_path = match sanitize_scratch_note_path(&raw_scratch) {
+        let scratch_path = match sanitize_scratch_note_path_for_lang(&raw_scratch, lang) {
             Ok(p) => p,
             Err(err) => {
                 return json!({
@@ -654,8 +768,41 @@ impl McpDaemon {
         };
 
         let cid_arg = str_arg(args, "conversation_id");
-        let rem_turns = u64_arg(args, "estimated_remaining_turns", 12) as usize;
         let target = self.engine.resolve_session_fast(&cid_arg, None);
+
+        // Guard against ambiguous multi-window `commit_handoff` when conversation_id was omitted
+        // and >=2 main conversations are concurrently RUNNING in the same workspace scope.
+        if cid_arg.is_empty() && target.as_ref().map(|t| !t.is_subagent).unwrap_or(true) {
+            let concurrent_mains = self.engine.ambiguous_running_mains_in_scope(None);
+            if concurrent_mains.len() >= 2 {
+                let joined = concurrent_mains.join(", ");
+                let reason = if zh {
+                    format!(
+                        "检测到同一工作区有多个主会话同时运行（{joined}）；请显式传入 conversation_id 以免签发到错误窗口。"
+                    )
+                } else {
+                    format!(
+                        "Multiple main sessions are concurrently running in this workspace ({joined}); pass conversation_id explicitly to avoid targeting the wrong chat."
+                    )
+                };
+                let blocked = json!({
+                    "mode": "handoff_blocked",
+                    "kind": kind,
+                    "blocked": true,
+                    "conversation_id": "",
+                    "current_context_tokens": 0,
+                    "running_subagent_count": 0,
+                    "reasons": [reason],
+                });
+                return json!({
+                    "content": [{ "type": "text", "text": reason }],
+                    "structuredContent": blocked,
+                    "isError": false
+                });
+            }
+        }
+
+        let rem_turns = u64_arg(args, "estimated_remaining_turns", 12) as usize;
         let gate = evaluate_handoff_gate(target.as_ref(), rem_turns, &mut self.engine.rates);
 
         if !gate.allowed {
@@ -664,15 +811,23 @@ impl McpDaemon {
                 "kind": kind,
                 "blocked": true,
                 "conversation_id": target.as_ref().map(|t| t.id.as_str()).unwrap_or(""),
+                "workspace": target.as_ref().map(|t| t.workspace.as_str()).unwrap_or(""),
                 "current_context_tokens": target.as_ref().map(|t| t.latest_context_tokens).unwrap_or(0),
                 "running_subagent_count": target.as_ref().map(|t| t.running_subagent_count).unwrap_or(0),
                 "reasons": gate.reasons,
                 "profile": gate.profile
             });
-            let msg_txt = format!(
-                "【服务端硬约束拦截：禁止本次全量压缩/接力】\n- {}\n请继续直接复用当前热前缀执行任务，或改调 context_radar_hotspots 做保前缀局部提炼。",
-                gate.reasons.join("\n- ")
-            );
+            let msg_txt = if zh {
+                format!(
+                    "【服务端校验拦截：暂不执行全量压缩/接力】\n- {}\n请继续复用当前热前缀执行任务，或调用 context_radar_hotspots 将早期片段旁路提炼到 scratch/。",
+                    gate.reasons.join("\n- ")
+                )
+            } else {
+                format!(
+                    "[Handoff Gate Blocked]\n- {}\nKeep using the warm KV prefix, or call context_radar_hotspots to distill older slices to scratch/.",
+                    gate.reasons.join("\n- ")
+                )
+            };
             return json!({
                 "content": [{ "type": "text", "text": msg_txt }],
                 "structuredContent": blocked,
@@ -681,6 +836,14 @@ impl McpDaemon {
         }
 
         let cid = target.as_ref().map(|t| t.id.clone()).unwrap_or_default();
+        let workspace = target
+            .as_ref()
+            .map(|t| t.workspace.clone())
+            .unwrap_or_default();
+        let workspaces = target
+            .as_ref()
+            .map(|t| t.workspaces.clone())
+            .unwrap_or_default();
         let title = target.as_ref().map(|t| t.title.clone()).unwrap_or_default();
         let turns_count = target.as_ref().map(|t| t.turns).unwrap_or(0);
         let ckpt_count = target.as_ref().map(|t| t.checkpoint_count).unwrap_or(0);
@@ -691,16 +854,19 @@ impl McpDaemon {
         let resume_task = str_arg(args, "resume_task");
         let auto_fire = bool_arg(args, "auto_fire", true);
 
-        let grant = self.grants.create_grant(
+        let grant = self.grants.create_grant_scoped(
             &preserve,
             &resume_task,
             auto_fire,
             &cid,
+            &workspace,
+            &workspaces,
             turns_count,
             ckpt_count,
             kind,
             &scratch_path,
             &title,
+            lang,
         );
         self.on_grants_mutated();
         let settings = self.grants.get_settings();
@@ -710,7 +876,9 @@ impl McpDaemon {
             "mode": "handoff_card",
             "kind": kind,
             "blocked": false,
+            "lang": lang.as_str(),
             "conversation_id": cid,
+            "workspace": grant.workspace,
             "title": title,
             "grant_id": grant.grant_id,
             "auto_fire": grant.auto_fire,
@@ -724,14 +892,27 @@ impl McpDaemon {
             "handoff_conversation_id": ""
         });
 
-        let auto_line = if allow_auto && grant.auto_fire {
-            "当前面板「自主接力新会话（官方 target:new）」已开启且满足 running_subagent_count == 0：前端将自动核销单次票据并调用官方 _meta: {\"com.google.antigravity/message\": {\"target\": \"new\"}} 拉起接力新会话并记录新 conversationId。"
+        let guide = if zh {
+            let auto_line = if allow_auto && grant.auto_fire {
+                "面板「自动接力」已开启且 running_subagent_count == 0：当本工具内联卡片或同工作区 Context Radar 侧边栏处于可见挂载状态时，前端会自动核销票据并通过官方 target:new 拉起新会话；若当前在无界面的 agy CLI、折叠卡片或后台标签页中运行，请展开卡片/侧边栏点击拉起，或直接复制下方 `/compact` 指令。"
+            } else {
+                "本次未启用自动拉起（auto_fire=false 或面板开关已关闭）：已保留当前会话窗口，可在卡片或侧边栏复制 `/compact` 指令，或手动点击拉起新会话。"
+            };
+            format!(
+                "已通过模型档位、冷却、回本轮数与 running_subagent_count == 0 校验，票据已绑定至当前会话与工作区。\n- `/compact` 指令：`{}`\n- 官方接力说明：{auto_line}",
+                grant.compact_command
+            )
         } else {
-            "本次未启用自动拉起新会话（auto_fire=false 或面板开关已手动关闭）：已保留当前会话窗口，可在卡片或侧边栏一键复制 /compact 原地压缩，或手动点击「拉起接力新会话」。"
+            let auto_line = if allow_auto && grant.auto_fire {
+                "Auto-handoff is enabled and running_subagent_count == 0: when the inline handoff card or a matching-workspace Context Radar side pane is mounted and visible, the webview will claim this single-use grant and launch a background chat via official `target:new`. Note: in headless `agy` CLI, collapsed tool cards, or hidden tabs, `target:new` waits until a UI pane opens—expand the card/pane or paste the `/compact` command below."
+            } else {
+                "Auto-launch is off for this grant (`auto_fire=false` or paused in panel): the current window stays active; copy the `/compact` command or click 'Launch New Chat' in the panel when ready."
+            };
+            format!(
+                "Passed all model-tier, cooldown, break-even, and running_subagent_count == 0 gates (grant scoped to this conversation and workspace).\n- Ready `/compact` command: `{}`\n- Relay status: {auto_line}",
+                grant.compact_command
+            )
         };
-        let guide = format!(
-            "已通过模型×强度、冷却、经济回本及 running_subagent_count == 0 全部硬拦截校验。\n- 原地压缩说明：Antigravity 同会话原地 /compact 仅支持用户在输入框首词手动提交；本工具已在内联卡片与侧边栏监控面板中准备好一键复制的完整 `/compact` 指令（含保留要点与续跑指令）。\n- 官方接力状态：{auto_line}"
-        );
         json!({
             "content": [{ "type": "text", "text": guide }],
             "structuredContent": card,
@@ -810,9 +991,8 @@ impl McpDaemon {
             "context_radar_overview" => {
                 let act = str_arg_or(args, "action", "snapshot");
                 match act.as_str() {
-                    "set_prefs" | "record_relay" | "dismiss_grant" | "claim_grant" => {
-                        Ok(self.handle_ui_action(&act, args))
-                    }
+                    "set_prefs" | "record_relay" | "dismiss_grant" | "claim_grant"
+                    | "distill_slice" | "create_handoff" => Ok(self.handle_ui_action(&act, args)),
                     "turns" => Ok(self.handle_turns_tool(args)),
                     _ => {
                         let t0 = Instant::now();
@@ -820,6 +1000,7 @@ impl McpDaemon {
                         let include_archived = bool_arg(args, "include_archived", false);
                         let limit = u64_arg(args, "limit", 25) as usize;
                         let ws_filter = str_arg(args, "workspace_filter");
+                        let cid_scope = str_arg(args, "conversation_id");
                         let fresh = bool_arg(args, "fresh", false);
                         let if_digest = {
                             let d = str_arg(args, "if_digest");
@@ -832,9 +1013,9 @@ impl McpDaemon {
                         let is_default_query = !show_history
                             && !include_archived
                             && limit == 25
-                            && ws_filter.is_empty();
+                            && ws_filter.is_empty()
+                            && cid_scope.is_empty();
 
-                        // Burst-coalescing fresh hit (<500ms) for initial entrypoint open (empty args / no if_digest).
                         if is_default_query && if_digest.is_empty() && !fresh {
                             if let Some(mut snap) = self.get_fresh_default_snapshot() {
                                 snap.server_ms = t0.elapsed().as_millis() as u64;
@@ -847,10 +1028,11 @@ impl McpDaemon {
                             }
                         }
 
-                        // If SWR background refresh just completed with a newer digest than if_digest, serve immediately.
                         if is_default_query && !if_digest.is_empty() && !fresh {
+                            let cur_lang = self.engine.rates.get_lang().as_str();
                             if let Some(cached) = self.swr.get_cached() {
                                 if cached.grants_rev == self.swr.grants_rev()
+                                    && cached.snap.lang == cur_lang
                                     && cached.snap.digest != if_digest
                                     && cached.built_at.elapsed() < SWR_STALE_TTL
                                 {
@@ -874,7 +1056,17 @@ impl McpDaemon {
                             &ws_filter,
                             None,
                         );
-                        self.attach_grant_and_rehash(&mut snap);
+                        let cid_opt = if cid_scope.is_empty() {
+                            None
+                        } else {
+                            Some(cid_scope.as_str())
+                        };
+                        let ws_opt = if ws_filter.is_empty() {
+                            None
+                        } else {
+                            Some(ws_filter.as_str())
+                        };
+                        self.attach_grant_and_rehash(&mut snap, cid_opt, ws_opt);
 
                         if is_default_query {
                             let rev = self.swr.grants_rev();
@@ -905,6 +1097,8 @@ impl McpDaemon {
             }
             "context_radar_turns" => Ok(self.handle_turns_tool(args)),
             "context_radar_hotspots" => {
+                let lang = self.engine.rates.get_lang();
+                let zh = lang.is_zh();
                 let cid_arg = str_arg(args, "conversation_id");
                 let target = self.engine.resolve_session_fast(&cid_arg, None);
                 let cid = target
@@ -914,7 +1108,7 @@ impl McpDaemon {
                     .unwrap_or(cid_arg);
                 if cid.is_empty() {
                     return Ok(json!({
-                        "content": [{ "type": "text", "text": "未找到目标会话" }],
+                        "content": [{ "type": "text", "text": if zh { "未找到目标会话" } else { "Target session not found" } }],
                         "isError": true
                     }));
                 }
@@ -925,7 +1119,7 @@ impl McpDaemon {
                 let save_note = bool_arg(args, "save_note", false);
                 let top_k = u64_arg(args, "top_k", 8) as usize;
                 let root = self.engine.ledger.data_root.clone();
-                let res = distill_slice(
+                let res = distill_slice_with_lang(
                     &root,
                     &cid,
                     &turns,
@@ -935,10 +1129,11 @@ impl McpDaemon {
                     save_note,
                     top_k,
                     &mut self.engine.ledger.journal_cache,
+                    lang,
                 );
                 if !res.found {
                     return Ok(json!({
-                        "content": [{ "type": "text", "text": res.error.clone().unwrap_or_else(|| "提炼失败".into()) }],
+                        "content": [{ "type": "text", "text": res.error.clone().unwrap_or_else(|| if zh { "提炼失败".into() } else { "Distillation failed".into() }) }],
                         "structuredContent": res,
                         "isError": true
                     }));
@@ -952,35 +1147,73 @@ impl McpDaemon {
                         .unwrap_or(&[])
                         .iter()
                         .map(|h| {
-                            format!(
-                                "  · 轮 #{} (step {}): +{} → {} | {}",
-                                h.turn,
-                                h.step_idx,
-                                fmt_k(h.delta_tokens),
-                                fmt_k(h.context_after),
-                                h.cause
-                            )
+                            if zh {
+                                format!(
+                                    "  · 轮 #{} (step {}，归因步 {}–{}): +{} → {} | {}",
+                                    h.turn,
+                                    h.step_idx,
+                                    h.cause_step_range[0],
+                                    h.cause_step_range[1],
+                                    fmt_k(h.delta_tokens),
+                                    fmt_k(h.context_after),
+                                    h.cause
+                                )
+                            } else {
+                                format!(
+                                    "  · Turn #{} (step {}, caused by steps {}–{}): +{} → {} | {}",
+                                    h.turn,
+                                    h.step_idx,
+                                    h.cause_step_range[0],
+                                    h.cause_step_range[1],
+                                    fmt_k(h.delta_tokens),
+                                    fmt_k(h.context_after),
+                                    h.cause
+                                )
+                            }
                         })
                         .collect();
-                    format!(
-                        "会话 {cid} 上下文膨胀热点（活跃步 {}–{}，建议局部提炼区间 start_step={}, end_step={}）：\n{}",
-                        active_rng[0],
-                        active_rng[1],
-                        rec_rng[0],
-                        rec_rng[1],
-                        if rows.is_empty() {
-                            "  · 当前检查点后尚无明显单步膨胀".to_string()
-                        } else {
-                            rows.join("\n")
-                        }
-                    )
+                    if zh {
+                        format!(
+                            "会话 {cid} 上下文膨胀热点（活跃步 {}–{}，建议旁路提炼区间 start_step={}, end_step={}）：\n{}",
+                            active_rng[0],
+                            active_rng[1],
+                            rec_rng[0],
+                            rec_rng[1],
+                            if rows.is_empty() {
+                                "  · 当前检查点后尚无明显单步膨胀".to_string()
+                            } else {
+                                rows.join("\n")
+                            }
+                        )
+                    } else {
+                        format!(
+                            "Context bloat hotspots for {cid} (active steps {}–{}, recommended slice start_step={}, end_step={}):\n{}",
+                            active_rng[0],
+                            active_rng[1],
+                            rec_rng[0],
+                            rec_rng[1],
+                            if rows.is_empty() {
+                                "  · No significant single-turn spikes since last checkpoint".to_string()
+                            } else {
+                                rows.join("\n")
+                            }
+                        )
+                    }
                 } else {
                     let mut s = res.digest.clone().unwrap_or_default();
                     if let Some(p) = res.saved_note_path.as_deref().filter(|x| !x.is_empty()) {
-                        s.push_str(&format!("\n- 已存备忘：{p}"));
+                        if zh {
+                            s.push_str(&format!("\n- 已存备忘：{p}"));
+                        } else {
+                            s.push_str(&format!("\n- Saved note: {p}"));
+                        }
                     }
                     if let Some(h) = res.handoff_hint.as_deref().filter(|x| !x.is_empty()) {
-                        s.push_str(&format!("\n- 复用建议：{h}"));
+                        if zh {
+                            s.push_str(&format!("\n- 复用建议：{h}"));
+                        } else {
+                            s.push_str(&format!("\n- Next step: {h}"));
+                        }
                     }
                     s
                 };
@@ -1008,34 +1241,83 @@ impl McpDaemon {
                         "isError": false
                     }));
                 }
+                let zh = plan.lang == "zh-CN";
                 let prof = plan.profile.as_ref().unwrap();
                 let rcp = plan.partial_compaction_recipes.as_ref().unwrap();
                 let sym = if plan.currency_symbol.is_empty() {
-                    "¥"
+                    if zh { "¥" } else { "$" }
                 } else {
                     plan.currency_symbol.as_str()
                 };
-                let txt = format!(
-                    "{}\n- 会话：{} ({}) | {} | 档位：{}\n- 上下文：{} / {}（硬下限 {} · 推荐 {} · 紧急 {}）\n- 经济回本：冷缓存+摘要约 {}{:.2}，后续每轮省 {}{:.3}，需 >= {} 轮回本。\n- 历史局部提纯：{}\n- 后续分叉折叠：{}\n- 官方接力新会话：{}",
-                    plan.headline,
-                    plan.title,
-                    plan.conversation_id,
-                    plan.model_display,
-                    prof.label,
-                    fmt_k(plan.current_context_tokens),
-                    fmt_k(plan.context_limit),
-                    fmt_k(prof.min_ctx),
-                    fmt_k(prof.recommend_ctx),
-                    fmt_k(prof.urgent_ctx),
-                    sym,
+                let ovh = select_display_cost(
+                    plan.compact_overhead_usd,
                     plan.compact_overhead_cny,
-                    sym,
-                    plan.per_turn_saving_cny,
-                    plan.break_even_turns,
-                    rcp.past_slice_distill,
-                    rcp.future_branch_fold,
-                    rcp.official_handoff_new
+                    &plan.currency_code,
                 );
+                let sav = select_display_cost(
+                    plan.per_turn_saving_usd,
+                    plan.per_turn_saving_cny,
+                    &plan.currency_code,
+                );
+                let econ_line = if plan.pricing_known {
+                    if zh {
+                        format!(
+                            "冷缓存+摘要约 {sym}{ovh:.2}，后续每轮省 {sym}{sav:.3}，需 >= {} 轮回本。",
+                            plan.break_even_turns
+                        )
+                    } else {
+                        format!(
+                            "compaction + rebuild ~{sym}{ovh:.2}, saves ~{sym}{sav:.3}/turn, break-even >= {} turns.",
+                            plan.break_even_turns
+                        )
+                    }
+                } else if zh {
+                    format!(
+                        "模型单价未配置，按 KV 缓存物理模型估算需 >= {} 轮回本。",
+                        plan.break_even_turns
+                    )
+                } else {
+                    format!(
+                        "unpriced model; token-physics break-even >= {} turns.",
+                        plan.break_even_turns
+                    )
+                };
+
+                let txt = if zh {
+                    format!(
+                        "{}\n- 会话：{} ({}) | {} | 档位：{}\n- 上下文：{} / {}（下限 {} · 推荐 {} · 紧急 {}）\n- 回本估算：{econ_line}\n- 切片摘要：{}\n- 分支隔离：{}\n- 接力新会话：{}",
+                        plan.headline,
+                        plan.title,
+                        plan.conversation_id,
+                        plan.model_display,
+                        prof.label,
+                        fmt_k(plan.current_context_tokens),
+                        fmt_k(plan.context_limit),
+                        fmt_k(prof.min_ctx),
+                        fmt_k(prof.recommend_ctx),
+                        fmt_k(prof.urgent_ctx),
+                        rcp.past_slice_distill,
+                        rcp.future_branch_fold,
+                        rcp.official_handoff_new
+                    )
+                } else {
+                    format!(
+                        "{}\n- Session: {} ({}) | {} | Tier: {}\n- Context: {} / {} (floor {} · target {} · urgent {})\n- Break-even: {econ_line}\n- Slice notes: {}\n- Branch isolation: {}\n- Session handoff: {}",
+                        plan.headline,
+                        plan.title,
+                        plan.conversation_id,
+                        plan.model_display,
+                        prof.label,
+                        fmt_k(plan.current_context_tokens),
+                        fmt_k(plan.context_limit),
+                        fmt_k(prof.min_ctx),
+                        fmt_k(prof.recommend_ctx),
+                        fmt_k(prof.urgent_ctx),
+                        rcp.past_slice_distill,
+                        rcp.future_branch_fold,
+                        rcp.official_handoff_new
+                    )
+                };
                 Ok(json!({
                     "content": [{ "type": "text", "text": txt }],
                     "structuredContent": plan,
@@ -1048,20 +1330,25 @@ impl McpDaemon {
                     return Ok(self.claim_with_live_check(
                         &str_arg(args, "grant_id"),
                         &str_arg(args, "conversation_id"),
+                        &str_arg(args, "workspace"),
                         &str_arg_or(args, "claim_mode", "manual"),
                     ));
                 }
                 let kind = str_arg_or(args, "kind", "handoff");
                 Ok(self.prepare_commit_handoff(args, &kind))
             }
-            _ => Ok(json!({
-                "content": [{ "type": "text", "text": format!("未知工具：{name}") }],
-                "isError": true
-            })),
+            _ => {
+                let zh = self.engine.rates.get_lang().is_zh();
+                Ok(json!({
+                    "content": [{ "type": "text", "text": if zh { format!("未知工具：{name}") } else { format!("Unknown tool: {name}") } }],
+                    "isError": true
+                }))
+            }
         }
     }
 
     fn handle_turns_tool(&mut self, args: &Map<String, Value>) -> Value {
+        let zh = self.engine.rates.get_lang().is_zh();
         let cid = str_arg(args, "conversation_id");
         let limit = u64_arg(args, "limit", 30) as usize;
         let detail = self.engine.get_session_turns(&cid, limit);
@@ -1073,7 +1360,11 @@ impl McpDaemon {
             });
         }
         let short: String = detail.conversation_id.chars().take(8).collect();
-        let text = format!("会话 {short} 最近 {} 轮明细", detail.turns.len());
+        let text = if zh {
+            format!("会话 {short} 最近 {} 轮明细", detail.turns.len())
+        } else {
+            format!("Last {} turn(s) for session {short}", detail.turns.len())
+        };
         json!({
             "content": [{ "type": "text", "text": text }],
             "structuredContent": detail,
@@ -1094,7 +1385,7 @@ impl McpDaemon {
                 Some(s) => s,
                 None => {
                     let mut s = self.engine.build_overview_snapshot(25, false, false, "", None);
-                    self.attach_grant_and_rehash(&mut s);
+                    self.attach_grant_and_rehash(&mut s, None, None);
                     s.stale = false;
                     let rev = self.swr.grants_rev();
                     self.swr.put_cached(s.clone(), rev);
@@ -1130,7 +1421,8 @@ impl McpDaemon {
                 .swr
                 .load_html(&panel_path)
                 .map_err(|e| (-32603, e))?;
-            inject_boot_html(&template, &json!({ "view": "handoff" }))
+            let lang = self.engine.rates.get_lang().as_str();
+            inject_boot_html(&template, &json!({ "view": "handoff", "lang": lang }))
         };
 
         Ok(json!({
@@ -1190,14 +1482,11 @@ fn rpc_err(id: &Value, code: i64, message: &str) -> Value {
     })
 }
 
-/// Run line-delimited JSON-RPC 2.0 MCP daemon over stdio with immediate background pre-warm + SWR.
 pub fn run_stdio_daemon(
     panel_override: Option<PathBuf>,
     plugin_data_dir: Option<PathBuf>,
 ) -> io::Result<()> {
     let mut daemon = McpDaemon::new_with_plugin_data(None, None, plugin_data_dir, panel_override);
-    // Start immediate background pre-warm (HTML + read-only SQLite summary & sessions snapshot + SSR cache)
-    // without blocking stdin JSON-RPC handshake.
     daemon.start_prewarm();
 
     let stdin = io::stdin();
@@ -1237,7 +1526,6 @@ pub fn run_stdio_daemon(
     Ok(())
 }
 
-/// Helper for unit/integration tests to verify panel HTML path resolution.
 pub fn panel_path_exists(p: &Path) -> bool {
     p.is_file()
 }
