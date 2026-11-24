@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.2.0...v1.3.0) (2026-11-24)
+
+
+### Features
+
+* add 4-state live execution telemetry, thinking/response split, and loop rollup ([#16](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/16)) ([a8a94e4](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/a8a94e452122561ddb370d920c3113ba03ca4adb))
+
+
+### Bug Fixes
+
+* **docs:** serve release badge from first-party assets/release-badge.svg ([#14](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/14)) ([5697555](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/569755529e90a9a25aac6f8916e155af3c6504d1))
+
 ## [1.2.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.1.0...v1.2.0) (2026-11-24)
 
 
