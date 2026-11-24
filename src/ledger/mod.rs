@@ -147,15 +147,19 @@ impl TurnSample {
         if self.output_tokens == 0 || self.total_ms == 0 {
             return 0.0;
         }
-        let gen_ms = if self.total_ms > self.ttft_ms {
-            self.total_ms - self.ttft_ms
-        } else {
-            self.total_ms
-        };
-        if gen_ms == 0 {
-            return 0.0;
+        if self.total_ms > self.ttft_ms && self.ttft_ms > 0 {
+            let gen_ms = self.total_ms - self.ttft_ms;
+            if self.thinking_tokens > 0 {
+                if self.response_tokens > 0 {
+                    // Antigravity ttft_ms spans prefill + thinking; only response_tokens stream post-TTFT.
+                    return (self.response_tokens as f64) / ((gen_ms as f64) / 1000.0);
+                }
+                // Pure thinking turn (0 response_tokens): fall back to E2E throughput.
+                return (self.output_tokens as f64) / ((self.total_ms as f64) / 1000.0);
+            }
+            return (self.output_tokens as f64) / ((gen_ms as f64) / 1000.0);
         }
-        (self.output_tokens as f64) / ((gen_ms as f64) / 1000.0)
+        (self.output_tokens as f64) / ((self.total_ms as f64) / 1000.0)
     }
 
     #[inline]

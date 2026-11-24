@@ -602,7 +602,7 @@ test("rich live telemetry: 4-state dots, phase badges, headroom, thinking/loop r
   assert.ok(sliceA && sliceB && sliceC, "view.js telemetry slices must exist");
 
   let curLang = "en";
-  const uLs = new MockEl("div"), uHd = new MockEl("span"), uHt = new MockEl("span"), uHi = new MockEl("button"),
+  const uLs = new MockEl("div"), uHSub = new MockEl("div"), uHd = new MockEl("span"), uHf = new MockEl("span"), uHt = new MockEl("span"), uHi = new MockEl("button"),
     uHm = new MockEl("span"), uHp = new MockEl("span"), uHs = new MockEl("span"), uHv = new MockEl("span"),
     he = new MockEl("section");
   const sandbox = {
@@ -614,7 +614,7 @@ test("rich live telemetry: 4-state dots, phase badges, headroom, thinking/loop r
     fc: (e) => e.firstElementChild, lc: (e) => e.lastElementChild, ch: (e) => e.children,
     lang: "en", copiedId: null, confirmSendId: null, openRowId: null, loadingKey: "", subTrayRev: 0,
     allowAutoHandoff: true, canMessage: false, ownerCid: "",
-    openTrays: new Map(), cTurns: new Map(), cHot: new Map(), cDist: new Map(), cAdv: new Map(), rowNodes: new Map(),
+    openTrays: new Map(), cTurns: new Map(), cHot: new Map(), cDist: new Map(), cAdv: new Map(), rowNodes: new Map(), heroSubNodes: new Map(),
     snapshot: { daemon_workspace: "/ws", thresholds: { max: 512e3 }, summary: { running_main_count: 1 }, sessions: [] },
     normWs: (r) => String(r || "").trim(),
     sameWs: () => true,
@@ -626,7 +626,7 @@ test("rich live telemetry: 4-state dots, phase badges, headroom, thinking/loop r
     getVerdict: () => ({ cls: "ok", text: "" }),
     coldKind: () => "New turn",
     COLD_CLS: { mid_loop_cold: "mid", post_compact_cold: "post" },
-    uLs, uHd, uHt, uHi, uHm, uHp, uHs, uHv, ui: { he },
+    uLs, uHSub, uHd, uHf, uHt, uHi, uHm, uHp, uHs, uHv, ui: { he },
     setLang: (l) => { sandbox.lang = l; curLang = l; },
   };
   const code = `${sliceA}\n${sliceB}\n${sliceC}\nthis.getLiveDot=getLiveDot;this.getLivePhaseBadge=getLivePhaseBadge;this.mountDetailBlock=mountDetailBlock;this.patchDetailBlock=patchDetailBlock;this.patchHeroSlot=patchHeroSlot;this.patchSessionList=patchSessionList;this.renderSubTray=renderSubTray;`;
@@ -710,7 +710,7 @@ test("rich live telemetry: 4-state dots, phase badges, headroom, thinking/loop r
   assert.equal(rPhase.textContent, "异常");
   const rowD = rec[4];
   assert.equal(rowD[4].textContent, "100.0k / 512.0k (19.5%) · 余 412.0k");
-  assert.equal(rowD[13].textContent, "输出 1.0k（思考 68%） · 本轮 6 步 · 4.8k · ¥3.02");
+  assert.equal(rowD[13].textContent, "输出 1.0k (思考 68%) · 本轮 6 步 · 4.8k · ¥3.02");
   assert.equal(rowD[14].hidden, false);
   assert.equal(rowD[14].className, "er wr");
   assert.equal(rowD[14].textContent, '<script>alert("xss")</script> Upstream 429', "live_error must be assigned via textContent, never HTML-parsed");
@@ -770,4 +770,148 @@ test("rich live telemetry: 4-state dots, phase badges, headroom, thinking/loop r
     mid_loop_breakdown: { slow_turn_self_expiry: 1, replica_spillover: 1, model_switch_cold: 1 },
   });
   assert.deepEqual({ t: parsedCold.t, m: parsedCold.m, p: parsedCold.p, s: parsedCold.s, r: parsedCold.r, w: parsedCold.w }, { t: 1, m: 3, p: 0, s: 1, r: 1, w: 1 });
+});
+
+test("hero card docks its own subagents inside .hr, styles subagent badge & .dl flex gap, and separates tabs cleanly", () => {
+  const cssSrc = fs.readFileSync(THEME_CSS, "utf8");
+  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
+
+  // 1. .dl flex-column layout regression (never drift back to orphaned .dtl)
+  assert.ok(/\.dl\b[^{]*\{display:flex;flex-direction:column\}/.test(cssSrc), ".dl must have display:flex;flex-direction:column so gap:7px applies");
+  assert.equal(cssSrc.includes(".dtl"), false, "orphaned .dtl selector must not exist");
+  assert.ok(cssSrc.includes(".hs{"), "theme.css must style hero docked subagents .hs");
+
+  // 2. Full render() test with realistic multi-session + pinned + hero-with-subagent fixture
+  class El {
+    constructor(tag = "div") {
+      this.tag = tag; this.className = ""; this.hidden = false; this.textContent = "";
+      this.title = ""; this.style = {}; this.dataset = {}; this.attrs = {}; this.children = [];
+      this.classList = { toggle: (c, on) => {
+        const s = new Set(this.className.split(/\s+/).filter(Boolean));
+        on ? s.add(c) : s.delete(c); this.className = [...s].join(" ");
+      }};
+    }
+    get firstElementChild() { return this.children[0] || null; }
+    get lastElementChild() { return this.children[this.children.length - 1] || null; }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    appendChild(c) { c.parent = this; this.children.push(c); return c; }
+    insertBefore(el, ref) {
+      el.parent = this;
+      const i = this.children.indexOf(el); if (i >= 0) this.children.splice(i, 1);
+      const r = ref ? this.children.indexOf(ref) : -1;
+      r >= 0 ? this.children.splice(r, 0, el) : this.children.push(el);
+    }
+    remove() { if (this.parent) { const i = this.parent.children.indexOf(this); if (i >= 0) this.parent.children.splice(i, 1); this.parent = null; } }
+    set innerHTML(html) {
+      this._rawHtml = String(html); this.children = [];
+      const stack = [this];
+      const tok = /<\/([a-z0-9]+)>|<([a-z0-9]+)([^>]*)>|([^<]+)/gi;
+      let m;
+      while ((m = tok.exec(this._rawHtml))) {
+        if (m[1]) { if (stack.length > 1) stack.pop(); }
+        else if (m[2]) {
+          const el = new El(m[2].toLowerCase()), attrStr = m[3] || "";
+          const cm = attrStr.match(/\bclass="([^"]*)"/i); if (cm) el.className = cm[1];
+          const am = attrStr.match(/\bdata-a="([^"]*)"/i); if (am) el.dataset.a = am[1];
+          const im = attrStr.match(/\bdata-i="([^"]*)"/i); if (im) el.dataset.i = im[1];
+          if (/\bhidden\b/i.test(attrStr)) el.hidden = true;
+          stack[stack.length - 1].children.push(el);
+          if (!/\/$/.test(attrStr)) stack.push(el);
+        } else if (m[4] && stack.length > 1) {
+          stack[stack.length - 1].textContent += m[4];
+        }
+      }
+    }
+    get innerHTML() { return this._rawHtml || ""; }
+  }
+
+  const root = new El("div");
+  const slice = viewSrc.slice(viewSrc.indexOf("const BRAND_SVG ="), viewSrc.indexOf("const flashMicro ="));
+  const sandbox = {
+    D: { getElementById: (id) => (id === "root" ? root : null), createElement: (t) => new El(t), documentElement: new El("html") },
+    DE: new El("html"), M: Math, S: String, now: () => 10_000_000,
+    boot: { mode: "snapshot", lang: "zh-CN" },
+    setTimeout: () => 1, clearTimeout: () => {},
+    st: () => 1, ct: () => {},
+    fc: (e) => e.firstElementChild, lc: (e) => e.lastElementChild, ch: (e) => e.children,
+    bridge: {}, navigator: { language: "zh-CN" },
+    localStorage: { getItem: () => "zh-CN", setItem: () => {} },
+    console,
+  };
+  vm.runInNewContext(
+    `${slice}\nthis.render=render;this.setTab=(t)=>{filterTab=t;};this.setSnap=(s)=>{snapshot=s;};this.setOpen=(id)=>{openRowId=id;};this.getState=()=>({uHf,uHm,uHs,uHSub,uLs,uTa,uTs,uTr,ui,rowNodes,heroSubNodes});`,
+    sandbox
+  );
+
+  const mkSess = (id, title, extra = {}) => ({
+    id, title, level: "ok", is_active: false, pinned: false, archived: false,
+    latest_context_tokens: 50000, context_limit: 512000, context_pct: 9.8,
+    cache_hit_rate: 95, median_stream_tps: 120, latest_stream_tps: 999, e2e_tps: 60,
+    cost_usd: 1.0, cost_cny: 7.2, turns: 10, subagents: [], ...extra,
+  });
+
+  const subHero = mkSess("sub-hero", "release-pool-v0264", { is_active: true, is_subagent: true, latest_context_tokens: 166600 });
+  const subHeroOld = mkSess("sub-hero-old", "old-worker", { is_active: false, is_subagent: true, latest_context_tokens: 40000 });
+  const subOther = mkSess("sub-other", "glm-rollout-wave1", { is_active: true, is_subagent: true, latest_context_tokens: 293600 });
+
+  sandbox.setSnap({
+    mode: "snapshot",
+    generated_at: "2026-11-24T18:15:27Z",
+    summary: { shown_main_count: 4, running_main_count: 2, shown_subagent_count: 2, history_subagents_hidden_count: 8, archived_hidden_count: 12 },
+    sessions: [
+      mkSess("p1", "T7 Disk", { pinned: true }),
+      mkSess("p2", "Shared Memory", { pinned: true }),
+      mkSess("hero", "Swarm & Sub", { is_active: true, model_short: "Gemini 4 Neon XH", running_subagent_count: 1, subagents: [subHero, subHeroOld] }),
+      mkSess("m2", "AI Interaction Review", { is_active: true, running_subagent_count: 1, subagents: [subOther] }),
+    ],
+    orphan_subagents: [],
+  });
+
+  // Active tab: Hero docks its own active subagent INSIDE .hr; Shared Memory does NOT inherit it!
+  sandbox.render();
+  const st = sandbox.getState();
+  assert.equal(st.ui.he.hidden, false);
+  assert.equal(st.uHf.textContent, "当前焦点");
+  assert.equal(st.uHm.className, "bd muted");
+  assert.equal(st.uHs.hidden, false);
+  assert.equal(st.uHs.className, "bd info", "hero subagent count badge must have styled pill class");
+  assert.equal(st.uHs.textContent, "1 个子代理");
+  assert.equal(st.uHSub.hidden, false, "hero docked subagents strip must be visible");
+  assert.deepEqual(st.uHSub.children.map((e) => e.dataset.i), ["sub-hero"], "only hero's active subagent docks in .hr");
+  assert.deepEqual(st.uLs.children.map((e) => e.dataset.i), ["p1", "p2", "m2", "sub-other"], "hero's subagent MUST NOT leak under Shared Memory in uLs");
+  assert.equal(st.uTa.textContent, "会话 (4)");
+  assert.equal(st.uTs.textContent, "子代理 (10)");
+  assert.equal(st.uTr.textContent, "归档 (12)");
+
+  // Expanding a docked hero subagent opens its detail tray inside uHSub
+  sandbox.setOpen("sub-hero");
+  sandbox.render();
+  const heroSubRec = st.heroSubNodes.get("sub-hero");
+  assert.equal(heroSubRec[3].hidden, false, "clicking docked hero subagent must open its detail tray");
+  assert.ok(heroSubRec[4][6][2].children[1].textContent.includes("120/60 t/s"), "KPI must prefer steady median_stream_tps over spiky latest_stream_tps");
+
+  // Subagents tab: hides Hero, shows only parents that have subagents + active & historical subagents under true parents
+  sandbox.setTab("subs");
+  sandbox.render();
+  assert.equal(st.ui.he.hidden, true, "hero hides on Subagents tab");
+  assert.deepEqual(st.uLs.children.map((e) => e.dataset.i), ["hero", "sub-hero", "sub-hero-old", "m2", "sub-other"]);
+
+  // Archived tab: hides Hero, shows only archived sessions, preserves tab counts
+  sandbox.setSnap({
+    mode: "snapshot",
+    generated_at: "2026-11-24T18:15:27Z",
+    summary: { shown_main_count: 5, running_main_count: 1, shown_subagent_count: 0, history_subagents_hidden_count: 0, archived_hidden_count: 0 },
+    sessions: [
+      mkSess("p1", "T7 Disk", { pinned: true }),
+      mkSess("arch1", "Old Task", { archived: true }),
+      mkSess("arch2", "Old Task 2", { archived: true }),
+    ],
+    orphan_subagents: [],
+  });
+  sandbox.setTab("archived");
+  sandbox.render();
+  assert.equal(st.ui.he.hidden, true, "hero hides on Archived tab");
+  assert.deepEqual(st.uLs.children.map((e) => e.dataset.i), ["arch1", "arch2"]);
+  assert.equal(st.uTa.textContent, "会话 (1)");
+  assert.equal(st.uTr.textContent, "归档 (2)");
 });
