@@ -25,8 +25,8 @@ Context Radar 在 Antigravity 里提供了一个实时面板，把上下文占�
 
 ## 它能帮你做什么
 
-- **实时看清上下文和消耗**：在侧边栏直观查看当前会话和子 Agent 的上下文占比、缓存命中率、输出速度和估算费用；采用前台 1s / 后台 2s 自适应 `if_digest` 轮询（15s 超时防卡死）与按会话 WAL 变更感知，并在保活侧边栏/全局面板重新显现时通过 `ResizeObserver`、`IntersectionObserver`、`onhostcontextchanged` 与被动 `pointerenter` 立即触发刷新，避免界面停滞。
-- **定位变慢的原因**：自动区分"新的一轮正常未命中""对话中途意外断缓存"和"压缩后的首次重建"，一眼知道慢在哪。
+- **实时四态遥测、剩余余量与消耗面板**：通过 O(log N) 索引只读 SQLite 探测实时展示主会话与子 Agent 的四态运行/压缩指示（`ready` 就绪 / `running` 运行中 [LLM·工具·压缩中] / `waiting` 等待 / `error` 异常）、上下文剩余余量（`余 Xk`）、思考与正文输出占比（`思考 %`）、流式 + 端到端速度（Stream / E2E tok/s）、本轮多步循环汇总及估算费用；采用前台 1s / 后台 2s 自适应 `if_digest` 轮询（15s 超时防卡死）与按会话 WAL 变更感知，并在保活侧边栏/全局面板重新显现时通过 `ResizeObserver`、`IntersectionObserver`、`onhostcontextchanged` 与被动 `pointerenter` 立即触发刷新，避免界面停滞。
+- **定位变慢原因与跨模型压缩提示**：自动区分"新的一轮正常未命中""对话中途意外断缓存"和"压缩后的首次重建"，自动识别跨模型 `/compact` 并给出静默内联提示，同时展示检查点摘要体积（`KB`），一眼知道慢在哪。
 - **找出撑大上下文的罪魁祸首**：快速定位哪几轮历史最占空间，让 Agent 把早期冗长记录浓缩成简短摘要存到 `scratch/`，不用带着一堆旧日志继续跑。
 - **判断 `/compact` 或换新对话划不划算**：结合当前模型预算和回本轮数给出建议；严格遵循官方协议——在 Antigravity App 可见挂载卡片或归属侧边栏中通过 SEP-1865 `ui/message` 触发受保护的 `/compact` 或 `target:new` 新会话交接（失败自动复制 `/compact` 兜底），在 `agy CLI` 与 ACP 编辑器中则通过 `acp-proxy` / `acp-run` 全自动原地执行官方 `/compact`。
 - **顺手的小保护**：防止 Agent 把几秒钟就能跑完的命令过早丢到后台；如果你在配置里指定了工作区状态文件，也能在开新会话时自动带入。
@@ -65,8 +65,8 @@ CONTEXT_RADAR_VERSION=v1.0.0 ANTIGRAVITY_PLUGINS_DIR=~/.gemini/config/plugins \
 
 | 工具 | 作用 |
 | :--- | :--- |
-| `context_radar_overview` | 打开实时面板，返回当前会话和子 Agent 的概览数据。 |
-| `context_radar_turns` | 按轮次查看 Token 增长、缓存命中、冷启动原因、速度和估算费用。 |
+| `context_radar_overview` | 打开实时面板，返回四态运行/压缩状态、上下文余量、思考占比、流式/端到端速度、本轮循环汇总与子 Agent 概览。 |
+| `context_radar_turns` | 按轮次查看 Token 增长、思考与正文拆分、缓存命中、冷启动原因、流式/端到端速度和估算费用。 |
 | `context_radar_hotspots` | 找出历史里最占空间的片段，并按需整理成摘要写入 `scratch/`。 |
 | `context_radar_prepare_handoff` | 评估现在执行 `/compact` 或开新对话是否划算。 |
 | `context_radar_commit_handoff` | 条件满足后生成 `/compact` 或新对话交接卡片。 |
