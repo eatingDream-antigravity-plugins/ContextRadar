@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.2](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.3.1...v1.3.2) (2026-11-24)
+
+
+### Bug Fixes
+
+* **panel:** dock hero subagents in focus card and fix layout, tabs, and reasoning stream TPS ([#19](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/19)) ([afc596c](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/afc596cf49c82417e24bb349f096fb4fbbd424e6))
+
 ## [1.3.1](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.3.0...v1.3.1) (2026-11-24)
 
 
