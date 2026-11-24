@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.1.0...v1.2.0) (2026-11-24)
+
+
+### Features
+
+* add official ACP v1 auto-compact proxy/runner, zero-lag refresh, and fix MCP tool limit & README badge ([#10](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/10)) ([7ba3935](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/7ba39355ffa012fe61cadf2e56f729ead4ea0a2b))
+
+
+### Bug Fixes
+
+* **docs:** use shields static/v1 query URL so release-please preserves badge color ([#13](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/13)) ([e503a15](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/e503a1512ae44dfc96d527289ae10e25a48544f9))
+* **panel:** render background polls, refresh on pane reveal, and support guarded App compact dispatch ([#12](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/12)) ([22ab508](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/22ab508ab886e02fd48b89e8eb4093a7e655ef3c))
+
 ## [1.1.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.0.0...v1.1.0) (2026-11-24)
 
 
