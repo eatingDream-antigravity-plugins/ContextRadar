@@ -17,7 +17,7 @@ use crate::engine::rates::RateTable;
 use crate::i18n::{carbon_concurrency_warning_text, resolve_active_lang, Lang};
 use crate::ledger::index_db::DbVersionSig;
 use crate::ledger::sqlite_ro::{stat_db_stamp, FileStamp, LedgerReader};
-use crate::ledger::{is_safe_id, SummaryRecord, TurnSample};
+use crate::ledger::{is_safe_id, LiveStepProbe, SummaryRecord, TurnSample};
 use crate::settings::{
     default_data_root_for_plugin_data, default_plugin_data_dir, expand_tilde, SettingsWatcher,
     CONVERSATION_ID_ENV, DEFAULT_CONTEXT_LIMIT, DISABLE_DISK_CACHE_ENV, INDEX_CACHE_PATH_ENV,
@@ -536,6 +536,89 @@ fn median_f64(vals: &mut [f64]) -> f64 {
     }
 }
 
+#[inline]
+pub fn bucket_live_elapsed_sec(raw_sec: u64) -> u64 {
+    if raw_sec < 5 {
+        0
+    } else if raw_sec < 60 {
+        (raw_sec / 5) * 5
+    } else {
+        (raw_sec / 10) * 10
+    }
+}
+
+fn canonical_model_key(model: &str, model_display: &str) -> String {
+    let m = model.trim().to_ascii_lowercase();
+    if !m.is_empty() && m != "unknown" {
+        return m;
+    }
+    let d = model_display.trim().to_ascii_lowercase();
+    if !d.is_empty() && d != "未知模型" && d != "unknown model" {
+        return d;
+    }
+    String::new()
+}
+
+fn compute_live_state(
+    probe: Option<&LiveStepProbe>,
+    is_active: bool,
+    killed: bool,
+    cross_model_compact: bool,
+    now_ts: f64,
+) -> (String, String, u64, String) {
+    if killed {
+        let live_error = probe.map(|p| p.live_error.clone()).unwrap_or_default();
+        let live_status = if !live_error.is_empty() {
+            "error"
+        } else {
+            "ready"
+        };
+        return (live_status.to_string(), String::new(), 0, live_error);
+    }
+
+    let live_phase = probe
+        .map(|p| p.live_phase.clone())
+        .unwrap_or_default();
+    let raw_elapsed = if !live_phase.is_empty() {
+        probe
+            .filter(|p| p.live_started_ts > 0.0)
+            .map(|p| (now_ts - p.live_started_ts).max(0.0) as u64)
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let live_elapsed_sec = bucket_live_elapsed_sec(raw_elapsed);
+
+    let has_newer_active = !live_phase.is_empty()
+        && probe
+            .map(|p| p.live_active_step_idx > p.live_error_step_idx || live_phase == "compacting")
+            .unwrap_or(false);
+    let live_error = if has_newer_active {
+        String::new()
+    } else {
+        probe.map(|p| p.live_error.clone()).unwrap_or_default()
+    };
+
+    let live_status = if !live_error.is_empty() {
+        "error"
+    } else if !live_phase.is_empty()
+        && (live_elapsed_sec >= 45 || (live_phase == "compacting" && cross_model_compact))
+    {
+        "waiting"
+    } else if !live_phase.is_empty() || is_active {
+        "running"
+    } else {
+        "ready"
+    };
+
+    (
+        live_status.to_string(),
+        live_phase,
+        live_elapsed_sec,
+        live_error,
+    )
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionTelemetry {
     pub id: String,
@@ -549,6 +632,11 @@ pub struct SessionTelemetry {
     pub not_fully_idle: bool,
     pub is_active: bool,
     pub run_state: String,
+    pub live_status: String,
+    pub live_phase: String,
+    pub live_elapsed_sec: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub live_error: String,
     pub killed: bool,
     pub archived: bool,
     pub pinned: bool,
@@ -567,11 +655,14 @@ pub struct SessionTelemetry {
     pub recommend_compact_tokens: u64,
     pub urgent_compact_tokens: u64,
     pub just_compacted: bool,
+    pub cross_model_compact: bool,
+    pub compact_summary_kb: f64,
     pub pre_compact_tokens: u64,
     pub checkpoint_count: usize,
     pub turns_since_compact: usize,
     pub recent_cold_rebuild: bool,
     pub latest_context_tokens: u64,
+    pub remaining_context_tokens: u64,
     pub peak_context_tokens: u64,
     pub context_limit: u64,
     pub context_pct: f64,
@@ -588,9 +679,20 @@ pub struct SessionTelemetry {
     pub post_compact_cold_count: usize,
     pub median_ttft_ms: u64,
     pub median_stream_tps: f64,
+    pub latest_ttft_ms: u64,
+    pub latest_stream_tps: f64,
+    pub e2e_tps: f64,
     pub total_input_tokens: u64,
     pub total_cache_read_tokens: u64,
     pub total_output_tokens: u64,
+    pub total_thinking_tokens: u64,
+    pub total_response_tokens: u64,
+    pub thinking_share_pct: f64,
+    pub last_loop_steps: usize,
+    pub last_loop_output_tokens: u64,
+    pub last_loop_thinking_tokens: u64,
+    pub last_loop_cost_usd: f64,
+    pub last_loop_cost_cny: f64,
     pub cost_usd: f64,
     pub cost_cny: f64,
     pub currency_code: String,
@@ -647,6 +749,33 @@ pub fn build_session_telemetry_with_overlap(
     transcript_step_types: Option<&HashMap<i64, String>>,
     overlap_counts_by_turn: Option<&[usize]>,
 ) -> SessionTelemetry {
+    build_session_telemetry_with_probe(
+        cid,
+        summary,
+        turns,
+        eff_mtime,
+        fx_rate,
+        rates,
+        now_ts,
+        transcript_step_types,
+        overlap_counts_by_turn,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_session_telemetry_with_probe(
+    cid: &str,
+    summary: Option<&SummaryRecord>,
+    turns: &[TurnSample],
+    eff_mtime: f64,
+    fx_rate: f64,
+    rates: &mut RateTable,
+    now_ts: f64,
+    transcript_step_types: Option<&HashMap<i64, String>>,
+    overlap_counts_by_turn: Option<&[usize]>,
+    live_probe: Option<&LiveStepProbe>,
+) -> SessionTelemetry {
     let cfg = rates.current_settings();
     let lang = rates.get_lang();
     let zh = lang.is_zh();
@@ -692,14 +821,18 @@ pub fn build_session_telemetry_with_overlap(
     } else {
         DEFAULT_CONTEXT_LIMIT
     };
+    let remaining_context_tokens = ctx_limit.saturating_sub(latest_ctx);
     let prof = resolve_budget_tier(model_id, model_disp, &cfg);
 
     let mut total_in = 0u64;
     let mut total_cr = 0u64;
     let mut total_cw = 0u64;
     let mut total_out = 0u64;
+    let mut total_thinking = 0u64;
+    let mut total_response = 0u64;
     let mut ttfts: Vec<u64> = Vec::new();
     let mut tps_vals: Vec<f64> = Vec::new();
+    let mut e2e_tps_vals: Vec<f64> = Vec::new();
     let mut total_usd = 0.0f64;
 
     for t in turns {
@@ -707,6 +840,13 @@ pub fn build_session_telemetry_with_overlap(
         total_cr = total_cr.saturating_add(t.cache_read);
         total_cw = total_cw.saturating_add(t.cache_write);
         total_out = total_out.saturating_add(t.output_tokens);
+        let resp_tok = if t.thinking_tokens == 0 && t.response_tokens == 0 && t.output_tokens > 0 {
+            t.output_tokens
+        } else {
+            t.response_tokens
+        };
+        total_thinking = total_thinking.saturating_add(t.thinking_tokens);
+        total_response = total_response.saturating_add(resp_tok);
         if !t.is_checkpoint {
             if t.ttft_ms > 0 {
                 ttfts.push(t.ttft_ms);
@@ -714,6 +854,10 @@ pub fn build_session_telemetry_with_overlap(
             let tps = t.stream_tps();
             if tps > 0.0 {
                 tps_vals.push(tps);
+            }
+            let e2e = t.e2e_tps();
+            if e2e > 0.0 {
+                e2e_tps_vals.push(e2e);
             }
         }
         total_usd += rates.calculate_cost_usd(
@@ -731,6 +875,46 @@ pub fn build_session_telemetry_with_overlap(
     } else {
         0.0
     };
+    let thinking_share_pct = if total_out > 0 {
+        round_dp(((total_thinking as f64) / (total_out as f64) * 100.0).min(100.0), 1)
+    } else {
+        0.0
+    };
+
+    let latest_non_ckpt = turns.iter().rev().find(|t| !t.is_checkpoint).or(latest);
+    let latest_ttft_ms = latest_non_ckpt.map(|t| t.ttft_ms).unwrap_or(0);
+    let latest_stream_tps = latest_non_ckpt
+        .map(|t| round_dp(t.stream_tps(), 1))
+        .unwrap_or(0.0);
+
+    // Current/latest agent loop rollup: walk backwards from latest non-checkpoint turn
+    // until hitting `after_turn_start == Some(true)` (inclusive) or a checkpoint boundary.
+    let mut last_loop_steps = 0usize;
+    let mut last_loop_output_tokens = 0u64;
+    let mut last_loop_thinking_tokens = 0u64;
+    let mut last_loop_cost_usd = 0.0f64;
+    if let Some(last_non_ckpt_idx) = turns.iter().rposition(|t| !t.is_checkpoint) {
+        for t in turns[..=last_non_ckpt_idx].iter().rev() {
+            if t.is_checkpoint {
+                break;
+            }
+            last_loop_steps += 1;
+            last_loop_output_tokens = last_loop_output_tokens.saturating_add(t.output_tokens);
+            last_loop_thinking_tokens = last_loop_thinking_tokens.saturating_add(t.thinking_tokens);
+            last_loop_cost_usd += rates.calculate_cost_usd(
+                &t.model,
+                t.input_tokens,
+                t.cache_read,
+                t.cache_write,
+                t.output_tokens,
+                &t.model_display,
+            );
+            if t.after_turn_start == Some(true) || t.after_checkpoint {
+                break;
+            }
+        }
+    }
+    let last_loop_cost_cny = last_loop_cost_usd * fx_rate;
 
     let cold_classified = classify_cold_cache_turns_detailed(
         turns,
@@ -781,6 +965,7 @@ pub fn build_session_telemetry_with_overlap(
 
     let med_ttft = median_u64(&mut ttfts);
     let med_tps = round_dp(median_f64(&mut tps_vals), 1);
+    let e2e_tps = round_dp(median_f64(&mut e2e_tps_vals), 1);
     let total_cny = total_usd * fx_rate;
 
     let crit_line = (prof.recommend_ctx + 40_000).max(cfg.context.critical_threshold);
@@ -879,6 +1064,65 @@ pub fn build_session_telemetry_with_overlap(
         0.0
     };
 
+    let active_phase_str = if killed {
+        ""
+    } else {
+        live_probe.map(|p| p.live_phase.as_str()).unwrap_or("")
+    };
+    let cross_model_compact = if active_phase_str == "compacting" {
+        if just_compacted {
+            let ckpt_pos = last_ckpt_pos.unwrap();
+            let mut ckpt_model =
+                canonical_model_key(&turns[ckpt_pos].model, &turns[ckpt_pos].model_display);
+            if ckpt_model.is_empty() {
+                ckpt_model = live_probe
+                    .map(|p| canonical_model_key(&p.live_model, ""))
+                    .unwrap_or_default();
+            }
+            let prev_model = turns[..ckpt_pos]
+                .iter()
+                .rev()
+                .find(|t| !t.is_checkpoint)
+                .map(|t| canonical_model_key(&t.model, &t.model_display))
+                .unwrap_or_default();
+            !ckpt_model.is_empty() && !prev_model.is_empty() && ckpt_model != prev_model
+        } else {
+            let active_model = live_probe
+                .map(|p| canonical_model_key(&p.live_model, ""))
+                .unwrap_or_default();
+            let prev_model = turns
+                .iter()
+                .rev()
+                .find(|t| !t.is_checkpoint)
+                .map(|t| canonical_model_key(&t.model, &t.model_display))
+                .unwrap_or_default();
+            !active_model.is_empty() && !prev_model.is_empty() && active_model != prev_model
+        }
+    } else if just_compacted {
+        let ckpt_pos = last_ckpt_pos.unwrap();
+        let ckpt_model =
+            canonical_model_key(&turns[ckpt_pos].model, &turns[ckpt_pos].model_display);
+        let prev_model = turns[..ckpt_pos]
+            .iter()
+            .rev()
+            .find(|t| !t.is_checkpoint)
+            .map(|t| canonical_model_key(&t.model, &t.model_display))
+            .unwrap_or_default();
+        !ckpt_model.is_empty() && !prev_model.is_empty() && ckpt_model != prev_model
+    } else {
+        false
+    };
+
+    let (live_status, live_phase, live_elapsed_sec, live_error) =
+        compute_live_state(live_probe, is_active, killed, cross_model_compact, now_ts);
+
+    let compact_summary_bytes = live_probe.map(|p| p.compact_summary_bytes).unwrap_or(0);
+    let compact_summary_kb = if compact_summary_bytes > 0 {
+        round_dp((compact_summary_bytes as f64) / 1024.0, 1)
+    } else {
+        0.0
+    };
+
     SessionTelemetry {
         id: cid.to_string(),
         conversation_id: cid.to_string(),
@@ -891,6 +1135,10 @@ pub fn build_session_telemetry_with_overlap(
         not_fully_idle,
         is_active,
         run_state: run_state.to_string(),
+        live_status,
+        live_phase,
+        live_elapsed_sec,
+        live_error,
         killed,
         archived,
         pinned,
@@ -908,11 +1156,14 @@ pub fn build_session_telemetry_with_overlap(
         recommend_compact_tokens: prof.recommend_ctx,
         urgent_compact_tokens: prof.urgent_ctx,
         just_compacted,
+        cross_model_compact,
+        compact_summary_kb,
         pre_compact_tokens,
         checkpoint_count,
         turns_since_compact,
         recent_cold_rebuild,
         latest_context_tokens: latest_ctx,
+        remaining_context_tokens,
         peak_context_tokens: peak_ctx,
         context_limit: ctx_limit,
         context_pct: ctx_pct,
@@ -929,9 +1180,20 @@ pub fn build_session_telemetry_with_overlap(
         mid_loop_breakdown,
         median_ttft_ms: med_ttft,
         median_stream_tps: med_tps,
+        latest_ttft_ms,
+        latest_stream_tps,
+        e2e_tps,
         total_input_tokens: total_in,
         total_cache_read_tokens: total_cr,
         total_output_tokens: total_out,
+        total_thinking_tokens: total_thinking,
+        total_response_tokens: total_response,
+        thinking_share_pct,
+        last_loop_steps,
+        last_loop_output_tokens,
+        last_loop_thinking_tokens,
+        last_loop_cost_usd: round_dp(last_loop_cost_usd, 4),
+        last_loop_cost_cny: round_dp(last_loop_cost_cny, 2),
         cost_usd: round_dp(total_usd, 4),
         cost_cny: round_dp(total_cny, 2),
         currency_code,
@@ -962,6 +1224,8 @@ pub struct TurnViewRow {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub output_tokens: u64,
+    pub thinking_tokens: u64,
+    pub response_tokens: u64,
     pub cache_hit_rate: f64,
     pub is_cold_cache: bool,
     pub is_partial_cold: bool,
@@ -975,6 +1239,7 @@ pub struct TurnViewRow {
     pub ttft_ms: u64,
     pub total_ms: u64,
     pub stream_tps: f64,
+    pub e2e_tps: f64,
     pub cost_usd: f64,
     pub cost_cny: f64,
     pub currency_code: String,
@@ -1031,6 +1296,11 @@ pub fn format_turn_rows_with_overlap(
         } else {
             (String::new(), String::new())
         };
+        let resp_tok = if t.thinking_tokens == 0 && t.response_tokens == 0 && t.output_tokens > 0 {
+            t.output_tokens
+        } else {
+            t.response_tokens
+        };
         rows.push(TurnViewRow {
             turn: t.turn_index,
             step_idx: t.step_idx,
@@ -1043,6 +1313,8 @@ pub fn format_turn_rows_with_overlap(
             cache_read_tokens: t.cache_read,
             cache_write_tokens: t.cache_write,
             output_tokens: t.output_tokens,
+            thinking_tokens: t.thinking_tokens,
+            response_tokens: resp_tok,
             cache_hit_rate: round_dp(t.cache_hit_rate(), 1),
             is_cold_cache: is_cold,
             is_partial_cold: is_partial,
@@ -1054,6 +1326,7 @@ pub fn format_turn_rows_with_overlap(
             ttft_ms: t.ttft_ms,
             total_ms: t.total_ms,
             stream_tps: round_dp(t.stream_tps(), 1),
+            e2e_tps: round_dp(t.e2e_tps(), 1),
             cost_usd: round_dp(usd, 4),
             cost_cny: round_dp(usd * fx_rate, 3),
             currency_code: currency_code.clone(),
@@ -1084,6 +1357,8 @@ pub struct SnapshotSummary {
     pub carbon_concurrency_warning: bool,
     pub compact_needed_count: usize,
     pub critical_count: usize,
+    pub compacting_count: usize,
+    pub error_session_count: usize,
     pub total_cost_usd: f64,
     pub total_cost_cny: f64,
 }
@@ -1259,7 +1534,7 @@ pub struct TelemetryEngine {
     pub rates: RateTable,
     preferred_workspace: Option<String>,
     workspace_explicit: bool,
-    metrics_cache: HashMap<String, (MetricsCacheKey, SessionTelemetry)>,
+    metrics_cache: HashMap<String, (MetricsCacheKey, LiveStepProbe, SessionTelemetry)>,
 }
 
 impl TelemetryEngine {
@@ -1346,6 +1621,7 @@ impl TelemetryEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_metrics_cached(
         &mut self,
         cid: &str,
@@ -1355,6 +1631,7 @@ impl TelemetryEngine {
         fx_rate: f64,
         ref_now: f64,
         overlap_counts_by_turn: Option<&[usize]>,
+        live_probe: Option<&LiveStepProbe>,
     ) -> SessionTelemetry {
         let cfg = self.rates.current_settings();
         let lang = self.rates.get_lang();
@@ -1376,8 +1653,9 @@ impl TelemetryEngine {
             currency_code,
             overlap_sig,
         };
-        if let Some((prev_key, prev_tel)) = self.metrics_cache.get(cid) {
-            if *prev_key == cache_key {
+        let owned_probe = live_probe.cloned().unwrap_or_default();
+        if let Some((prev_key, prev_probe, prev_tel)) = self.metrics_cache.get(cid) {
+            if *prev_key == cache_key && *prev_probe == owned_probe {
                 let mut out = prev_tel.clone();
                 if out.is_subagent {
                     let is_act = is_subagent_active(
@@ -1398,13 +1676,24 @@ impl TelemetryEngine {
                     }
                     .to_string();
                 }
+                let (ls, lp, le, lerr) = compute_live_state(
+                    Some(prev_probe),
+                    out.is_active,
+                    out.killed,
+                    out.cross_model_compact,
+                    ref_now,
+                );
+                out.live_status = ls;
+                out.live_phase = lp;
+                out.live_elapsed_sec = le;
+                out.live_error = lerr;
                 return out;
             }
         }
 
         let t_types = self.transcript_types_if_needed(cid, turns);
         let eff_mtime = stamp.map(|s| s.eff_mtime).unwrap_or(0.0);
-        let tel = build_session_telemetry_with_overlap(
+        let tel = build_session_telemetry_with_probe(
             cid,
             summary,
             turns,
@@ -1414,9 +1703,10 @@ impl TelemetryEngine {
             ref_now,
             t_types.as_ref(),
             overlap_counts_by_turn,
+            live_probe,
         );
         self.metrics_cache
-            .insert(cid.to_string(), (cache_key, tel.clone()));
+            .insert(cid.to_string(), (cache_key, owned_probe, tel.clone()));
         tel
     }
 
@@ -1680,7 +1970,9 @@ impl TelemetryEngine {
             return None;
         }
 
-        let turns = self.ledger.read_turns(&resolved_cid, prefetched.as_ref());
+        let (turns, probe) = self
+            .ledger
+            .read_turns_and_probe(&resolved_cid, prefetched.as_ref());
         let summary = summaries.get(&resolved_cid);
         let mut tel = self.build_metrics_cached(
             &resolved_cid,
@@ -1690,11 +1982,15 @@ impl TelemetryEngine {
             fx_rate,
             ref_now,
             None,
+            Some(&probe),
         );
         if !tel.is_subagent {
             let run_subs = self.get_running_subagent_count(&resolved_cid, Some(ref_now));
             tel.running_subagent_count = run_subs;
             tel.is_active = tel.is_active || run_subs > 0;
+            if tel.is_active && tel.live_status == "ready" {
+                tel.live_status = "running".to_string();
+            }
         }
         Some(tel)
     }
@@ -1842,12 +2138,17 @@ impl TelemetryEngine {
             }
         }
 
-        let mut turns_by_cid: HashMap<String, std::sync::Arc<Vec<TurnSample>>> = HashMap::new();
+        let mut turns_by_cid: HashMap<String, (std::sync::Arc<Vec<TurnSample>>, LiveStepProbe)> =
+            HashMap::new();
         let mut model_windows: Vec<ActiveModelWindow> = Vec::new();
         for cid in selected_mains.iter().chain(selected_subs.iter()) {
             let stamp = file_stamps.get(cid);
-            let turns = self.ledger.read_turns(cid, stamp);
-            if turns.is_empty() && !running_ids.contains(cid) {
+            let (turns, probe) = self.ledger.read_turns_and_probe(cid, stamp);
+            if turns.is_empty()
+                && !running_ids.contains(cid)
+                && probe.live_phase.is_empty()
+                && probe.live_error.is_empty()
+            {
                 continue;
             }
             if let Some(w) = Self::make_model_window(
@@ -1859,7 +2160,7 @@ impl TelemetryEngine {
             ) {
                 model_windows.push(w);
             }
-            turns_by_cid.insert(cid.clone(), turns);
+            turns_by_cid.insert(cid.clone(), (turns, probe));
         }
         // Include any active conversations outside a workspace filter for global replica-pool/Carbon contention accuracy.
         for cid in &running_ids {
@@ -1892,7 +2193,7 @@ impl TelemetryEngine {
 
         let mut metrics_by_id: HashMap<String, SessionTelemetry> = HashMap::new();
         for cid in selected_mains.iter().chain(selected_subs.iter()) {
-            let Some(turns) = turns_by_cid.get(cid) else { continue };
+            let Some((turns, probe)) = turns_by_cid.get(cid) else { continue };
             let stamp = file_stamps.get(cid);
             let overlaps = compute_overlap_counts(cid, turns, &model_windows);
             let tel = self.build_metrics_cached(
@@ -1903,6 +2204,7 @@ impl TelemetryEngine {
                 fx_rate,
                 ref_now,
                 Some(&overlaps),
+                Some(probe),
             );
             metrics_by_id.insert(cid.clone(), tel);
         }
@@ -1953,6 +2255,9 @@ impl TelemetryEngine {
             m.running_subagent_count = run_subs;
             m.history_subagent_count = hist_subs;
             m.is_active = m.is_active || run_subs > 0;
+            if m.is_active && m.live_status == "ready" {
+                m.live_status = "running".to_string();
+            }
             m.effective_last_active_ts = Some(round_dp(eff_ts, 3));
             m.sidebar_sort_ts = round_dp(sort_ts, 3);
             m.group_cost_usd = Some(round_dp(group_usd, 4));
@@ -1990,6 +2295,8 @@ impl TelemetryEngine {
         let mut running_subagent_count = 0usize;
         let mut compact_needed_count = 0usize;
         let mut critical_count = 0usize;
+        let mut compacting_count = 0usize;
+        let mut error_session_count = 0usize;
         let mut total_cost_usd = 0.0f64;
         let mut total_cost_cny = 0.0f64;
 
@@ -2002,6 +2309,12 @@ impl TelemetryEngine {
             }
             if item.level == "critical" {
                 critical_count += 1;
+            }
+            if item.live_phase == "compacting" {
+                compacting_count += 1;
+            }
+            if item.live_status == "error" {
+                error_session_count += 1;
             }
             total_cost_usd += item.cost_usd;
             total_cost_cny += item.cost_cny;
@@ -2054,6 +2367,8 @@ impl TelemetryEngine {
                 carbon_concurrency_warning,
                 compact_needed_count,
                 critical_count,
+                compacting_count,
+                error_session_count,
                 total_cost_usd: round_dp(total_cost_usd, 4),
                 total_cost_cny: round_dp(total_cost_cny, 2),
             },
@@ -2121,7 +2436,7 @@ impl TelemetryEngine {
         let summaries = self.ledger.read_summaries();
         let (file_mtimes, file_stamps) = self.ledger.scan_dir();
         let stamp = stat_db_stamp(&self.ledger.db_path(&resolved));
-        let turns = self.ledger.read_turns(&resolved, stamp.as_ref());
+        let (turns, probe) = self.ledger.read_turns_and_probe(&resolved, stamp.as_ref());
         let mut model_windows: Vec<ActiveModelWindow> = Vec::new();
         for (cid, s) in summaries.iter() {
             let Some(&mtime) = file_mtimes.get(cid) else { continue };
@@ -2164,6 +2479,7 @@ impl TelemetryEngine {
             fx_rate,
             ref_now,
             Some(&overlaps),
+            Some(&probe),
         );
         let rows = format_turn_rows_with_overlap(
             &turns,

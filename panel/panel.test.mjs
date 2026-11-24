@@ -610,3 +610,210 @@ test("kept-alive pane reveal hooks (ResizeObserver, IntersectionObserver, onhost
   assert.equal(refreshes.length, 4, "pointerenter after >900ms must trigger fresh refresh");
   assert.deepEqual(refreshes[3], { force: true, showSynced: false });
 });
+
+test("rich live telemetry: 4-state dots, phase badges, headroom, thinking/loop rollup, turns, whisper notices, and backward compat", () => {
+  const cssSrc = fs.readFileSync(THEME_CSS, "utf8");
+  const viewSrc = fs.readFileSync(VIEW_JS, "utf8");
+
+  // 1. CSS invariants for 4-state live dot & reduced motion
+  for (const cls of [".dt.run", ".dt.wait", ".dt.err", ".dt.idle"]) {
+    assert.ok(cssSrc.includes(cls), `theme.css must style ${cls}`);
+  }
+  assert.ok(cssSrc.includes(".dt.run,.dt.wait{animation:kp"), "pulse animation must only target dot states .dt.run and .dt.wait");
+  assert.ok(cssSrc.includes("@media(prefers-reduced-motion:reduce){.dt.run,.dt.wait,.spn{animation:none!important}}"), "reduced-motion must disable .dt.run and .dt.wait animations");
+
+  // 2. Build lightweight DOM tree that parses mountDetailBlock/createRowEntry innerHTML accurately
+  class MockEl {
+    constructor(tag = "div") {
+      this.tag = tag; this.className = ""; this.hidden = false; this.textContent = "";
+      this.title = ""; this.style = {}; this.dataset = {}; this.attrs = {}; this.children = [];
+      this.classList = { toggle: (c, on) => {
+        const s = new Set(this.className.split(/\s+/).filter(Boolean));
+        on ? s.add(c) : s.delete(c); this.className = [...s].join(" ");
+      }};
+    }
+    get firstElementChild() { return this.children[0] || null; }
+    get lastElementChild() { return this.children[this.children.length - 1] || null; }
+    setAttribute(k, v) { this.attrs[k] = String(v); }
+    appendChild(c) { this.children.push(c); return c; }
+    insertBefore(el, ref) {
+      const i = this.children.indexOf(el); if (i >= 0) this.children.splice(i, 1);
+      const r = ref ? this.children.indexOf(ref) : -1;
+      r >= 0 ? this.children.splice(r, 0, el) : this.children.push(el);
+    }
+    remove() {}
+    set innerHTML(html) {
+      this._rawHtml = String(html); this.children = [];
+      const stack = [this];
+      const tok = /<\/([a-z0-9]+)>|<([a-z0-9]+)([^>]*)>|([^<]+)/gi;
+      let m;
+      while ((m = tok.exec(this._rawHtml))) {
+        if (m[1]) { if (stack.length > 1) stack.pop(); }
+        else if (m[2]) {
+          const el = new MockEl(m[2].toLowerCase()), attrStr = m[3] || "";
+          const cm = attrStr.match(/\bclass="([^"]*)"/i); if (cm) el.className = cm[1];
+          const am = attrStr.match(/\bdata-a="([^"]*)"/i); if (am) el.dataset.a = am[1];
+          const im = attrStr.match(/\bdata-i="([^"]*)"/i); if (im) el.dataset.i = im[1];
+          if (/\bhidden\b/i.test(attrStr)) el.hidden = true;
+          stack[stack.length - 1].children.push(el);
+          if (!/\/>$/.test(attrStr)) stack.push(el);
+        } else if (m[4] && stack.length > 1) {
+          stack[stack.length - 1].textContent += m[4];
+        }
+      }
+    }
+    get innerHTML() { return this._rawHtml || ""; }
+  }
+
+  // Extract telemetry & UI patching slice from view.js
+  const sliceA = viewSrc.slice(viewSrc.indexOf("const CM ="), viewSrc.indexOf("let viewMode"));
+  const sliceB = viewSrc.slice(viewSrc.indexOf("const num ="), viewSrc.indexOf("const normWs ="));
+  const sliceC = viewSrc.slice(viewSrc.indexOf("const DOT_CLS ="), viewSrc.indexOf("const isHandoffLocked ="));
+  assert.ok(sliceA && sliceB && sliceC, "view.js telemetry slices must exist");
+
+  let curLang = "en";
+  const uLs = new MockEl("div"), uHd = new MockEl("span"), uHt = new MockEl("span"), uHi = new MockEl("button"),
+    uHm = new MockEl("span"), uHp = new MockEl("span"), uHs = new MockEl("span"), uHv = new MockEl("span"),
+    he = new MockEl("section");
+  const sandbox = {
+    D: { createElement: (t) => new MockEl(t) },
+    M: Math, S: String, now: () => 10_000_000,
+    isZh: () => curLang === "zh-CN",
+    tr: (e, z) => (z !== undefined ? (curLang === "zh-CN" ? z : e) : e.split("|")[curLang === "zh-CN" ? 1 : 0]),
+    subTxt: (n) => (curLang === "zh-CN" ? `${n} 个子代理` : `${n} subagent${n === 1 ? "" : "s"}`),
+    fc: (e) => e.firstElementChild, lc: (e) => e.lastElementChild, ch: (e) => e.children,
+    lang: "en", copiedId: null, confirmSendId: null, openRowId: null, loadingKey: "", subTrayRev: 0,
+    allowAutoHandoff: true, canMessage: false, ownerCid: "",
+    openTrays: new Map(), cTurns: new Map(), cHot: new Map(), cDist: new Map(), cAdv: new Map(), rowNodes: new Map(),
+    snapshot: { daemon_workspace: "/ws", thresholds: { max: 512e3 }, summary: { running_main_count: 1 }, sessions: [] },
+    normWs: (r) => String(r || "").trim(),
+    sameWs: () => true,
+    getHero: () => sandbox.snapshot.sessions[0] || null,
+    canDirectCid: () => false,
+    canDirectMsg: () => false,
+    getCold: ({ cold_cache_breakdown: c, mid_loop_breakdown: mb, turn_start_cold_count: t, mid_loop_cold_count: m, post_compact_cold_count: p }) =>
+      ({ t: Number(t ?? c?.turn_start_cold) || 0, m: Number(m ?? c?.mid_loop_cold) || 0, p: Number(p ?? c?.post_compact_cold) || 0, s: Number(mb?.slow_turn_self_expiry) || 0, r: Number(mb?.replica_spillover) || 0, w: Number(mb?.model_switch_cold) || 0 }),
+    getVerdict: () => ({ cls: "ok", text: "" }),
+    coldKind: () => "New turn",
+    COLD_CLS: { mid_loop_cold: "mid", post_compact_cold: "post" },
+    uLs, uHd, uHt, uHi, uHm, uHp, uHs, uHv, ui: { he },
+    setLang: (l) => { sandbox.lang = l; curLang = l; },
+  };
+  const code = `${sliceA}\n${sliceB}\n${sliceC}\nthis.getLiveDot=getLiveDot;this.getLivePhaseBadge=getLivePhaseBadge;this.mountDetailBlock=mountDetailBlock;this.patchDetailBlock=patchDetailBlock;this.patchHeroSlot=patchHeroSlot;this.patchSessionList=patchSessionList;this.renderSubTray=renderSubTray;`;
+  sandbox.uHdBlk = null;
+  vm.runInNewContext(code, sandbox);
+  sandbox.uHdBlk = sandbox.mountDetailBlock();
+
+  // 3. 4-state live dot + backward-compat fallback
+  assert.equal(sandbox.getLiveDot({ live_status: "ready", is_active: true }), "idle");
+  assert.equal(sandbox.getLiveDot({ live_status: "running", is_active: false }), "run");
+  assert.equal(sandbox.getLiveDot({ live_status: "waiting" }), "wait");
+  assert.equal(sandbox.getLiveDot({ live_status: "error" }), "err");
+  assert.equal(sandbox.getLiveDot({ is_active: true }), "run", "fallback when live_status absent");
+  assert.equal(sandbox.getLiveDot({ is_active: false }), "idle", "fallback when live_status absent");
+
+  // 4. Phase badges (EN + zh-CN)
+  const pb = (o) => { const r = sandbox.getLivePhaseBadge(o); return r ? { cls: r.cls, text: r.text } : null; };
+  assert.deepEqual(pb({ live_status: "running", live_phase: "compacting", live_elapsed_sec: 12 }), { cls: "info", text: "Compacting… 12s" });
+  assert.deepEqual(pb({ live_status: "waiting", live_phase: "compacting", live_elapsed_sec: 0 }), { cls: "warn", text: "Compacting…" });
+  assert.deepEqual(pb({ live_status: "waiting", live_phase: "llm", live_elapsed_sec: 50 }), { cls: "warn", text: "Waiting 50s" });
+  assert.deepEqual(pb({ live_status: "error" }), { cls: "critical", text: "Error" });
+  assert.equal(pb({ live_status: "running", live_phase: "llm", live_elapsed_sec: 5 }), null);
+  assert.equal(pb({ is_active: false }), null);
+
+  sandbox.setLang("zh-CN");
+  assert.deepEqual(pb({ live_status: "running", live_phase: "compacting", live_elapsed_sec: 8 }), { cls: "info", text: "压缩中… 8s" });
+  assert.deepEqual(pb({ live_status: "waiting", live_elapsed_sec: 50 }), { cls: "warn", text: "等待 50s" });
+  assert.deepEqual(pb({ live_status: "error" }), { cls: "critical", text: "异常" });
+
+  // 5. Patch Hero & Detail Block with full rich telemetry (EN)
+  sandbox.setLang("en");
+  const richHero = {
+    id: "c-rich", title: "Rich Session", level: "ok", is_active: true,
+    live_status: "waiting", live_phase: "compacting", live_elapsed_sec: 50,
+    cross_model_compact: true,
+    latest_context_tokens: 244000, context_limit: 512000, context_pct: 48.0,
+    remaining_context_tokens: 268000, peak_context_tokens: 340000,
+    just_compacted: true, pre_compact_tokens: 340000, compact_summary_kb: 21.9,
+    cache_hit_rate: 92.5, cold_cache_count: 0,
+    latest_ttft_ms: 1400, latest_stream_tps: 64, e2e_tps: 41, checkpoint_count: 2,
+    total_thinking_tokens: 9656, total_response_tokens: 4544, thinking_share_pct: 68,
+    last_loop_steps: 6, last_loop_output_tokens: 4800, last_loop_thinking_tokens: 3200,
+    last_loop_cost_usd: 0.42, last_loop_cost_cny: 3.02,
+    cost_usd: 1.85, cost_cny: 13.32, turns: 14,
+  };
+  sandbox.patchHeroSlot(richHero);
+  assert.equal(uHd.className, "dt wait");
+  assert.equal(uHp.hidden, false);
+  assert.equal(uHp.className, "bd warn");
+  assert.equal(uHp.textContent, "Compacting… 50s");
+
+  const dBlk = sandbox.uHdBlk;
+  const [, , , , g1, g2, ps, , , , , , , tmEl, wnEl] = dBlk;
+  assert.equal(g1.textContent, "244.0k / 512.0k (48.0%) · 268.0k left");
+  assert.equal(g2.textContent, "Before 340.0k · ~21.9 KB");
+  assert.equal(ps[2].children[1].textContent, "TTFT 1.4s · 64/41 t/s");
+  assert.ok(ps[2].title.includes("Stream 64 · E2E 41 t/s"), `tooltip should clarify stream/e2e: ${ps[2].title}`);
+  assert.equal(tmEl.hidden, false);
+  assert.equal(tmEl.textContent, "Out 14.2k (68% think) · Loop 6× · 4.8k · $0.42");
+  assert.equal(wnEl.hidden, false);
+  assert.equal(wnEl.className, "cw wr");
+  assert.equal(wnEl.textContent, "Cross-model /compact cannot reuse prior KV cache; slower rebuild expected.");
+
+  // 6. zh-CN formatting, XSS-safe live_error notice, and row phase badge
+  sandbox.setLang("zh-CN");
+  const errRow = {
+    id: "c-err", title: "Broken Run", level: "critical", is_active: false,
+    live_status: "error", live_error: '<script>alert("xss")</script> Upstream 429',
+    latest_context_tokens: 100000, context_limit: 512000, context_pct: 19.5,
+    total_thinking_tokens: 680, total_response_tokens: 320,
+    last_loop_steps: 6, last_loop_output_tokens: 4800, last_loop_cost_usd: 0.42, last_loop_cost_cny: 3.02,
+    turns: 4,
+  };
+  sandbox.openRowId = "c-err";
+  sandbox.patchSessionList([[errRow, false]]);
+  const rec = sandbox.rowNodes.get("c-err");
+  const [, , [, rDot, , , , rPhase], trBox] = rec;
+  assert.equal(rDot.className, "dt err");
+  assert.equal(rPhase.hidden, false);
+  assert.equal(rPhase.className, "bd critical");
+  assert.equal(rPhase.textContent, "异常");
+  const rowD = rec[4];
+  assert.equal(rowD[4].textContent, "100.0k / 512.0k (19.5%) · 余 412.0k");
+  assert.equal(rowD[13].textContent, "输出 1.0k（思考 68%） · 本轮 6 步 · 4.8k · ¥3.02");
+  assert.equal(rowD[14].hidden, false);
+  assert.equal(rowD[14].className, "er wr");
+  assert.equal(rowD[14].textContent, '<script>alert("xss")</script> Upstream 429', "live_error must be assigned via textContent, never HTML-parsed");
+  assert.equal(trBox.hidden, false);
+
+  // 7. Backward compatibility when all new fields are absent
+  sandbox.setLang("en");
+  const legacySession = {
+    id: "c-old", title: "Legacy", level: "ok", is_active: false,
+    latest_context_tokens: 120000, context_limit: 500000, context_pct: 24.0,
+    cache_hit_rate: 80, median_ttft_ms: 900, median_stream_tps: 55,
+    cost_usd: 0.5, cost_cny: 3.6, turns: 5,
+  };
+  sandbox.patchHeroSlot(legacySession);
+  assert.equal(uHd.className, "dt idle");
+  assert.equal(uHp.hidden, true);
+  assert.equal(g1.textContent, "120.0k / 500.0k (24.0%) · 380.0k left");
+  assert.equal(g2.textContent, "5t");
+  assert.equal(ps[2].children[1].textContent, "TTFT 900ms · 55 t/s");
+  assert.equal(tmEl.hidden, true, "thinking/loop rollup must hide when absent");
+  assert.equal(wnEl.hidden, true, "whisper notice must hide when live_error and cross_model_compact are absent");
+
+  // 8. Turns sub-tray displays compact thinking share and stream/e2e speed without crowding
+  sandbox.openTrays.set("c-rich", "turns");
+  sandbox.cTurns.set("c-rich", {
+    total_turns: 2,
+    turns: [
+      { turn: 2, time_iso: "2026-11-24T08:50:00Z", context_tokens: 244000, cache_hit_rate: 95, ttft_ms: 1400, stream_tps: 64, e2e_tps: 41, thinking_tokens: 680, response_tokens: 320, cost_usd: 0.12, cost_cny: 0.86 },
+      { turn: 1, time_iso: "2026-11-24T08:48:00Z", context_tokens: 120000, cache_hit_rate: 50, ttft_ms: 900, stream_tps: 50, thinking_tokens: 717, response_tokens: 0, cost_usd: 0.05, cost_cny: 0.36 },
+    ],
+  });
+  const turnsHtml = sandbox.renderSubTray(richHero);
+  assert.ok(turnsHtml.includes("T68%"), "turns tray should show T68% when thinking_tokens & response_tokens present");
+  assert.ok(turnsHtml.includes("think 717"), "turns tray should show think 717 when response_tokens is 0");
+  assert.ok(turnsHtml.includes("1.4s · 64/41"), "turns tray should show stream/e2e speed when e2e_tps > 0");
+});

@@ -14,9 +14,9 @@ use flate2::Compression;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::ledger::TurnSample;
+use crate::ledger::{LiveStepProbe, TurnSample};
 
-const INDEX_SCHEMA_VERSION: i64 = 1;
+pub const INDEX_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbVersionSig {
@@ -40,6 +40,7 @@ pub struct ParsedLedgerState {
     pub saw_turn_start: bool,
     pub by_resp: HashMap<String, usize>,
     pub turns: Arc<Vec<TurnSample>>,
+    pub live_probe: LiveStepProbe,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,6 +53,8 @@ struct PersistedPayload {
     saw_ckpt_boundary: bool,
     saw_turn_start: bool,
     turns: Vec<TurnSample>,
+    #[serde(default)]
+    live_probe: LiveStepProbe,
 }
 
 pub struct IndexDbCache {
@@ -186,6 +189,7 @@ impl IndexDbCache {
             saw_turn_start: payload.saw_turn_start,
             by_resp,
             turns: Arc::new(payload.turns),
+            live_probe: payload.live_probe,
         })
     }
 
@@ -212,6 +216,7 @@ impl IndexDbCache {
             saw_ckpt_boundary: state.saw_ckpt_boundary,
             saw_turn_start: state.saw_turn_start,
             turns: (*state.turns).clone(),
+            live_probe: state.live_probe.clone(),
         };
 
         let Ok(raw_json) = serde_json::to_vec(&payload) else { return };

@@ -25,8 +25,8 @@ Context Radar puts a live status panel in Antigravity so you can see what is goi
 
 ## What it does
 
-- **Live context and cost meter**: Shows how much of your context window is used across the current chat and any running subagents, along with cache hit rate, response speed, and estimated cost. Stays live with adaptive `if_digest` polling (1s foreground / 2s background, 15s timeout) and refreshes immediately when a kept-alive side/global pane is revealed (`ResizeObserver`, `IntersectionObserver`, `onhostcontextchanged`, and passive `pointerenter`).
-- **Explains slow turns**: Tells the difference between a normal new-turn cache miss, an unexpected mid-loop cache break, and a post-compact rebuild, so you know what actually slowed things down.
+- **Live 4-state telemetry, headroom, and cost meter**: Uses O(log N) indexed read-only SQLite probes to show a 4-state execution/compaction indicator (`ready`, `running` [LLM / Tool / Compacting], `waiting`, `error`), remaining context headroom (`left`), thinking vs. response token split (`% think`), Stream + E2E tok/s, current-turn multi-step loop rollups, and estimated cost across main sessions and subagents. Stays live with adaptive `if_digest` polling (1s foreground / 2s background, 15s timeout) and refreshes immediately when a kept-alive side/global pane is revealed (`ResizeObserver`, `IntersectionObserver`, `onhostcontextchanged`, and passive `pointerenter`).
+- **Explains slow turns & cross-model compaction**: Tells the difference between a normal new-turn cache miss, an unexpected mid-loop cache break, and a post-compact rebuild, detects cross-model `/compact` cache resets with a quiet inline notice, and displays checkpoint summary size (`KB`) so you know what actually slowed things down.
 - **Finds and trims bloated history**: Points out the specific turns that caused context spikes and lets your agent save a short summary of old work into `scratch/` instead of dragging raw logs around.
 - **Smarter `/compact` and fresh-chat handoffs**: Checks whether compacting or moving to a new conversation will actually save tokens over the next few turns, then dispatches via official protocols only—SEP-1865 `ui/message` (`Send /compact`, guarded auto-compact, or `target:new` handoff with automatic clipboard fallback) from a visibly mounted Antigravity App card/pane, or unattended in-place `/compact` on `agy acp` via `acp-proxy` and `acp-run`.
 - **Helpful optional guardrails**: Can gently keep the agent from backgrounding short shell commands too early, and optionally inject a short workspace status file at session start if you configure one.
@@ -65,8 +65,8 @@ You can also just ask your agent in plain language. The plugin includes an on-de
 
 | Tool | What it does |
 | :--- | :--- |
-| `context_radar_overview` | Opens the live panel and returns the current session and subagent summary. |
-| `context_radar_turns` | Breaks down per-turn tokens, cache hits, cache-miss causes, speed, and estimated cost. |
+| `context_radar_overview` | Opens the live panel and returns 4-state live status (`ready`/`running`/`waiting`/`error`), headroom, thinking share, Stream/E2E speed, loop rollup, and subagent summary. |
+| `context_radar_turns` | Breaks down per-turn tokens, thinking vs. response split, cache hits, cache-miss causes, Stream/E2E speed, and estimated cost. |
 | `context_radar_hotspots` | Finds the biggest context spikes in the conversation and summarizes selected slices to `scratch/`. |
 | `context_radar_prepare_handoff` | Checks whether `/compact` or a fresh session makes sense right now. |
 | `context_radar_commit_handoff` | Creates the one-click `/compact` or new-conversation handoff card once checks pass. |

@@ -20,7 +20,8 @@ use crate::engine::pruner::distill_slice_with_lang;
 use crate::engine::telemetry::{compute_snapshot_digest, OverviewSnapshot, TelemetryEngine};
 use crate::i18n::select_display_cost;
 use crate::rpc::tools::{
-    fmt_k, resources_spec, summarize_snapshot_text, tools_spec, APP_MIME, HANDOFF_URI, PANEL_URI,
+    fmt_k, format_live_status_tag, resources_spec, summarize_snapshot_text, tools_spec, APP_MIME,
+    HANDOFF_URI, PANEL_URI,
 };
 use crate::settings::{expand_tilde, ACP_PROXY_ENV, PANEL_HTML_ENV};
 
@@ -1461,6 +1462,42 @@ impl McpDaemon {
             });
         }
         let short: String = detail.conversation_id.chars().take(8).collect();
+        let mut extra_parts: Vec<String> = Vec::new();
+        if let Some(ref sess) = detail.session {
+            let live_tag = format_live_status_tag(sess, zh);
+            if !live_tag.is_empty()
+                && (matches!(sess.live_status.as_str(), "error" | "waiting")
+                    || sess.live_phase == "compacting")
+            {
+                extra_parts.push(live_tag.trim().to_string());
+            }
+            if sess.context_limit > 0 {
+                extra_parts.push(if zh {
+                    format!("余 {}", fmt_k(sess.remaining_context_tokens))
+                } else {
+                    format!("{} left", fmt_k(sess.remaining_context_tokens))
+                });
+            }
+            if sess.total_thinking_tokens > 0 {
+                extra_parts.push(if zh {
+                    format!("思考 {:.0}%", sess.thinking_share_pct)
+                } else {
+                    format!("think {:.0}%", sess.thinking_share_pct)
+                });
+            }
+            if sess.cross_model_compact {
+                extra_parts.push(if zh {
+                    "跨模型压缩".to_string()
+                } else {
+                    "cross-model compact".to_string()
+                });
+            }
+        }
+        let extra_note = if extra_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" | {}", extra_parts.join(" · "))
+        };
         let mid_note = detail
             .mid_loop_breakdown
             .as_ref()
@@ -1480,9 +1517,9 @@ impl McpDaemon {
             })
             .unwrap_or_default();
         let text = if zh {
-            format!("会话 {short} 最近 {} 轮明细{mid_note}", detail.turns.len())
+            format!("会话 {short} 最近 {} 轮明细{extra_note}{mid_note}", detail.turns.len())
         } else {
-            format!("Last {} turn(s) for session {short}{mid_note}", detail.turns.len())
+            format!("Last {} turn(s) for session {short}{extra_note}{mid_note}", detail.turns.len())
         };
         json!({
             "content": [{ "type": "text", "text": text }],
