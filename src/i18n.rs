@@ -178,3 +178,34 @@ pub fn select_display_cost(cost_usd: f64, cost_cny: f64, currency_code: &str) ->
         cost_cny
     }
 }
+
+#[inline]
+pub fn pick<'a>(lang: Lang, en: &'a str, zh: &'a str) -> &'a str {
+    if lang.is_zh() {
+        zh
+    } else {
+        en
+    }
+}
+
+#[inline]
+pub fn ttl_window_label(lang: Lang, ttl_sec: u64) -> &'static str {
+    match (lang.is_zh(), ttl_sec) {
+        (true, 180) => "3 分钟",
+        (false, 180) => "3m",
+        (true, _) => "5 分钟",
+        (false, _) => "5m",
+    }
+}
+
+pub fn carbon_concurrency_warning_text(lang: Lang, active_carbon_count: usize) -> String {
+    if lang.is_zh() {
+        format!(
+            "并发提示：当前 {active_carbon_count} 个活跃会话同时运行 Gemini 4 Carbon，建议将并发 Carbon 控制在 <= 2，避免单副本 HBM 缓存溢出。"
+        )
+    } else {
+        format!(
+            "Concurrency tip: {active_carbon_count} active conversations are running Gemini 4 Carbon simultaneously; cap concurrent Carbon workers <= 2 to avoid per-replica HBM spillover."
+        )
+    }
+}
