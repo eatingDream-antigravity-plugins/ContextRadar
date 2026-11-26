@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.1](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.5.0...v1.5.1) (2026-11-26)
+
+
+### Bug Fixes
+
+* align display branding and panel wordmark to ContextRadar ([#29](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/29)) ([50baeb6](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/50baeb6679f70a6499fd2eeda35315836d7abeba))
+
 ## [1.5.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.4.0...v1.5.0) (2026-11-26)
 
 
