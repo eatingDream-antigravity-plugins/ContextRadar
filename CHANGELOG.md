@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.3](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.3.2...v1.3.3) (2026-11-26)
+
+
+### Bug Fixes
+
+* **arch:** decouple telemetry tiers, lock grant store, and unify handoff contracts ([#21](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/21)) ([6b1efdc](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/6b1efdc44c8e31dae202e3f60e40e3c3231c6045))
+
 ## [1.3.2](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.3.1...v1.3.2) (2026-11-24)
 
 
