@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.3.4...v1.4.0) (2026-11-26)
+
+
+### Features
+
+* **ai:** add llms.txt, root AGENTS.md, and cross-client AI integration docs ([#25](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/25)) ([00a55e1](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/00a55e1dfb1eb300eefa0408d3f4899c9c4274b8))
+
 ## [1.3.4](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.3.3...v1.3.4) (2026-11-26)
 
 
