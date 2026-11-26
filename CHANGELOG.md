@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.4](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.3.3...v1.3.4) (2026-11-26)
+
+
+### Bug Fixes
+
+* **acp:** make acp-proxy and acp-run a pure-protocol thin client ([#23](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/23)) ([42a93c6](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/42a93c6cb3d6040ff84bdf7b809664062180c558))
+
 ## [1.3.3](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.3.2...v1.3.3) (2026-11-26)
 
 
