@@ -134,7 +134,11 @@ pub fn evaluate_handoff_gate(
     };
 
     let ctx = s.latest_context_tokens;
-    let model = if s.model.is_empty() { "unknown" } else { s.model.as_str() };
+    let model = if s.model.is_empty() {
+        "unknown"
+    } else {
+        s.model.as_str()
+    };
     let model_disp = if s.model_display.is_empty() {
         model
     } else {

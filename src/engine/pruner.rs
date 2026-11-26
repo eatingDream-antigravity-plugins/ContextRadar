@@ -1,9 +1,6 @@
 //! Prefix-preserving context bloat hotspot locator and out-of-band transcript slice distiller.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use serde::Serialize;
@@ -11,6 +8,8 @@ use serde::Serialize;
 use crate::i18n::{resolve_active_lang, Lang};
 use crate::ledger::journal_tail::{JournalEntry, JournalTailCache};
 use crate::ledger::{is_safe_id, TurnSample};
+
+mod note_file;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BloatHotspot {
@@ -122,7 +121,14 @@ pub fn analyze_hotspots(
     top_k: usize,
     journal_cache: &mut JournalTailCache,
 ) -> PrunerReport {
-    analyze_hotspots_with_lang(data_root, cid, turns, top_k, journal_cache, resolve_active_lang(""))
+    analyze_hotspots_with_lang(
+        data_root,
+        cid,
+        turns,
+        top_k,
+        journal_cache,
+        resolve_active_lang(""),
+    )
 }
 
 pub fn analyze_hotspots_with_lang(
@@ -168,7 +174,10 @@ pub fn analyze_hotspots_with_lang(
     let window_entries = journal_cache.get_active_window(data_root, cid);
 
     let mut spikes: Vec<BloatHotspot> = Vec::new();
-    let mut prev_ctx = active_turns.first().map(|t| t.context_tokens()).unwrap_or(0);
+    let mut prev_ctx = active_turns
+        .first()
+        .map(|t| t.context_tokens())
+        .unwrap_or(0);
     let mut prev_step = active_turns.first().map(|t| t.step_idx).unwrap_or(0);
     for (pos, t) in active_turns.iter().enumerate() {
         let cur_ctx = t.context_tokens();
@@ -195,7 +204,7 @@ pub fn analyze_hotspots_with_lang(
         });
     }
 
-    spikes.sort_by(|a, b| b.delta_tokens.cmp(&a.delta_tokens));
+    spikes.sort_by_key(|spike| std::cmp::Reverse(spike.delta_tokens));
     let k = top_k.clamp(1, 15);
     spikes.truncate(k);
 
@@ -338,7 +347,10 @@ pub fn distill_slice_with_lang(
     let mut errors = Vec::new();
     let mut raw_chars = 0usize;
 
-    for e in entries.iter().filter(|e| e.step_index >= s_idx && e.step_index <= e_idx) {
+    for e in entries
+        .iter()
+        .filter(|e| e.step_index >= s_idx && e.step_index <= e_idx)
+    {
         step_count += 1;
         raw_chars += e.raw_chars;
         if e.step_type == "USER_INPUT" && !e.snippet_long.is_empty() {
@@ -451,39 +463,28 @@ pub fn distill_slice_with_lang(
     }
 
     let mut saved_path = String::new();
+    let mut save_error: Option<String> = None;
     if save_note {
-        let brain_dir = data_root.join("brain");
-        let conv_brain = brain_dir.join(cid);
-        let scratch_dir = conv_brain.join("scratch");
-        let is_symlink = |p: &Path| {
-            fs::symlink_metadata(p)
-                .map(|m| m.file_type().is_symlink())
-                .unwrap_or(false)
-        };
-        if !is_symlink(&brain_dir) && !is_symlink(&conv_brain) && !is_symlink(&scratch_dir) {
-            if fs::create_dir_all(&scratch_dir).is_ok() {
-                let note_file = scratch_dir.join(format!("slice_{s_idx}_{e_idx}.md"));
-                if !is_symlink(&note_file) {
-                    let note_body = format!(
-                        "<!-- Source conversation: {cid} | steps {s_idx}-{e_idx} | out-of-band scratch slice -->\n{digest}\n"
-                    );
-                    let write_ok = OpenOptions::new()
-                        .write(true)
-                        .create(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open(&note_file)
-                        .and_then(|mut f| f.write_all(note_body.as_bytes()));
-                    if write_ok.is_ok() {
-                        saved_path = note_file.to_string_lossy().into_owned();
-                    }
-                }
+        let name = format!("slice_{s_idx}_{e_idx}.md");
+        let body = format!(
+            "<!-- Source conversation: {cid} | steps {s_idx}-{e_idx} | out-of-band scratch slice -->\n{digest}\n"
+        );
+        match note_file::save(data_root, cid, &name, &body) {
+            Ok(path) => {
+                saved_path = path.to_string_lossy().into_owned();
+            }
+            Err(err) => {
+                save_error = Some(if zh {
+                    format!("保存提炼备忘失败：{err}")
+                } else {
+                    format!("Failed to save distilled note: {err}")
+                });
             }
         }
     }
 
     let handoff_hint = if !saved_path.is_empty() {
-        if zh {
+        Some(if zh {
             format!(
                 "可将 {saved_path} 作为 scratch_note_path 传给 context_radar_commit_handoff，或交由全新子代理 / target:new 新会话读取。"
             )
@@ -491,17 +492,21 @@ pub fn distill_slice_with_lang(
             format!(
                 "Pass {saved_path} as scratch_note_path to context_radar_commit_handoff, or read it from a fresh subagent or target:new session."
             )
-        }
-    } else if zh {
-        "可加 save_note=true 写入 scratch/，供全新子代理或接力新会话按需读取。".into()
+        })
+    } else if save_error.is_some() {
+        None
     } else {
-        "Pass save_note=true to persist this summary under scratch/ for fresh subagents or target:new handoff chats.".into()
+        Some(if zh {
+            "可加 save_note=true 写入 scratch/，供全新子代理或接力新会话按需读取。".into()
+        } else {
+            "Pass save_note=true to persist this summary under scratch/ for fresh subagents or target:new handoff chats.".into()
+        })
     };
 
     PrunerReport {
         found: true,
         mode: "distill".into(),
-        error: None,
+        error: save_error,
         conversation_id: cid.to_string(),
         active_step_range: None,
         recommended_distill_range: None,
@@ -511,7 +516,7 @@ pub fn distill_slice_with_lang(
         estimated_raw_tokens: Some(est_raw_tokens),
         digest_chars: Some(digest.chars().count()),
         saved_note_path: Some(saved_path),
-        handoff_hint: Some(handoff_hint),
+        handoff_hint,
         digest: Some(digest),
     }
 }

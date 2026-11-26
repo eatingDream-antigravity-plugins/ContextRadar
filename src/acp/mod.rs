@@ -31,7 +31,9 @@ use crate::i18n::{
     build_compact_command_with_note_for_lang, resolve_active_lang,
     sanitize_scratch_note_path_pure_for_lang, Lang,
 };
-use crate::settings::{expand_tilde, resolve_agy_bin, ACP_PROXY_ENV, AGY_AUTO_COMPACT_OVERRIDE_ENV};
+use crate::settings::{
+    expand_tilde, resolve_agy_bin, ACP_PROXY_ENV, AGY_AUTO_COMPACT_OVERRIDE_ENV,
+};
 
 pub const DEFAULT_MAX_AUTO_COMPACTS: usize = 2;
 const CLIENT_NAME: &str = "context-radar-mcp";
@@ -457,12 +459,7 @@ impl ProxyCoordinator {
         match status {
             "failed" | "cancelled" | "error" => {
                 st.in_flight_tools.remove(tc_id);
-                if st
-                    .pending_compact
-                    .as_ref()
-                    .map(|p| p.tool_call_id.as_str())
-                    == Some(tc_id)
-                {
+                if st.pending_compact.as_ref().map(|p| p.tool_call_id.as_str()) == Some(tc_id) {
                     st.pending_compact = None;
                 }
             }
@@ -544,12 +541,12 @@ impl ProxyCoordinator {
                                 let used = upd.get("used").and_then(Value::as_u64).unwrap_or(0);
                                 let size = upd.get("size").and_then(Value::as_u64).unwrap_or(0);
                                 if !sid.is_empty() {
-                                    let st = self
-                                        .sessions
-                                        .entry(sid.to_string())
-                                        .or_insert_with(|| SessionState {
-                                            session_id: sid.to_string(),
-                                            ..SessionState::default()
+                                    let st =
+                                        self.sessions.entry(sid.to_string()).or_insert_with(|| {
+                                            SessionState {
+                                                session_id: sid.to_string(),
+                                                ..SessionState::default()
+                                            }
                                         });
                                     st.last_used_tokens = used;
                                     if size > 0 {
@@ -632,12 +629,13 @@ impl ProxyCoordinator {
                         .unwrap_or_default();
                     if !sid.is_empty() {
                         if msg.get("result").is_some() {
-                            let st = self.sessions.entry(sid.clone()).or_insert_with(|| {
-                                SessionState {
-                                    session_id: sid.clone(),
-                                    ..SessionState::default()
-                                }
-                            });
+                            let st =
+                                self.sessions
+                                    .entry(sid.clone())
+                                    .or_insert_with(|| SessionState {
+                                        session_id: sid.clone(),
+                                        ..SessionState::default()
+                                    });
                             if st.session_id.is_empty() {
                                 st.session_id = sid;
                             }
@@ -674,7 +672,8 @@ impl ProxyCoordinator {
                         && !session_id.is_empty()
                     {
                         let orig_id = msg.get("id").cloned().unwrap_or(Value::Null);
-                        if let Some(outbound) = self.try_inject_compact(&session_id, orig_id, 0, true)
+                        if let Some(outbound) =
+                            self.try_inject_compact(&session_id, orig_id, 0, true)
                         {
                             return outbound;
                         }
@@ -804,11 +803,22 @@ fn write_json_line<W: Write>(writer: &mut W, msg: &Value) -> io::Result<()> {
     writer.flush()
 }
 
+pub fn append_proxy_log_line(path: &Path, line: &str) -> io::Result<()> {
+    let mut opts = OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600)
+            .custom_flags(crate::settings::UNIX_O_NOFOLLOW);
+    }
+    let mut f = opts.open(path)?;
+    writeln!(f, "{line}")
+}
+
 fn append_log(log_file: &Option<PathBuf>, line: &str) {
     let Some(path) = log_file else { return };
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = writeln!(f, "{line}");
-    }
+    let _ = append_proxy_log_line(path, line);
 }
 
 enum ProxyEvent {
@@ -976,11 +986,7 @@ fn pick_permission_option_id(params: &Value, allow: bool) -> Option<String> {
             }
         }
     }
-    options
-        .first()
-        .and_then(|o| o.get("optionId"))
-        .and_then(Value::as_str)
-        .map(str::to_string)
+    None
 }
 
 /// Standalone headless official ACP v1 pure-protocol runner with autonomous `/compact`.
@@ -996,10 +1002,7 @@ pub fn run_acp_headless(mut cfg: AcpRunConfig) -> io::Result<AcpRunReport> {
             .agy_args
             .push("--dangerously-skip-permissions".to_string());
     }
-    let cwd_abs = cfg
-        .cwd
-        .canonicalize()
-        .unwrap_or_else(|_| cfg.cwd.clone());
+    let cwd_abs = cfg.cwd.canonicalize().unwrap_or_else(|_| cfg.cwd.clone());
     let mut child = spawn_agy_acp(&cfg.proxy, Some(&cwd_abs))?;
     let mut child_stdin = child
         .stdin
@@ -1269,7 +1272,9 @@ pub fn run_acp_headless(mut cfg: AcpRunConfig) -> io::Result<AcpRunReport> {
     let _ = stderr_handle.join();
 
     if let Some(err) = prompt_res.get("error") {
-        return Err(io::Error::other(format!("ACP session/prompt failed: {err}")));
+        return Err(io::Error::other(format!(
+            "ACP session/prompt failed: {err}"
+        )));
     }
     let result = prompt_res.get("result").cloned().unwrap_or(Value::Null);
     let stop_reason = result

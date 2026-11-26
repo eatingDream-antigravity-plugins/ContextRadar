@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ledger::{LiveStepProbe, TurnSample};
 
-pub const INDEX_SCHEMA_VERSION: i64 = 2;
+// Older versions can contain cursors saved after incomplete host reads.
+pub const INDEX_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbVersionSig {
@@ -194,7 +195,9 @@ impl IndexDbCache {
     }
 
     pub fn save(&mut self, cid: &str, state: &ParsedLedgerState) {
-        let Some(conn) = self.ensure_conn() else { return };
+        let Some(conn) = self.ensure_conn() else {
+            return;
+        };
 
         let mut sorted_models: Vec<(i64, String, String)> = state
             .models
@@ -219,8 +222,11 @@ impl IndexDbCache {
             live_probe: state.live_probe.clone(),
         };
 
-        let Ok(raw_json) = serde_json::to_vec(&payload) else { return };
-        let mut encoder = ZlibEncoder::new(Vec::with_capacity(raw_json.len() / 2), Compression::fast());
+        let Ok(raw_json) = serde_json::to_vec(&payload) else {
+            return;
+        };
+        let mut encoder =
+            ZlibEncoder::new(Vec::with_capacity(raw_json.len() / 2), Compression::fast());
         if encoder.write_all(&raw_json).is_err() {
             return;
         }

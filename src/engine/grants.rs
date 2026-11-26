@@ -11,12 +11,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::i18n::{parse_lang_tag, resolve_active_lang, Lang};
 pub use crate::i18n::{
     build_compact_command, build_compact_command_for_lang,
     build_compact_command_with_note_for_lang, sanitize_scratch_note_path,
     sanitize_scratch_note_path_for_lang, sanitize_scratch_note_path_pure_for_lang,
 };
+use crate::i18n::{parse_lang_tag, resolve_active_lang, Lang};
 use crate::settings::{
     default_data_root, default_plugin_data_dir, expand_tilde, normalize_workspace_uri,
     ACP_PROXY_ENV, GRANTS_PATH_ENV,
@@ -36,25 +36,10 @@ pub fn is_acp_proxy_active() -> bool {
 #[cfg(unix)]
 mod file_lock {
     use super::*;
+    use crate::settings::UNIX_O_NOFOLLOW;
 
     const LOCK_EX: i32 = 2;
     const LOCK_UN: i32 = 8;
-
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    const O_NOFOLLOW: i32 = 0x0100;
-    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
-    const O_NOFOLLOW: i32 = 0o100000;
-    #[cfg(all(
-        target_os = "linux",
-        not(any(target_arch = "aarch64", target_arch = "arm"))
-    ))]
-    const O_NOFOLLOW: i32 = 0o400000;
 
     extern "C" {
         fn flock(fd: i32, operation: i32) -> i32;
@@ -75,7 +60,7 @@ mod file_lock {
             if let Some(parent) = store_path.parent() {
                 if !parent.as_os_str().is_empty() {
                     fs::create_dir_all(parent)?;
-                    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
                 }
             }
             let lpath = lock_path_for(store_path);
@@ -84,7 +69,7 @@ mod file_lock {
                 .read(true)
                 .write(true)
                 .mode(0o600)
-                .custom_flags(O_NOFOLLOW)
+                .custom_flags(UNIX_O_NOFOLLOW)
                 .open(&lpath)?;
             loop {
                 let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
@@ -113,10 +98,7 @@ pub fn default_grants_path(data_root: Option<&Path>) -> PathBuf {
     default_grants_path_in(None, data_root)
 }
 
-pub fn default_grants_path_in(
-    plugin_data_dir: Option<&Path>,
-    data_root: Option<&Path>,
-) -> PathBuf {
+pub fn default_grants_path_in(plugin_data_dir: Option<&Path>, data_root: Option<&Path>) -> PathBuf {
     if let Ok(ov) = env::var(GRANTS_PATH_ENV) {
         let trimmed = ov.trim();
         if !trimmed.is_empty() {
@@ -358,6 +340,28 @@ pub struct RelayGrant {
     pub allow_auto_handoff: Option<bool>,
 }
 
+impl RelayGrant {
+    pub(crate) fn display_until(&self) -> Option<f64> {
+        let expires = self.created_at + self.ttl_sec;
+        if !self.claimed {
+            return Some(expires);
+        }
+        let recorded_at = if !self.handoff_conversation_id.is_empty() {
+            self.handoff_at
+        } else if !self.compact_status.is_empty() {
+            self.compact_dispatched_at
+        } else {
+            return None;
+        };
+        let displayed_from = if recorded_at > 0.0 {
+            recorded_at
+        } else {
+            self.claimed_at
+        };
+        Some(expires.min(displayed_from + RELAY_DISPLAY_SEC))
+    }
+}
+
 fn default_ttl() -> f64 {
     GRANT_TTL_SEC
 }
@@ -402,9 +406,64 @@ pub struct ActionOutcome {
     pub handoff_conversation_id: Option<String>,
 }
 
+pub(crate) type GrantFileSignature = (u64, u64, i128, u64);
+
+fn file_signature(meta: &fs::Metadata) -> GrantFileSignature {
+    (
+        meta.dev(),
+        meta.ino(),
+        (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128),
+        meta.size(),
+    )
+}
+
+struct GrantStorage {
+    lock: fn(&Path) -> io::Result<file_lock::GrantFileLock>,
+    write: fn(&mut File, &[u8]) -> io::Result<()>,
+    rename: fn(&Path, &Path) -> io::Result<()>,
+}
+
+impl Default for GrantStorage {
+    fn default() -> Self {
+        Self {
+            lock: file_lock::GrantFileLock::acquire,
+            write: File::write_all,
+            rename: |from, to| fs::rename(from, to),
+        }
+    }
+}
+
+impl ClaimOutcome {
+    pub fn denied(reason: &str) -> Self {
+        Self {
+            claimed: false,
+            reason: Some(reason.into()),
+            grant_id: None,
+            conversation_id: None,
+            workspace: None,
+            compact_command: None,
+            handoff_prompt: None,
+            handoff_conversation_id: None,
+            running_subagent_count: None,
+        }
+    }
+}
+
+impl ActionOutcome {
+    fn failed(reason: &str) -> Self {
+        Self {
+            ok: false,
+            reason: Some(reason.into()),
+            grant_id: None,
+            handoff_conversation_id: None,
+        }
+    }
+}
+
 pub struct RelayGrantStore {
     pub path: PathBuf,
-    cache_sig: Option<(u64, u64, i128, u64)>,
+    cache_sig: Option<GrantFileSignature>,
+    storage: GrantStorage,
     cache_data: Option<StoreFile>,
 }
 
@@ -413,93 +472,117 @@ impl RelayGrantStore {
         Self {
             path,
             cache_sig: None,
+            storage: GrantStorage::default(),
             cache_data: None,
         }
     }
 
-    fn load(&mut self) -> StoreFile {
-        let Ok(meta) = fs::symlink_metadata(&self.path) else {
-            self.cache_sig = None;
-            self.cache_data = None;
-            return StoreFile::default();
+    fn load_checked(&mut self) -> io::Result<StoreFile> {
+        let meta = match fs::symlink_metadata(&self.path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                self.cache_sig = None;
+                self.cache_data = None;
+                return Ok(StoreFile::default());
+            }
+            Err(err) => {
+                self.cache_sig = None;
+                self.cache_data = None;
+                return Err(err);
+            }
         };
         if meta.file_type().is_symlink() || !meta.file_type().is_file() {
             self.cache_sig = None;
             self.cache_data = None;
-            return StoreFile::default();
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "grant store is not a regular file",
+            ));
         }
-        let sig = (
-            meta.dev(),
-            meta.ino(),
-            (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128),
-            meta.size(),
-        );
+        let sig = file_signature(&meta);
         if self.cache_sig == Some(sig) {
             if let Some(ref cached) = self.cache_data {
-                return cached.clone();
+                return Ok(cached.clone());
             }
         }
-        if let Ok(raw) = fs::read_to_string(&self.path) {
-            if let Ok(parsed) = serde_json::from_str::<StoreFile>(&raw) {
-                self.cache_sig = Some(sig);
-                self.cache_data = Some(parsed.clone());
-                return parsed;
-            }
-        }
-        StoreFile::default()
+        let raw = fs::read_to_string(&self.path).inspect_err(|_| {
+            self.cache_sig = None;
+            self.cache_data = None;
+        })?;
+        let parsed = serde_json::from_str::<StoreFile>(&raw).map_err(|err| {
+            self.cache_sig = None;
+            self.cache_data = None;
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("corrupt grant store JSON: {err}"),
+            )
+        })?;
+        self.cache_sig = Some(sig);
+        self.cache_data = Some(parsed.clone());
+        Ok(parsed)
     }
 
-    fn save(&mut self, data: &StoreFile) {
-        if let Ok(smeta) = fs::symlink_metadata(&self.path) {
-            if smeta.file_type().is_symlink() {
-                return;
-            }
-        }
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-            }
-        }
-        let parent_dir = self
-            .path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let tmp_name = format!(".grants-{}-{}.tmp", std::process::id(), random_hex_16());
-        let tmp_path = parent_dir.join(tmp_name);
+    pub(crate) fn disk_signature(&self) -> Option<GrantFileSignature> {
+        fs::symlink_metadata(&self.path)
+            .ok()
+            .map(|meta| file_signature(&meta))
+    }
 
-        let Ok(payload) = serde_json::to_vec(data) else { return };
-        let write_ok = OpenOptions::new()
+    fn save(&mut self, data: &StoreFile) -> io::Result<()> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "grant store is a symlink",
+                ));
+            }
+            Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+            _ => {}
+        }
+        let payload = serde_json::to_vec(data)?;
+        let tmp_name = format!(".grants-{}-{}.tmp", std::process::id(), random_hex_16());
+        let tmp_path = self.path.with_file_name(tmp_name);
+        let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
-            .open(&tmp_path)
-            .and_then(|mut f| f.write_all(&payload));
-
-        if write_ok.is_ok() && fs::rename(&tmp_path, &self.path).is_ok() {
-            if let Ok(meta) = fs::metadata(&self.path) {
-                let sig = (
-                    meta.dev(),
-                    meta.ino(),
-                    (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128),
-                    meta.size(),
-                );
+            .open(&tmp_path)?;
+        let result = (|| {
+            file.set_permissions(fs::Permissions::from_mode(0o600))?;
+            (self.storage.write)(&mut file, &payload)?;
+            file.sync_all()?;
+            let sig = file_signature(&file.metadata()?);
+            (self.storage.rename)(&tmp_path, &self.path)?;
+            Ok(sig)
+        })();
+        match result {
+            Ok(sig) => {
                 self.cache_sig = Some(sig);
                 self.cache_data = Some(data.clone());
-                return;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(err)
             }
         }
-        let _ = fs::remove_file(&tmp_path);
-        self.cache_sig = None;
-        self.cache_data = None;
+    }
+
+    pub fn try_get_settings(&mut self) -> io::Result<PanelPrefs> {
+        Ok(self.load_checked()?.settings)
     }
 
     pub fn get_settings(&mut self) -> PanelPrefs {
-        self.load().settings
+        match self.load_checked() {
+            Ok(data) => data.settings,
+            Err(_) => PanelPrefs {
+                allow_auto_handoff: false,
+                lang: String::new(),
+            },
+        }
     }
 
-    pub fn update_settings(&mut self, allow_auto_handoff: Option<bool>) -> PanelPrefs {
+    pub fn update_settings(&mut self, allow_auto_handoff: Option<bool>) -> io::Result<PanelPrefs> {
         self.update_settings_with_lang(allow_auto_handoff, None)
     }
 
@@ -507,11 +590,9 @@ impl RelayGrantStore {
         &mut self,
         allow_auto_handoff: Option<bool>,
         lang: Option<&str>,
-    ) -> PanelPrefs {
-        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
-            return self.load().settings;
-        };
-        let mut data = self.load();
+    ) -> io::Result<PanelPrefs> {
+        let _lock = (self.storage.lock)(&self.path)?;
+        let mut data = self.load_checked()?;
         if let Some(v) = allow_auto_handoff {
             data.settings.allow_auto_handoff = v;
         }
@@ -523,12 +604,12 @@ impl RelayGrantStore {
                 data.settings.lang = parsed.as_str().to_string();
             }
         }
-        self.save(&data);
-        data.settings
+        self.save(&data)?;
+        Ok(data.settings)
     }
 
     pub fn find_grant(&mut self, grant_id: &str) -> Option<RelayGrant> {
-        self.load().grants.get(grant_id).cloned()
+        self.load_checked().ok()?.grants.get(grant_id).cloned()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -543,7 +624,7 @@ impl RelayGrantStore {
         kind: &str,
         scratch_note_path: &str,
         title: &str,
-    ) -> RelayGrant {
+    ) -> io::Result<RelayGrant> {
         self.create_grant_scoped(
             preserve_points,
             resume_task,
@@ -575,10 +656,10 @@ impl RelayGrantStore {
         scratch_note_path: &str,
         title: &str,
         lang: Lang,
-    ) -> RelayGrant {
+    ) -> io::Result<RelayGrant> {
         let now = now_sec();
-        let lock = file_lock::GrantFileLock::acquire(&self.path).ok();
-        let mut data = self.load();
+        let _lock = (self.storage.lock)(&self.path)?;
+        let mut data = self.load_checked()?;
         data.grants
             .retain(|_, g| (now - g.created_at) <= GRANT_PRUNE_SEC);
 
@@ -638,11 +719,9 @@ impl RelayGrantStore {
             running_subagent_count: None,
             allow_auto_handoff: None,
         };
-        if lock.is_some() {
-            data.grants.insert(grant_id, entry.clone());
-            self.save(&data);
-        }
-        entry
+        data.grants.insert(grant_id, entry.clone());
+        self.save(&data)?;
+        Ok(entry)
     }
 
     pub fn get_pending_grant(&mut self, now_override: Option<f64>) -> Option<RelayGrant> {
@@ -660,16 +739,14 @@ impl RelayGrantStore {
         let ws_f = scope_workspace
             .map(normalize_workspace_uri)
             .filter(|s| !s.is_empty());
-        let data = self.load();
+        let Ok(data) = self.load_checked() else {
+            return None;
+        };
         let mut cands: Vec<RelayGrant> = data
             .grants
             .values()
             .filter(|rec| {
-                if rec.dismissed {
-                    return false;
-                }
-                let age = ref_now - rec.created_at;
-                if age > rec.ttl_sec {
+                if rec.dismissed || !rec.display_until().is_some_and(|until| ref_now <= until) {
                     return false;
                 }
                 if let Some(cid_req) = cid_f {
@@ -688,26 +765,7 @@ impl RelayGrantStore {
                         return false;
                     }
                 }
-                if !rec.claimed {
-                    return true;
-                }
-                if !rec.handoff_conversation_id.is_empty() {
-                    let h_ts = if rec.handoff_at > 0.0 {
-                        rec.handoff_at
-                    } else {
-                        rec.claimed_at
-                    };
-                    return (ref_now - h_ts) <= RELAY_DISPLAY_SEC;
-                }
-                if !rec.compact_status.is_empty() {
-                    let c_ts = if rec.compact_dispatched_at > 0.0 {
-                        rec.compact_dispatched_at
-                    } else {
-                        rec.claimed_at
-                    };
-                    return (ref_now - c_ts) <= RELAY_DISPLAY_SEC;
-                }
-                false
+                true
             })
             .cloned()
             .collect();
@@ -754,47 +812,19 @@ impl RelayGrantStore {
         require_auto_handoff: bool,
     ) -> ClaimOutcome {
         if grant_id.is_empty() {
-            return ClaimOutcome {
-                claimed: false,
-                reason: Some("missing_grant_id".into()),
-                grant_id: None,
-                conversation_id: None,
-                workspace: None,
-                compact_command: None,
-                handoff_prompt: None,
-                handoff_conversation_id: None,
-                running_subagent_count: None,
-            };
+            return ClaimOutcome::denied("missing_grant_id");
         }
-        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
-            return ClaimOutcome {
-                claimed: false,
-                reason: Some("lock_error".into()),
-                grant_id: None,
-                conversation_id: None,
-                workspace: None,
-                compact_command: None,
-                handoff_prompt: None,
-                handoff_conversation_id: None,
-                running_subagent_count: None,
-            };
+        let Ok(_lock) = (self.storage.lock)(&self.path) else {
+            return ClaimOutcome::denied("lock_error");
         };
         let now = now_sec();
-        let mut data = self.load();
+        let Ok(mut data) = self.load_checked() else {
+            return ClaimOutcome::denied("storage_error");
+        };
         let allow_auto = data.settings.allow_auto_handoff;
 
         let Some(rec) = data.grants.get_mut(grant_id) else {
-            return ClaimOutcome {
-                claimed: false,
-                reason: Some("not_found".into()),
-                grant_id: None,
-                conversation_id: None,
-                workspace: None,
-                compact_command: None,
-                handoff_prompt: None,
-                handoff_conversation_id: None,
-                running_subagent_count: None,
-            };
+            return ClaimOutcome::denied("not_found");
         };
 
         if let Some(ecid) = expected_cid.map(str::trim).filter(|s| !s.is_empty()) {
@@ -848,52 +878,26 @@ impl RelayGrantStore {
         }
 
         if (now - rec.created_at) > rec.ttl_sec {
-            return ClaimOutcome {
-                claimed: false,
-                reason: Some("expired".into()),
-                grant_id: None,
-                conversation_id: None,
-                workspace: None,
-                compact_command: None,
-                handoff_prompt: None,
-                handoff_conversation_id: None,
-                running_subagent_count: None,
-            };
+            return ClaimOutcome::denied("expired");
         }
 
         if let Some(cur_ckpts) = current_checkpoints {
             if cur_ckpts > rec.created_checkpoints {
                 rec.claimed = true;
-                self.save(&data);
-                return ClaimOutcome {
-                    claimed: false,
-                    reason: Some("already_compacted".into()),
-                    grant_id: None,
-                    conversation_id: None,
-                    workspace: None,
-                    compact_command: None,
-                    handoff_prompt: None,
-                    handoff_conversation_id: None,
-                    running_subagent_count: None,
-                };
+                if self.save(&data).is_err() {
+                    return ClaimOutcome::denied("storage_error");
+                }
+                return ClaimOutcome::denied("already_compacted");
             }
         }
 
         if let Some(cur_turns) = current_turns {
             if rec.created_turns > 0 && cur_turns.saturating_sub(rec.created_turns) > 4 {
                 rec.claimed = true;
-                self.save(&data);
-                return ClaimOutcome {
-                    claimed: false,
-                    reason: Some("session_advanced".into()),
-                    grant_id: None,
-                    conversation_id: None,
-                    workspace: None,
-                    compact_command: None,
-                    handoff_prompt: None,
-                    handoff_conversation_id: None,
-                    running_subagent_count: None,
-                };
+                if self.save(&data).is_err() {
+                    return ClaimOutcome::denied("storage_error");
+                }
+                return ClaimOutcome::denied("session_advanced");
             }
         }
 
@@ -913,18 +917,13 @@ impl RelayGrantStore {
             }
         }
 
-        if require_auto_handoff && !allow_auto {
-            return ClaimOutcome {
-                claimed: false,
-                reason: Some("auto_handoff_disabled".into()),
-                grant_id: None,
-                conversation_id: None,
-                workspace: None,
-                compact_command: None,
-                handoff_prompt: None,
-                handoff_conversation_id: None,
-                running_subagent_count: None,
-            };
+        if require_auto_handoff {
+            if !allow_auto {
+                return ClaimOutcome::denied("auto_handoff_disabled");
+            }
+            if !rec.auto_fire {
+                return ClaimOutcome::denied("auto_fire_disabled");
+            }
         }
 
         rec.claimed = true;
@@ -940,41 +939,32 @@ impl RelayGrantStore {
             handoff_conversation_id: None,
             running_subagent_count: None,
         };
-        self.save(&data);
+        if self.save(&data).is_err() {
+            return ClaimOutcome::denied("storage_error");
+        }
         out
     }
 
     pub fn record_relay(&mut self, grant_id: &str, handoff_cid: &str) -> ActionOutcome {
         if grant_id.is_empty() {
-            return ActionOutcome {
-                ok: false,
-                reason: Some("missing_grant_id".into()),
-                grant_id: None,
-                handoff_conversation_id: None,
-            };
+            return ActionOutcome::failed("missing_grant_id");
         }
-        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
-            return ActionOutcome {
-                ok: false,
-                reason: Some("lock_error".into()),
-                grant_id: None,
-                handoff_conversation_id: None,
-            };
+        let Ok(_lock) = (self.storage.lock)(&self.path) else {
+            return ActionOutcome::failed("lock_error");
         };
-        let mut data = self.load();
+        let Ok(mut data) = self.load_checked() else {
+            return ActionOutcome::failed("storage_error");
+        };
         let Some(rec) = data.grants.get_mut(grant_id) else {
-            return ActionOutcome {
-                ok: false,
-                reason: Some("not_found".into()),
-                grant_id: None,
-                handoff_conversation_id: None,
-            };
+            return ActionOutcome::failed("not_found");
         };
         rec.claimed = true;
         rec.handoff_conversation_id = handoff_cid.trim().to_string();
         rec.handoff_at = now_sec();
         let saved_cid = rec.handoff_conversation_id.clone();
-        self.save(&data);
+        if self.save(&data).is_err() {
+            return ActionOutcome::failed("storage_error");
+        }
         ActionOutcome {
             ok: true,
             reason: None,
@@ -985,29 +975,16 @@ impl RelayGrantStore {
 
     pub fn record_compact(&mut self, grant_id: &str, status: &str) -> ActionOutcome {
         if grant_id.is_empty() {
-            return ActionOutcome {
-                ok: false,
-                reason: Some("missing_grant_id".into()),
-                grant_id: None,
-                handoff_conversation_id: None,
-            };
+            return ActionOutcome::failed("missing_grant_id");
         }
-        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
-            return ActionOutcome {
-                ok: false,
-                reason: Some("lock_error".into()),
-                grant_id: None,
-                handoff_conversation_id: None,
-            };
+        let Ok(_lock) = (self.storage.lock)(&self.path) else {
+            return ActionOutcome::failed("lock_error");
         };
-        let mut data = self.load();
+        let Ok(mut data) = self.load_checked() else {
+            return ActionOutcome::failed("storage_error");
+        };
         let Some(rec) = data.grants.get_mut(grant_id) else {
-            return ActionOutcome {
-                ok: false,
-                reason: Some("not_found".into()),
-                grant_id: None,
-                handoff_conversation_id: None,
-            };
+            return ActionOutcome::failed("not_found");
         };
         rec.claimed = true;
         if rec.claimed_at <= 0.0 {
@@ -1016,7 +993,9 @@ impl RelayGrantStore {
         rec.compact_status = status.trim().to_string();
         rec.compact_dispatched_at = now_sec();
         let saved = rec.compact_status.clone();
-        self.save(&data);
+        if self.save(&data).is_err() {
+            return ActionOutcome::failed("storage_error");
+        }
         ActionOutcome {
             ok: true,
             reason: Some(saved),
@@ -1027,37 +1006,135 @@ impl RelayGrantStore {
 
     pub fn dismiss_grant(&mut self, grant_id: &str) -> ActionOutcome {
         if grant_id.is_empty() {
-            return ActionOutcome {
-                ok: false,
-                reason: Some("missing_grant_id".into()),
-                grant_id: None,
-                handoff_conversation_id: None,
-            };
+            return ActionOutcome::failed("missing_grant_id");
         }
-        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
-            return ActionOutcome {
-                ok: false,
-                reason: Some("lock_error".into()),
-                grant_id: None,
-                handoff_conversation_id: None,
-            };
+        let Ok(_lock) = (self.storage.lock)(&self.path) else {
+            return ActionOutcome::failed("lock_error");
         };
-        let mut data = self.load();
+        let Ok(mut data) = self.load_checked() else {
+            return ActionOutcome::failed("storage_error");
+        };
         let Some(rec) = data.grants.get_mut(grant_id) else {
-            return ActionOutcome {
-                ok: false,
-                reason: Some("not_found".into()),
-                grant_id: None,
-                handoff_conversation_id: None,
-            };
+            return ActionOutcome::failed("not_found");
         };
         rec.dismissed = true;
-        self.save(&data);
+        if self.save(&data).is_err() {
+            return ActionOutcome::failed("storage_error");
+        }
         ActionOutcome {
             ok: true,
             reason: None,
             grant_id: Some(grant_id.to_string()),
             handoff_conversation_id: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_write_or_rename_does_not_create_or_consume_grants() {
+        for fail_write in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("relay_grants.json");
+            let mut store = RelayGrantStore::new(path.clone());
+            let create = |store: &mut RelayGrantStore| {
+                store.create_grant("Keep state", "Resume", true, "", 0, 0, "handoff", "", "")
+            };
+            let grant = create(&mut store).unwrap();
+            let before = fs::read(&path).unwrap();
+            if fail_write {
+                store.storage.write = |file, payload| {
+                    file.write_all(&payload[..8])?;
+                    Err(io::Error::other("injected write error"))
+                };
+            } else {
+                store.storage.rename = |_, _| Err(io::Error::other("injected rename error"));
+            }
+
+            assert!(create(&mut store).is_err());
+            let failed = store.claim_grant(&grant.grant_id, None, None, None, false);
+            assert!(!failed.claimed);
+            assert_eq!(failed.reason.as_deref(), Some("storage_error"));
+            assert!(failed.grant_id.is_none());
+            assert!(failed.compact_command.is_none());
+            assert!(failed.handoff_prompt.is_none());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_eq!(root.path().read_dir().unwrap().count(), 2);
+            assert!(!store.find_grant(&grant.grant_id).unwrap().claimed);
+
+            let mut retry = RelayGrantStore::new(path.clone());
+            let claimed = retry.claim_grant(&grant.grant_id, None, None, None, false);
+            assert!(claimed.claimed);
+            assert!(claimed.handoff_prompt.is_some());
+            let replay =
+                RelayGrantStore::new(path).claim_grant(&grant.grant_id, None, None, None, false);
+            assert!(!replay.claimed);
+            assert_eq!(replay.reason.as_deref(), Some("already_claimed"));
+            assert!(replay.handoff_prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn corrupt_grant_store_fails_closed_and_preserves_file() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("relay_grants.json");
+        let mut store = RelayGrantStore::new(path.clone());
+        store.update_settings(Some(false)).unwrap();
+        let grant = store
+            .create_grant("Keep state", "Resume", true, "", 0, 0, "handoff", "", "")
+            .unwrap();
+
+        let corrupt = b"{\"settings\":{\"allow_auto_handoff\":false},\"grants\":{BROKEN";
+        fs::write(&path, corrupt).unwrap();
+
+        let mut reader = RelayGrantStore::new(path.clone());
+        assert!(
+            !reader.get_settings().allow_auto_handoff,
+            "corrupt store must fail safe with allow_auto_handoff=false"
+        );
+        assert!(reader.try_get_settings().is_err());
+        assert!(reader.update_settings(Some(true)).is_err());
+        assert!(reader
+            .create_grant("New", "Task", true, "", 0, 0, "handoff", "", "")
+            .is_err());
+        let claim = reader.claim_grant(&grant.grant_id, None, None, None, false);
+        assert!(!claim.claimed);
+        assert_eq!(claim.reason.as_deref(), Some("storage_error"));
+        assert_eq!(
+            reader
+                .record_relay(&grant.grant_id, "new-cid")
+                .reason
+                .as_deref(),
+            Some("storage_error")
+        );
+        assert_eq!(
+            reader.dismiss_grant(&grant.grant_id).reason.as_deref(),
+            Some("storage_error")
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            corrupt,
+            "corrupt grant store file must never be overwritten"
+        );
+    }
+
+    #[test]
+    fn auto_claim_enforces_ticket_auto_fire_flag() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("relay_grants.json");
+        let mut store = RelayGrantStore::new(path);
+        let grant = store
+            .create_grant("Keep", "Next", false, "", 0, 0, "handoff", "", "")
+            .unwrap();
+
+        let auto = store.claim_grant(&grant.grant_id, None, None, Some(0), true);
+        assert!(!auto.claimed);
+        assert_eq!(auto.reason.as_deref(), Some("auto_fire_disabled"));
+
+        let manual = store.claim_grant(&grant.grant_id, None, None, Some(0), false);
+        assert!(manual.claimed);
     }
 }

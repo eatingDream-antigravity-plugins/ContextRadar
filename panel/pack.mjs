@@ -1,13 +1,16 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import vm from "node:vm";
 import { execFileSync } from "node:child_process";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
-const MAX_BUNDLE_BYTES = 45 * 1024;
+const MAX_BUNDLE_BYTES = 43_500;
+const WARN_BUNDLE_BYTES = 43_000;
+const CSP = "default-src 'none';style-src 'unsafe-inline';script-src 'unsafe-inline'";
 
 function tryLoadEsbuild() {
   const candidates = [process.env.ESBUILD_PATH, "esbuild"].filter(Boolean);
@@ -24,9 +27,8 @@ function tryCliBundle(entryJs, bridgeJs) {
   try {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "cr-pack-"));
     fs.writeFileSync(path.join(tmpDir, "bridge.js"), fs.readFileSync(bridgeJs, "utf8"), "utf8");
-    const compactedView = compactHtmlLiterals(fs.readFileSync(entryJs, "utf8"));
     const tmpEntry = path.join(tmpDir, "view.js");
-    fs.writeFileSync(tmpEntry, compactedView, "utf8");
+    fs.writeFileSync(tmpEntry, fs.readFileSync(entryJs, "utf8"), "utf8");
 
     for (const esbBin of ["esbuild", "/opt/homebrew/bin/esbuild", "/usr/local/bin/esbuild"]) {
       try {
@@ -76,16 +78,10 @@ function tryCliBundle(entryJs, bridgeJs) {
   }
 }
 
-function compactHtmlLiterals(src) {
-  return src
-    .replace(/>\s+</g, "><")
-    .replace(/>\s+\$\{/g, ">${")
-    .replace(/\}\s+</g, "}<");
-}
-
-function fallbackMinifyCss(css) {
+function minifyCss(css) {
   return css
     .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/--buncss-[^;:}]*:[^;}]*;?/g, "")
     .replace(/\s+/g, " ")
     .replace(/\s*([{}:;,>+~])\s*/g, "$1")
     .replace(/;}/g, "}")
@@ -97,7 +93,7 @@ function stripJsCommentsAndIndent(code) {
   let i = 0;
   const n = code.length;
   let state = "code";
-  let tplDepth = [];
+  const tplDepth = [];
 
   while (i < n) {
     const ch = code[i];
@@ -193,10 +189,9 @@ function stripJsCommentsAndIndent(code) {
 
 function fallbackBundleJs(bridgeSrc, viewSrc) {
   const cleanBridge = bridgeSrc.replace(/^\s*export\s+/gm, "");
-  const cleanView = compactHtmlLiterals(
-    viewSrc.replace(/^\s*import\s+[\s\S]*?from\s+["']\.\/bridge\.js["'];?\s*/m, "")
-  );
-  return `(()=>{${stripJsCommentsAndIndent(`${cleanBridge}\n${cleanView}`)}})();`;
+  const cleanView = viewSrc.replace(/^\s*import\s+[\s\S]*?from\s+["']\.\/bridge\.js["'];?\s*/m, "");
+  const wrappedBridge = `const {McpAppBridge,applyDocumentTheme,applyHostFonts,applyHostStyleVariables}=(()=>{${cleanBridge}\nreturn {McpAppBridge,applyDocumentTheme,applyHostFonts,applyHostStyleVariables};})();`;
+  return `(()=>{${stripJsCommentsAndIndent(`${wrappedBridge}\n${cleanView}`)}})();`;
 }
 
 async function main() {
@@ -210,20 +205,10 @@ async function main() {
   const esbuild = tryLoadEsbuild();
 
   let jsCode;
-  let cssCode;
   let bundler = "fallback";
 
   if (esbuild) {
     bundler = "esbuild";
-    const compactPlugin = {
-      name: "compact-html-templates",
-      setup(build) {
-        build.onLoad({ filter: /\/view\.js$/ }, async (args) => {
-          const src = await fs.promises.readFile(args.path, "utf8");
-          return { contents: compactHtmlLiterals(src), loader: "js" };
-        });
-      },
-    };
     const res = await esbuild.build({
       entryPoints: [entryJs],
       bundle: true,
@@ -234,11 +219,9 @@ async function main() {
       format: "iife",
       platform: "browser",
       target: ["es2022"],
-      plugins: [compactPlugin],
       write: false,
     });
     jsCode = res.outputFiles[0].text.trim().replace(/<\/script/gi, "<\\/script");
-    cssCode = fallbackMinifyCss(rawCss).replace(/<\/style/gi, "<\\/style");
   } else {
     const cliOut = tryCliBundle(entryJs, bridgeJs);
     if (cliOut) {
@@ -250,22 +233,33 @@ async function main() {
         fs.readFileSync(entryJs, "utf8")
       ).replace(/<\/script/gi, "<\\/script");
     }
-    cssCode = fallbackMinifyCss(rawCss).replace(/<\/style/gi, "<\\/style");
   }
 
-  const html = `<!doctype html><html lang="en" style="background:#141311;color-scheme:dark"><head><meta charset="utf-8"><meta name="color-scheme" content="dark"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Context Radar</title><style>${cssCode}</style></head><body style="background:#141311"><div id="root"></div><script>/*__CONTEXT_RADAR_BOOT__*/</script><script>${jsCode}</script></body></html>`;
+  const cssCode = minifyCss(rawCss).replace(/<\/style/gi, "<\\/style");
+  const html = `<!doctype html><html lang="en" style="background:#141311;color-scheme:dark"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${CSP}"><meta name="color-scheme" content="dark"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Context Radar</title><style>${cssCode}</style></head><body style="background:#141311"><div id="root"></div><script>/*__CONTEXT_RADAR_BOOT__*/${jsCode}</script></body></html>`;
 
-  fs.mkdirSync(distDir, { recursive: true });
-  fs.writeFileSync(outHtml, html, "utf8");
+  // Validate syntax and hard size cap BEFORE touching dist/panel.html
+  new vm.Script(jsCode);
+  const jsBytes = Buffer.byteLength(jsCode, "utf8");
+  const cssBytes = Buffer.byteLength(cssCode, "utf8");
   const totalBytes = Buffer.byteLength(html, "utf8");
-  const jsKb = (Buffer.byteLength(jsCode, "utf8") / 1024).toFixed(1);
-  const cssKb = (Buffer.byteLength(cssCode, "utf8") / 1024).toFixed(1);
   const totalKb = (totalBytes / 1024).toFixed(1);
+  if (totalBytes > MAX_BUNDLE_BYTES) {
+    throw new Error(
+      `Panel bundle ${totalBytes} B exceeds ${MAX_BUNDLE_BYTES} B limit (JS ${jsBytes} B + CSS ${cssBytes} B, bundler=${bundler}); dist unchanged`
+    );
+  }
+  fs.mkdirSync(distDir, { recursive: true });
+  const tmpHtml = path.join(distDir, `.panel-${process.pid}.tmp`);
+  fs.writeFileSync(tmpHtml, html, "utf8");
+  fs.renameSync(tmpHtml, outHtml);
   console.log(
-    `Packed ${outHtml} (${totalKb} KiB / ${totalBytes} B total: JS ${jsKb} KiB + CSS ${cssKb} KiB, bundler=${bundler})`
+    `Packed ${outHtml} (${totalKb} KiB / ${totalBytes} B total: JS ${jsBytes} B + CSS ${cssBytes} B, bundler=${bundler})`
   );
-  if (totalBytes >= MAX_BUNDLE_BYTES) {
-    throw new Error(`Panel bundle ${totalBytes} B exceeds ${MAX_BUNDLE_BYTES} B (<45 KiB) limit`);
+  if (totalBytes > WARN_BUNDLE_BYTES) {
+    console.warn(
+      `WARNING: Panel bundle ${totalBytes} B exceeds ${WARN_BUNDLE_BYTES} B warning threshold`
+    );
   }
 }
 

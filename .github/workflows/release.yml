@@ -80,9 +80,8 @@ jobs:
     if: ${{ inputs.platforms != 'macos' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.prepare-release.outputs.tag }}
       TARGET: x86_64-unknown-linux-gnu
     steps:
@@ -99,33 +98,38 @@ jobs:
           key: linux-x86_64
       - name: Pack and verify MCP App panel
         run: |
-          npm --prefix "${RUNNER_TEMP}/esbuild" install --no-save esbuild
+          npm --prefix "${RUNNER_TEMP}/esbuild" install --no-save esbuild@0.28.2
           ESBUILD_PATH="${RUNNER_TEMP}/esbuild/node_modules/esbuild" node panel/pack.mjs
           node --test panel/panel.test.mjs
       - name: Run Rust test suite
         run: cargo test --locked
-      - name: Build, verify, and upload Linux tarball
+      - name: Build, verify, and stage Linux tarball
         run: |
-          RUSTFLAGS="--remap-path-prefix=${HOME}=/build" cargo build --release --locked --target "${TARGET}"
+          RUSTFLAGS="--remap-path-prefix=${HOME}=/build --remap-path-prefix=${PWD}=/src" cargo build --release --locked --target "${TARGET}"
           bin="target/${TARGET}/release/context-radar-mcp"
-          if strings "$bin" | grep -F "${HOME}" >/dev/null 2>&1; then
-            echo "error: runner HOME path leaked into release binary" >&2
+          if strings "$bin" | grep -F -e "${HOME}" -e "${PWD}" >/dev/null 2>&1; then
+            echo "error: runner path leaked into release binary" >&2
             exit 1
           fi
           STAGE="${RUNNER_TEMP}/stage-${TARGET}"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE/bin" "$STAGE/panel/dist" "$STAGE/rules" "$STAGE/skills/context-radar" "$STAGE/assets"
+          OUT="${RUNNER_TEMP}/artifacts-${TARGET}"
+          rm -rf "$STAGE" "$OUT"
+          mkdir -p "$STAGE/bin" "$STAGE/panel/dist" "$STAGE/rules" "$STAGE/skills/context-radar" "$STAGE/assets" "$STAGE/docs" "$OUT"
           install -m 0755 "$bin" "$STAGE/bin/context-radar-mcp"
           cp panel/dist/panel.html "$STAGE/panel/dist/panel.html"
-          cp plugin.json mcp_config.json hooks.json LICENSE README.md settings.example.json settings.schema.json "$STAGE/"
+          cp plugin.json mcp_config.json hooks.json LICENSE README.md llms.txt settings.example.json settings.schema.json "$STAGE/"
           cp rules/AGENTS.md "$STAGE/rules/AGENTS.md"
           cp skills/context-radar/SKILL.md "$STAGE/skills/context-radar/SKILL.md"
           cp assets/logo.svg "$STAGE/assets/logo.svg"
+          cp docs/ai-guide.md "$STAGE/docs/ai-guide.md"
           ARCHIVE="context-radar-mcp-${TAG}-${TARGET}.tar.gz"
-          tar -C "$STAGE" -czf "$ARCHIVE" .
-          sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
-          cat "${ARCHIVE}.sha256"
-          gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
+          tar -C "$STAGE" -czf "${OUT}/${ARCHIVE}" .
+          (cd "$OUT" && sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256" && cat "${ARCHIVE}.sha256")
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dist-${{ env.TARGET }}
+          path: ${{ runner.temp }}/artifacts-${{ env.TARGET }}/*
+          if-no-files-found: error
 
   build-macos:
     name: Build (macOS arm64 + x86_64)
@@ -133,9 +137,8 @@ jobs:
     if: ${{ inputs.platforms != 'linux' }}
     runs-on: macos-15-intel
     permissions:
-      contents: write
+      contents: read
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.prepare-release.outputs.tag }}
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
@@ -152,33 +155,65 @@ jobs:
           key: macos-universal
       - name: Pack and verify MCP App panel
         run: |
-          npm --prefix "${RUNNER_TEMP}/esbuild" install --no-save esbuild
+          npm --prefix "${RUNNER_TEMP}/esbuild" install --no-save esbuild@0.28.2
           ESBUILD_PATH="${RUNNER_TEMP}/esbuild/node_modules/esbuild" node panel/pack.mjs
           node --test panel/panel.test.mjs
       - name: Run Rust test suite
         run: cargo test --locked
-      - name: Build, verify, and upload macOS tarballs
+      - name: Build, verify, and stage macOS tarballs
         run: |
+          OUT="${RUNNER_TEMP}/artifacts-macos"
+          rm -rf "$OUT"
+          mkdir -p "$OUT"
           for TARGET in aarch64-apple-darwin x86_64-apple-darwin; do
             echo "=== Building ${TARGET} ==="
-            RUSTFLAGS="--remap-path-prefix=${HOME}=/build" cargo build --release --locked --target "${TARGET}"
+            RUSTFLAGS="--remap-path-prefix=${HOME}=/build --remap-path-prefix=${PWD}=/src" cargo build --release --locked --target "${TARGET}"
             bin="target/${TARGET}/release/context-radar-mcp"
-            if strings "$bin" | grep -F "${HOME}" >/dev/null 2>&1; then
-              echo "error: runner HOME path leaked into release binary (${TARGET})" >&2
+            if strings "$bin" | grep -F -e "${HOME}" -e "${PWD}" >/dev/null 2>&1; then
+              echo "error: runner path leaked into release binary (${TARGET})" >&2
               exit 1
             fi
             STAGE="${RUNNER_TEMP}/stage-${TARGET}"
             rm -rf "$STAGE"
-            mkdir -p "$STAGE/bin" "$STAGE/panel/dist" "$STAGE/rules" "$STAGE/skills/context-radar" "$STAGE/assets"
+            mkdir -p "$STAGE/bin" "$STAGE/panel/dist" "$STAGE/rules" "$STAGE/skills/context-radar" "$STAGE/assets" "$STAGE/docs"
             install -m 0755 "$bin" "$STAGE/bin/context-radar-mcp"
             cp panel/dist/panel.html "$STAGE/panel/dist/panel.html"
-            cp plugin.json mcp_config.json hooks.json LICENSE README.md settings.example.json settings.schema.json "$STAGE/"
+            cp plugin.json mcp_config.json hooks.json LICENSE README.md llms.txt settings.example.json settings.schema.json "$STAGE/"
             cp rules/AGENTS.md "$STAGE/rules/AGENTS.md"
             cp skills/context-radar/SKILL.md "$STAGE/skills/context-radar/SKILL.md"
             cp assets/logo.svg "$STAGE/assets/logo.svg"
+            cp docs/ai-guide.md "$STAGE/docs/ai-guide.md"
             ARCHIVE="context-radar-mcp-${TAG}-${TARGET}.tar.gz"
-            COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "$ARCHIVE" .
-            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
-            cat "${ARCHIVE}.sha256"
-            gh release upload "$TAG" "$ARCHIVE" "${ARCHIVE}.sha256" --clobber
+            COPYFILE_DISABLE=1 tar -C "$STAGE" -czf "${OUT}/${ARCHIVE}" .
+            (cd "$OUT" && shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256" && cat "${ARCHIVE}.sha256")
           done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dist-macos
+          path: ${{ runner.temp }}/artifacts-macos/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release assets
+    needs: [prepare-release, build-linux, build-macos]
+    if: >-
+      ${{ always() && needs.prepare-release.result == 'success' &&
+      (needs.build-linux.result == 'success' || needs.build-linux.result == 'skipped') &&
+      (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped') &&
+      (needs.build-linux.result == 'success' || needs.build-macos.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.prepare-release.outputs.tag }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        with:
+          path: dist-artifacts
+          merge-multiple: true
+      - name: Upload release tarballs and checksums
+        run: |
+          ls -la dist-artifacts
+          gh release upload "$TAG" -R "$REPO" dist-artifacts/*.tar.gz dist-artifacts/*.tar.gz.sha256 --clobber

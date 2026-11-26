@@ -3,7 +3,10 @@
   "displayName": "Context Radar MCP",
   "version": "1.4.0",
   "description": "Native Rust Antigravity context telemetry, 3-way cold-cache attribution, prefix-safe slice distillation, gated /compact & target:new relay handoff MCP server, and execution guards.",
-  "author": "eatingDream",
+  "author": {
+    "name": "eatingDream",
+    "url": "https://github.com/eatingDream"
+  },
   "homepage": "https://github.com/eatingDream-antigravity-plugins/context-radar-mcp",
   "repository": "https://github.com/eatingDream-antigravity-plugins/context-radar-mcp",
   "logo": "assets/logo.svg",

@@ -139,7 +139,9 @@ pub fn decode_timestamp(buf: &[u8]) -> f64 {
     let mut sec: u64 = 0;
     let mut nanos: u64 = 0;
     while !cur.is_eof() {
-        let Some((fnum, wtype)) = cur.read_tag() else { break };
+        let Some((fnum, wtype)) = cur.read_tag() else {
+            break;
+        };
         if wtype == 0 {
             let Some(v) = cur.read_varint() else { break };
             if fnum == 1 {
@@ -165,13 +167,17 @@ pub fn extract_gen_model(buf: &[u8]) -> (String, String) {
 
     let mut outer = PbCursor::new(buf);
     while !outer.is_eof() {
-        let Some((fnum, wtype)) = outer.read_tag() else { break };
+        let Some((fnum, wtype)) = outer.read_tag() else {
+            break;
+        };
         if wtype == 2 {
             let Some(sub) = outer.read_bytes() else { break };
             if fnum == 1 && !sub.is_empty() {
                 let mut inner = PbCursor::new(sub);
                 while !inner.is_eof() {
-                    let Some((fn2, wt2)) = inner.read_tag() else { break };
+                    let Some((fn2, wt2)) = inner.read_tag() else {
+                        break;
+                    };
                     if wt2 == 2 {
                         let Some(val) = inner.read_bytes() else { break };
                         if val.len() <= 200 {
@@ -219,9 +225,15 @@ pub fn extract_gen_model(buf: &[u8]) -> (String, String) {
         }
     }
 
-    let s19 = f19.map(|s| String::from_utf8_lossy(s).trim().to_string()).unwrap_or_default();
-    let s21 = f21.map(|s| String::from_utf8_lossy(s).trim().to_string()).unwrap_or_default();
-    let s22 = f22.map(|s| String::from_utf8_lossy(s).trim().to_string()).unwrap_or_default();
+    let s19 = f19
+        .map(|s| String::from_utf8_lossy(s).trim().to_string())
+        .unwrap_or_default();
+    let s21 = f21
+        .map(|s| String::from_utf8_lossy(s).trim().to_string())
+        .unwrap_or_default();
+    let s22 = f22
+        .map(|s| String::from_utf8_lossy(s).trim().to_string())
+        .unwrap_or_default();
 
     let canonical = if !s19.is_empty() {
         s19.clone()
@@ -269,7 +281,9 @@ pub fn decode_step_metadata(buf: &[u8]) -> Option<StepMetaDecoded> {
 
     let mut cur = PbCursor::new(buf);
     while !cur.is_eof() {
-        let Some((fnum, wtype)) = cur.read_tag() else { break };
+        let Some((fnum, wtype)) = cur.read_tag() else {
+            break;
+        };
         if wtype == 2 {
             let Some(sub) = cur.read_bytes() else { break };
             if !sub.is_empty() {
@@ -281,7 +295,9 @@ pub fn decode_step_metadata(buf: &[u8]) -> Option<StepMetaDecoded> {
                     20 => {
                         let mut inner = PbCursor::new(sub);
                         while !inner.is_eof() {
-                            let Some((fn2, wt2)) = inner.read_tag() else { break };
+                            let Some((fn2, wt2)) = inner.read_tag() else {
+                                break;
+                            };
                             if wt2 == 0 {
                                 let Some(v2) = inner.read_varint() else { break };
                                 if fn2 == 3 {
@@ -315,7 +331,9 @@ pub fn decode_step_metadata(buf: &[u8]) -> Option<StepMetaDecoded> {
 
     let mut ucur = PbCursor::new(usage_buf);
     while !ucur.is_eof() {
-        let Some((fnum, wtype)) = ucur.read_tag() else { break };
+        let Some((fnum, wtype)) = ucur.read_tag() else {
+            break;
+        };
         match wtype {
             0 => {
                 let Some(val) = ucur.read_varint() else { break };
@@ -343,7 +361,12 @@ pub fn decode_step_metadata(buf: &[u8]) -> Option<StepMetaDecoded> {
         }
     }
 
-    if in_tok.saturating_add(out_tok).saturating_add(cw_tok).saturating_add(cr_tok) == 0 {
+    if in_tok
+        .saturating_add(out_tok)
+        .saturating_add(cw_tok)
+        .saturating_add(cr_tok)
+        == 0
+    {
         return None;
     }
 
@@ -372,7 +395,9 @@ pub fn decode_step_metadata(buf: &[u8]) -> Option<StepMetaDecoded> {
 pub fn extract_step_start_ts(metadata: &[u8]) -> f64 {
     let mut cur = PbCursor::new(metadata);
     while !cur.is_eof() {
-        let Some((fnum, wtype)) = cur.read_tag() else { break };
+        let Some((fnum, wtype)) = cur.read_tag() else {
+            break;
+        };
         if fnum == 1 && wtype == 2 {
             if let Some(sub) = cur.read_bytes() {
                 return decode_timestamp(sub);
@@ -392,7 +417,9 @@ pub fn extract_step_start_and_gen_idx(metadata: &[u8]) -> (f64, Option<i64>) {
     let mut gen_idx: Option<i64> = None;
     let mut cur = PbCursor::new(metadata);
     while !cur.is_eof() {
-        let Some((fnum, wtype)) = cur.read_tag() else { break };
+        let Some((fnum, wtype)) = cur.read_tag() else {
+            break;
+        };
         if wtype == 2 {
             let Some(sub) = cur.read_bytes() else { break };
             if !sub.is_empty() {
@@ -401,7 +428,9 @@ pub fn extract_step_start_and_gen_idx(metadata: &[u8]) -> (f64, Option<i64>) {
                     20 if gen_idx.is_none() => {
                         let mut inner = PbCursor::new(sub);
                         while !inner.is_eof() {
-                            let Some((fn2, wt2)) = inner.read_tag() else { break };
+                            let Some((fn2, wt2)) = inner.read_tag() else {
+                                break;
+                            };
                             if wt2 == 0 {
                                 let Some(v2) = inner.read_varint() else { break };
                                 if fn2 == 3 {
@@ -431,12 +460,16 @@ pub fn extract_step_start_and_gen_idx(metadata: &[u8]) -> (f64, Option<i64>) {
 pub fn extract_checkpoint_summary_len(step_payload: &[u8]) -> usize {
     let mut cur = PbCursor::new(step_payload);
     while !cur.is_eof() {
-        let Some((fnum, wtype)) = cur.read_tag() else { break };
+        let Some((fnum, wtype)) = cur.read_tag() else {
+            break;
+        };
         if fnum == 30 && wtype == 2 {
             let Some(sub) = cur.read_bytes() else { break };
             let mut inner = PbCursor::new(sub);
             while !inner.is_eof() {
-                let Some((fn2, wt2)) = inner.read_tag() else { break };
+                let Some((fn2, wt2)) = inner.read_tag() else {
+                    break;
+                };
                 if fn2 == 5 && wt2 == 2 {
                     if let Some(val) = inner.read_bytes() {
                         return val.len();

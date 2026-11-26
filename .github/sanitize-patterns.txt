@@ -6,34 +6,34 @@
 -----BEGIN (RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----
 
 # Cloud providers (AWS, GCP/Google, Alibaba Cloud, Tencent Cloud, Azure, DigitalOcean, Cloudflare, etc.)
-\b(AKIA|ASIA|AIDA|AROA)[0-9A-Z]{16}\b
-\bAIza[0-9A-Za-z_-]{30,}
-\bLTAI[0-9A-Za-z]{12,24}\b
-\bAKID[0-9A-Za-z]{20,40}\b
-\b(CLOUDFLARE|CF|AWS|AZURE|GCP|ALIYUN|ALIBABA|TENCENT|HUAWEI|VOLC|DO|DIGITALOCEAN|VERCEL|NETLIFY|FLY|RAILWAY)_(API_TOKEN|ACCESS_KEY|SECRET_KEY|SECRET_ACCESS_KEY|ACCOUNT_ID|ZONE_ID|CLIENT_SECRET)[ ]*[:=][ ]*["']?[A-Za-z0-9_./+=-]{20,}
-\bdop_v1_[0-9a-f]{64}\b
-\bDefaultEndpointsProtocol=https;AccountName=[^;[:space:]]+;AccountKey=[A-Za-z0-9+/=]{20,}
+(^|[^[:alnum:]_])(AKIA|ASIA|AIDA|AROA)[0-9A-Z]{16}($|[^[:alnum:]_])
+(^|[^[:alnum:]_])AIza[0-9A-Za-z_-]{30,}
+(^|[^[:alnum:]_])LTAI[0-9A-Za-z]{12,24}($|[^[:alnum:]_])
+(^|[^[:alnum:]_])AKID[0-9A-Za-z]{20,40}($|[^[:alnum:]_])
+(^|[^[:alnum:]_])(CLOUDFLARE|CF|AWS|AZURE|GCP|ALIYUN|ALIBABA|TENCENT|HUAWEI|VOLC|DO|DIGITALOCEAN|VERCEL|NETLIFY|FLY|RAILWAY)_(API_TOKEN|ACCESS_KEY|SECRET_KEY|SECRET_ACCESS_KEY|ACCOUNT_ID|ZONE_ID|CLIENT_SECRET)[ ]*[:=][ ]*["']?[A-Za-z0-9_./+=-]{20,}
+(^|[^[:alnum:]_])dop_v1_[0-9a-f]{64}($|[^[:alnum:]_])
+(^|[^[:alnum:]_])DefaultEndpointsProtocol=https;AccountName=[^;[:space:]]+;AccountKey=[A-Za-z0-9+/=]{20,}
 
 # Version control & CI platforms (GitHub, GitLab)
-\bgh[pousr]_[A-Za-z0-9]{30,}
-\bgithub_pat_[A-Za-z0-9_]{30,}
-\bglpat-[A-Za-z0-9_-]{20,}
+(^|[^[:alnum:]_])gh[pousr]_[A-Za-z0-9]{30,}
+(^|[^[:alnum:]_])github_pat_[A-Za-z0-9_]{30,}
+(^|[^[:alnum:]_])glpat-[A-Za-z0-9_-]{20,}
 
 # AI / LLM & ML platforms (OpenAI, Anthropic, Hugging Face, Groq, xAI, Replicate, Perplexity)
-\bsk-(proj-|ant-api[0-9]+-|or-v1-)?[A-Za-z0-9_-]{24,}
-\bhf_[A-Za-z0-9]{30,}
-\bgsk_[A-Za-z0-9]{30,}
-\bxai-[A-Za-z0-9]{30,}
-\br8_[A-Za-z0-9]{30,}
-\bpplx-[A-Za-z0-9]{30,}
+(^|[^[:alnum:]_])sk-(proj-|ant-api[0-9]+-|or-v1-)?[A-Za-z0-9_-]{24,}
+(^|[^[:alnum:]_])hf_[A-Za-z0-9]{30,}
+(^|[^[:alnum:]_])gsk_[A-Za-z0-9]{30,}
+(^|[^[:alnum:]_])xai-[A-Za-z0-9]{30,}
+(^|[^[:alnum:]_])r8_[A-Za-z0-9]{30,}
+(^|[^[:alnum:]_])pplx-[A-Za-z0-9]{30,}
 
 # Messaging, SaaS, payments & package registries (Slack, Stripe, SendGrid, npm, PyPI, crates.io)
-\bxox[abprs]-[A-Za-z0-9-]{10,}
-\b(sk|rk)_(live|test)_[0-9A-Za-z]{20,}
-\bSG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}
-\bnpm_[A-Za-z0-9]{30,}
-\bpypi-AgEI[A-Za-z0-9_-]{30,}
-\bcio[A-Za-z0-9]{30,}
+(^|[^[:alnum:]_])xox[abprs]-[A-Za-z0-9-]{10,}
+(^|[^[:alnum:]_])(sk|rk)_(live|test)_[0-9A-Za-z]{20,}
+(^|[^[:alnum:]_])SG\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}
+(^|[^[:alnum:]_])npm_[A-Za-z0-9]{30,}
+(^|[^[:alnum:]_])pypi-AgEI[A-Za-z0-9_-]{30,}
+(^|[^[:alnum:]_])cio[A-Za-z0-9]{30,}
 
 # Local home/secret directory paths
 (/home/[a-z][a-z0-9_-]*/|/Users/[A-Za-z][A-Za-z0-9._-]*/)(secrets|\.ssh|\.config|\.aws|\.kube|\.gnupg)

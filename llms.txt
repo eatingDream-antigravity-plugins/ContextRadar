@@ -4,7 +4,8 @@
 
 ## For AI Agents
 
-- [Agent Skill](skills/context-radar/SKILL.md): Complete MCP tool reference, handoff gates, and workflow rules (`agentskills.io` compatible).
+- [AI Agent & Operator Guide](docs/ai-guide.md): Complete MCP tool parameters, ACP `acp-proxy`/`acp-run` workflows, environment variables, configuration, and source build steps.
+- [Agent Skill](skills/context-radar/SKILL.md): Portable workflow rules (`agentskills.io` compatible).
 - [Contributor & Agent Guide](AGENTS.md): Architecture, build/test commands, security boundaries, and plugin packaging rules.
 - [README (English)](README.md) | [README (简体中文)](README.zh-CN.md)
 
@@ -19,9 +20,9 @@ Generic stdio MCP configuration (`mcpServers`):
 ```json
 {
   "mcpServers": {
-    "radar": {
-      "command": "~/.gemini/config/plugins/context-radar-mcp/bin/context-radar-mcp",
-      "args": ["daemon", "--data-dir", "~/.gemini/antigravity/plugin_data/context-radar-mcp"]
+    "context-radar-mcp": {
+      "command": "/path/to/home/.gemini/config/plugins/context-radar-mcp/bin/context-radar-mcp",
+      "args": ["daemon", "--data-dir", "/path/to/home/.gemini/antigravity/plugin_data/context-radar-mcp"]
     }
   }
 }
