@@ -9,13 +9,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use chrono::{DateTime, Datelike, NaiveDateTime, Utc};
 use serde::Serialize;
 
-use crate::engine::budget::{
-    is_gemini_4_carbon, model_cache_ttl_sec, resolve_budget_tier,
-};
 use crate::engine::grants::{workspaces_overlap, PanelPrefs, RelayGrant};
 use crate::engine::rates::RateTable;
+use crate::engine::tiers::{is_gemini_4_carbon, model_cache_ttl_sec, resolve_budget_tier};
 use crate::i18n::{carbon_concurrency_warning_text, resolve_active_lang, Lang};
 use crate::ledger::index_db::DbVersionSig;
+use crate::ledger::journal_tail::JournalTailCache;
 use crate::ledger::sqlite_ro::{stat_db_stamp, FileStamp, LedgerReader};
 use crate::ledger::{is_safe_id, LiveStepProbe, SummaryRecord, TurnSample};
 use crate::settings::{
@@ -1425,6 +1424,7 @@ pub struct SessionTurnsPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MetricsCacheKey {
     db_stamp: Option<(u64, u64, DbVersionSig)>,
+    transcript_stamp: Option<(u64, u64, i128, u64)>,
     summary: Option<SummaryRecord>,
     fx_micros: i64,
     settings_gen: u64,
@@ -1644,8 +1644,14 @@ impl TelemetryEngine {
                     .wrapping_add(u64::from(c >= 3));
             }
         }
+        let transcript_stamp = if turns.iter().any(|t| t.after_turn_start.is_none()) {
+            JournalTailCache::stat_transcript_stamp(&self.ledger.data_root, cid)
+        } else {
+            None
+        };
         let cache_key = MetricsCacheKey {
             db_stamp: stamp.map(|s| (s.dev, s.ino, s.sig.clone())),
+            transcript_stamp,
             summary: summary.cloned(),
             fx_micros: (fx_rate * 1_000_000.0).round() as i64,
             settings_gen: cfg.generation,

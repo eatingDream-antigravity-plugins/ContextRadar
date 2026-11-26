@@ -499,6 +499,7 @@ pub struct RateTable {
 
     resolve_cache_ver: (u64, Option<(i128, u64)>),
     resolve_cache: HashMap<(String, String), RateCard>,
+    lang_override: Option<Lang>,
 }
 
 impl RateTable {
@@ -524,6 +525,7 @@ impl RateTable {
             user_models_sorted: Vec::new(),
             resolve_cache_ver: (u64::MAX, None),
             resolve_cache: HashMap::new(),
+            lang_override: None,
         }
     }
 
@@ -535,8 +537,20 @@ impl RateTable {
         self.ext_models_sig.is_some()
     }
 
+    /// Runtime UI language preference (from `PanelPrefs.lang`); applied whenever `settings.json`
+    /// leaves `lang` unset or `"auto"`.
+    pub fn set_lang_override(&mut self, lang: Option<Lang>) {
+        self.lang_override = lang;
+    }
+
     pub fn get_lang(&mut self) -> Lang {
         let cfg = self.watcher.current();
+        if let Some(explicit) = crate::i18n::parse_lang_tag(&cfg.lang) {
+            return explicit;
+        }
+        if let Some(ov) = self.lang_override {
+            return ov;
+        }
         resolve_active_lang(&cfg.lang)
     }
 
@@ -559,7 +573,7 @@ impl RateTable {
             };
             return (code, sym);
         }
-        let (code, sym) = resolve_active_lang(&cfg.lang).default_currency();
+        let (code, sym) = self.get_lang().default_currency();
         (code.to_string(), sym.to_string())
     }
 

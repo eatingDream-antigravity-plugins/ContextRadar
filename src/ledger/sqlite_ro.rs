@@ -15,6 +15,7 @@ use serde_json::Value;
 use crate::ledger::index_db::{DbVersionSig, IndexDbCache, ParsedLedgerState};
 use crate::ledger::journal_tail::JournalTailCache;
 use crate::ledger::{is_safe_id, LiveStepProbe, SummaryRecord, TurnSample};
+use crate::settings::normalize_workspace_uri;
 use crate::wire::pb_cursor::{
     decode_step_metadata, extract_checkpoint_summary_len, extract_error_summary, extract_gen_model,
     extract_step_start_and_gen_idx,
@@ -151,51 +152,6 @@ pub fn scan_conversations_dir(conv_dir: &Path) -> (HashMap<String, f64>, HashMap
     }
 
     (file_mtimes, file_stamps)
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
-                out.push((hi << 4) | lo);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-#[inline]
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn normalize_workspace_uri(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    let decoded = if let Some(rest) = trimmed.strip_prefix("file://") {
-        percent_decode(rest)
-    } else {
-        trimmed.to_string()
-    };
-    if decoded.len() > 1 {
-        decoded.trim_end_matches('/').to_string()
-    } else {
-        decoded
-    }
 }
 
 pub fn extract_workspaces(raw_uris: &str) -> (String, Vec<String>) {
