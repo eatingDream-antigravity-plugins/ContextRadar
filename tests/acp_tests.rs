@@ -66,7 +66,10 @@ fn test_acp_coordinator_pure_protocol_direct_and_lazy_wrapper_and_gates() {
     let _ = coord.on_agent_message(json!({
         "jsonrpc": "2.0", "id": 1, "result": { "sessionId": "sess-1" }
     }));
-    assert_eq!(coord.session_state("sess-1").unwrap().cwd, "/workspace/demo");
+    assert_eq!(
+        coord.session_state("sess-1").unwrap().cwd,
+        "/workspace/demo"
+    );
 
     // (a) Direct MCP tool_call -> tool_call_update(status: "completed") without rawOutput triggers /compact
     //     including preserve_points + sanitized scratch_note_path + resume_task
@@ -310,7 +313,10 @@ fn test_acp_coordinator_pure_protocol_direct_and_lazy_wrapper_and_gates() {
         Outbound::ToAgent(v) => {
             let txt = v["params"]["prompt"][0]["text"].as_str().unwrap();
             assert!(txt.contains("Keep safe state"));
-            assert!(!txt.contains("etc/passwd"), "traversal path must be stripped: {txt}");
+            assert!(
+                !txt.contains("etc/passwd"),
+                "traversal path must be stripped: {txt}"
+            );
             v["id"].clone()
         }
         _ => panic!("expected ToAgent /compact"),
@@ -346,7 +352,11 @@ fn test_acp_coordinator_pure_protocol_direct_and_lazy_wrapper_and_gates() {
     let _ = coord.on_agent_message(json!({
         "jsonrpc": "2.0", "id": 8, "result": { "sessionId": "sess-loaded" }
     }));
-    assert!(coord.session_state("sess-loaded").unwrap().pending_compact.is_none());
+    assert!(coord
+        .session_state("sess-loaded")
+        .unwrap()
+        .pending_compact
+        .is_none());
 
     let _ = coord.on_client_message(json!({
         "jsonrpc": "2.0", "id": 9, "method": "session/prompt",
@@ -362,8 +372,8 @@ fn test_acp_coordinator_pure_protocol_direct_and_lazy_wrapper_and_gates() {
 
 #[test]
 fn test_acp_coordinator_threshold_fallback_user_compact_and_cancel() {
-    let mut coord = ProxyCoordinator::new(2, 10_000, "/compact Keep basics".into(), true)
-        .with_lang(Lang::En);
+    let mut coord =
+        ProxyCoordinator::new(2, 10_000, "/compact Keep basics".into(), true).with_lang(Lang::En);
 
     let _ = coord.on_client_message(json!({
         "jsonrpc": "2.0", "id": 1, "method": "session/new",
@@ -461,7 +471,16 @@ for raw in sys.stdin:
     elif method == "session/prompt":
         sid = params["sessionId"]
         txt = params["prompt"][0]["text"]
-        if txt.startswith("/compact"):
+        if txt == "Request permission":
+            emit({"jsonrpc": "2.0", "id": 1001, "method": "session/request_permission", "params": {
+                "sessionId": sid,
+                "options": [{"optionId": "allow-only", "name": "Allow", "kind": "allow_once"}]
+            }})
+            reply = json.loads(next(sys.stdin))
+            assert reply["id"] == 1001, reply
+            assert reply["result"]["outcome"] == {"outcome": "cancelled"}, reply
+            emit({"jsonrpc": "2.0", "id": mid, "result": {"stopReason": "end_turn"}})
+        elif txt.startswith("/compact"):
             assert "mock state" in txt and "scratch/slice_1_4.md" in txt and "finish" in txt, f"unexpected compact cmd: {txt}"
             emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "usage_update", "used": 21000, "size": 512000}}})
             emit({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": sid, "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": f"COMPACTED_AND_RESUMED({native_ov})"}}}})
@@ -493,6 +512,30 @@ for raw in sys.stdin:
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
     }
     script
+}
+
+#[test]
+fn test_acp_run_cancels_allow_only_permission_without_auto_approve() {
+    let td = TempDir::new().unwrap();
+    let mock_agy = write_mock_agy_script(td.path());
+    let out = Command::new(bin_path())
+        .arg("acp-run")
+        .arg("--agy-bin")
+        .arg(mock_agy)
+        .arg("--cwd")
+        .arg(td.path())
+        .args(["--json", "--prompt", "Request permission"])
+        .env_remove("CONTEXT_RADAR_DATA_ROOT")
+        .env_remove("CONTEXT_RADAR_GRANTS_PATH")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["stop_reason"], "end_turn");
 }
 
 #[test]
@@ -565,26 +608,27 @@ fn test_acp_proxy_and_acp_run_pure_protocol_stdio_e2e_zero_disk_state() {
         writeln!(w, "{v}").unwrap();
         w.flush().unwrap();
     };
-    let read_until = |r: &mut BufReader<std::process::ChildStdout>, want_id: u64| -> (Value, String) {
-        let mut chunks = String::new();
-        let mut line = String::new();
-        loop {
-            line.clear();
-            let n = r.read_line(&mut line).unwrap();
-            assert!(n > 0, "unexpected EOF waiting for id={want_id}");
-            let v: Value = serde_json::from_str(line.trim()).unwrap();
-            if v.get("id") == Some(&json!(want_id))
-                && (v.get("result").is_some() || v.get("error").is_some())
-            {
-                return (v, chunks);
-            }
-            if v.get("method") == Some(&json!("session/update")) {
-                if let Some(txt) = v["params"]["update"]["content"]["text"].as_str() {
-                    chunks.push_str(txt);
+    let read_until =
+        |r: &mut BufReader<std::process::ChildStdout>, want_id: u64| -> (Value, String) {
+            let mut chunks = String::new();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = r.read_line(&mut line).unwrap();
+                assert!(n > 0, "unexpected EOF waiting for id={want_id}");
+                let v: Value = serde_json::from_str(line.trim()).unwrap();
+                if v.get("id") == Some(&json!(want_id))
+                    && (v.get("result").is_some() || v.get("error").is_some())
+                {
+                    return (v, chunks);
+                }
+                if v.get("method") == Some(&json!("session/update")) {
+                    if let Some(txt) = v["params"]["update"]["content"]["text"].as_str() {
+                        chunks.push_str(txt);
+                    }
                 }
             }
-        }
-    };
+        };
 
     send(
         &mut stdin,
@@ -614,4 +658,24 @@ fn test_acp_proxy_and_acp_run_pure_protocol_stdio_e2e_zero_disk_state() {
     drop(stdin);
     let st = child.wait().unwrap();
     assert!(st.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn test_proxy_log_uses_0600_and_refuses_symlinks() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let td = TempDir::new().unwrap();
+    let log_path = td.path().join("proxy.log");
+    context_radar_mcp::acp::append_proxy_log_line(&log_path, "C->A hello").unwrap();
+    let mode = fs::metadata(&log_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    assert_eq!(fs::read_to_string(&log_path).unwrap(), "C->A hello\n");
+
+    let target = td.path().join("outside.txt");
+    fs::write(&target, "untouched").unwrap();
+    let link_path = td.path().join("proxy_link.log");
+    symlink(&target, &link_path).unwrap();
+    assert!(context_radar_mcp::acp::append_proxy_log_line(&link_path, "pwn").is_err());
+    assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
 }

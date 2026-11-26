@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use regex::bytes::Regex as BytesRegex;
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, CachedStatement, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 
 use crate::ledger::index_db::{DbVersionSig, IndexDbCache, ParsedLedgerState};
@@ -23,7 +23,9 @@ use crate::wire::pb_cursor::{
 
 fn ann_title_regex() -> &'static BytesRegex {
     static RE: OnceLock<BytesRegex> = OnceLock::new();
-    RE.get_or_init(|| BytesRegex::new(r#"title:\s*"((?:[^"\\]|\\.)*)""#).expect("valid title regex"))
+    RE.get_or_init(|| {
+        BytesRegex::new(r#"title:\s*"((?:[^"\\]|\\.)*)""#).expect("valid title regex")
+    })
 }
 
 /// Strictly read-only host DB opener. Never sets immutable so live WAL reads work,
@@ -90,14 +92,18 @@ pub fn stat_db_stamp(db_path: &Path) -> Option<FileStamp> {
 }
 
 /// Single-pass `read_dir` scan collecting `.db` and `.db-wal` stamps without ENOENT stats.
-pub fn scan_conversations_dir(conv_dir: &Path) -> (HashMap<String, f64>, HashMap<String, FileStamp>) {
+pub fn scan_conversations_dir(
+    conv_dir: &Path,
+) -> (HashMap<String, f64>, HashMap<String, FileStamp>) {
     let mut db_stats: HashMap<String, (u64, u64, i128, u64, f64)> = HashMap::new();
     let mut wal_stats: HashMap<String, (i128, u64, f64)> = HashMap::new();
 
     if let Ok(entries) = fs::read_dir(conv_dir) {
         for entry in entries.flatten() {
             let fname_os = entry.file_name();
-            let Some(name) = fname_os.to_str() else { continue };
+            let Some(name) = fname_os.to_str() else {
+                continue;
+            };
             if let Some(cid) = name.strip_suffix(".db") {
                 if !is_safe_id(cid) {
                     continue;
@@ -244,11 +250,15 @@ impl AnnotationIndex {
             for entry in entries.flatten() {
                 let fname = entry.file_name();
                 let Some(name) = fname.to_str() else { continue };
-                let Some(cid) = name.strip_suffix(".pbtxt") else { continue };
+                let Some(cid) = name.strip_suffix(".pbtxt") else {
+                    continue;
+                };
                 if !is_safe_id(cid) {
                     continue;
                 }
-                let Ok(meta) = fs::symlink_metadata(entry.path()) else { continue };
+                let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+                    continue;
+                };
                 if !meta.file_type().is_file() {
                     continue;
                 }
@@ -266,8 +276,8 @@ impl AnnotationIndex {
                     let raw = &buf[..n];
                     let is_arch = contains_bytes(raw, b"archived:true")
                         || contains_bytes(raw, b"archived: true");
-                    let is_pin = contains_bytes(raw, b"pinned:true")
-                        || contains_bytes(raw, b"pinned: true");
+                    let is_pin =
+                        contains_bytes(raw, b"pinned:true") || contains_bytes(raw, b"pinned: true");
                     let title = ann_title_regex()
                         .captures(raw)
                         .and_then(|c| c.get(1))
@@ -380,12 +390,24 @@ impl LedgerReader {
     }
 
     pub fn read_summaries(&mut self) -> Arc<HashMap<String, SummaryRecord>> {
+        match self.try_read_summaries() {
+            Ok(summaries) => summaries,
+            Err(_) => Arc::clone(&self.summaries.merged),
+        }
+    }
+
+    /// Read one complete summary snapshot. Any query or decode error leaves the cached
+    /// summary rows and DB version stamp untouched so subsequent calls retry cleanly.
+    pub fn try_read_summaries(&mut self) -> rusqlite::Result<Arc<HashMap<String, SummaryRecord>>> {
         let Some(stamp) = stat_db_stamp(&self.summaries_db) else {
             self.summaries.last_stamp = None;
+            self.summaries.last_merged_key = None;
             if !self.summaries.merged.is_empty() {
+                self.summaries.raw_rows.clear();
+                self.summaries.fts_archived.clear();
                 self.summaries.merged = Arc::new(HashMap::new());
             }
-            return Arc::clone(&self.summaries.merged);
+            return Ok(Arc::clone(&self.summaries.merged));
         };
         let db_key = (stamp.dev, stamp.ino, stamp.sig.clone());
         let ann_ver = self.annotations.refresh(&self.ann_dir);
@@ -398,106 +420,110 @@ impl LedgerReader {
                 .map(|(k, av)| k == &db_key && *av == ann_ver)
                 .unwrap_or(false)
         {
-            return Arc::clone(&self.summaries.merged);
+            return Ok(Arc::clone(&self.summaries.merged));
         }
 
         if self.summaries.last_stamp.as_ref() != Some(&db_key) {
-            if let Ok(conn) = open_host_readonly(&self.summaries_db) {
-                let mut parents: HashMap<String, String> = HashMap::new();
-                if let Ok(mut stmt) =
-                    conn.prepare("SELECT conversation_id, parent_id FROM conversation_parents")
-                {
-                    if let Ok(rows) = stmt.query_map([], |r| {
-                        Ok((
-                            r.get::<_, Option<String>>(0)?,
-                            r.get::<_, Option<String>>(1)?,
-                        ))
-                    }) {
-                        for row in rows.flatten() {
-                            if let (Some(c), Some(p)) = row {
-                                if !c.is_empty() && !p.is_empty() {
-                                    parents.insert(c, p);
-                                }
-                            }
+            let mut conn = open_host_readonly(&self.summaries_db)?;
+            let tx = conn.transaction()?;
+
+            let mut parents: HashMap<String, String> = HashMap::new();
+            if let Some(mut stmt) = prepare_optional(
+                &tx,
+                "SELECT conversation_id, parent_id FROM conversation_parents",
+                &[
+                    "no such table: conversation_parents",
+                    "no such column: conversation_id",
+                    "no such column: parent_id",
+                ],
+            )? {
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let c: Option<String> = row.get(0)?;
+                    let p: Option<String> = row.get(1)?;
+                    if let (Some(c), Some(p)) = (c, p) {
+                        if !c.is_empty() && !p.is_empty() {
+                            parents.insert(c, p);
                         }
                     }
                 }
-
-                let mut fts_archived: HashSet<String> = HashSet::new();
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT DISTINCT conversation_id FROM conversations_fts WHERE archived = 1",
-                ) {
-                    if let Ok(rows) = stmt.query_map([], |r| r.get::<_, Option<String>>(0)) {
-                        for cid in rows.flatten().flatten() {
-                            if !cid.is_empty() {
-                                fts_archived.insert(cid);
-                            }
-                        }
-                    }
-                }
-
-                let mut raw_rows: HashMap<String, RawSummaryTuple> = HashMap::new();
-                let query = "SELECT conversation_id, title, preview, workspace_uris, status,
-                             agent_name, parent_conversation_id, nesting_depth,
-                             not_fully_idle, killed, last_modified_time, last_user_input_step_index
-                             FROM conversation_summaries";
-                if let Ok(mut stmt) = conn.prepare(query) {
-                    if let Ok(rows) = stmt.query_map([], |r| {
-                        Ok((
-                            r.get::<_, Option<String>>(0)?,
-                            r.get::<_, Option<String>>(1)?,
-                            r.get::<_, Option<String>>(2)?,
-                            r.get::<_, Option<String>>(3)?,
-                            r.get::<_, Option<String>>(4)?,
-                            r.get::<_, Option<String>>(5)?,
-                            r.get::<_, Option<String>>(6)?,
-                            r.get::<_, Option<i64>>(7)?,
-                            r.get::<_, Option<i64>>(8)?,
-                            r.get::<_, Option<i64>>(9)?,
-                            r.get::<_, Option<String>>(10)?,
-                            r.get::<_, Option<i64>>(11)?,
-                        ))
-                    }) {
-                        for row in rows.flatten() {
-                            let cid = row.0.unwrap_or_default();
-                            if cid.is_empty() {
-                                continue;
-                            }
-                            let p_direct = row.6.unwrap_or_default();
-                            let parent_id = if !p_direct.is_empty() {
-                                p_direct
-                            } else {
-                                parents.get(&cid).cloned().unwrap_or_default()
-                            };
-                            let (ws_primary, ws_all) =
-                                extract_workspaces(&row.3.unwrap_or_default());
-                            raw_rows.insert(
-                                cid,
-                                RawSummaryTuple {
-                                    title: row.1.unwrap_or_default().trim().to_string(),
-                                    preview: row.2.unwrap_or_default().trim().to_string(),
-                                    workspace: ws_primary,
-                                    workspaces: ws_all,
-                                    status: row.4.unwrap_or_default(),
-                                    agent_name: row.5.unwrap_or_default().trim().to_string(),
-                                    parent_conversation_id: parent_id,
-                                    nesting_depth: row.7.unwrap_or(0),
-                                    not_fully_idle: row.8.unwrap_or(0) != 0,
-                                    killed: row.9.unwrap_or(0) != 0,
-                                    last_modified_time: row.10.unwrap_or_default(),
-                                    last_user_input_step_index: row.11.unwrap_or(-1),
-                                },
-                            );
-                        }
-                    }
-                }
-
-                self.summaries.raw_rows = raw_rows;
-                self.summaries.fts_archived = fts_archived;
-                self.summaries.last_stamp = Some(db_key.clone());
-            } else {
-                return Arc::clone(&self.summaries.merged);
             }
+
+            let mut fts_archived: HashSet<String> = HashSet::new();
+            if let Some(mut stmt) = prepare_optional(
+                &tx,
+                "SELECT DISTINCT conversation_id FROM conversations_fts WHERE archived = 1",
+                &[
+                    "no such table: conversations_fts",
+                    "no such column: conversation_id",
+                    "no such column: archived",
+                ],
+            )? {
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    if let Some(cid) = row.get::<_, Option<String>>(0)? {
+                        if !cid.is_empty() {
+                            fts_archived.insert(cid);
+                        }
+                    }
+                }
+            }
+
+            let mut raw_rows: HashMap<String, RawSummaryTuple> = HashMap::new();
+            let query = "SELECT conversation_id, title, preview, workspace_uris, status,
+                         agent_name, parent_conversation_id, nesting_depth,
+                         not_fully_idle, killed, last_modified_time, last_user_input_step_index
+                         FROM conversation_summaries";
+            {
+                let mut stmt = tx.prepare(query)?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    let cid = r.get::<_, Option<String>>(0)?.unwrap_or_default();
+                    if cid.is_empty() {
+                        continue;
+                    }
+                    let title = r.get::<_, Option<String>>(1)?.unwrap_or_default();
+                    let preview = r.get::<_, Option<String>>(2)?.unwrap_or_default();
+                    let ws_uris = r.get::<_, Option<String>>(3)?.unwrap_or_default();
+                    let status = r.get::<_, Option<String>>(4)?.unwrap_or_default();
+                    let agent_name = r.get::<_, Option<String>>(5)?.unwrap_or_default();
+                    let p_direct = r.get::<_, Option<String>>(6)?.unwrap_or_default();
+                    let nesting_depth = r.get::<_, Option<i64>>(7)?.unwrap_or(0);
+                    let not_fully_idle = r.get::<_, Option<i64>>(8)?.unwrap_or(0) != 0;
+                    let killed = r.get::<_, Option<i64>>(9)?.unwrap_or(0) != 0;
+                    let last_modified_time = r.get::<_, Option<String>>(10)?.unwrap_or_default();
+                    let last_user_input_step_index = r.get::<_, Option<i64>>(11)?.unwrap_or(-1);
+
+                    let parent_id = if !p_direct.is_empty() {
+                        p_direct
+                    } else {
+                        parents.get(&cid).cloned().unwrap_or_default()
+                    };
+                    let (ws_primary, ws_all) = extract_workspaces(&ws_uris);
+                    raw_rows.insert(
+                        cid,
+                        RawSummaryTuple {
+                            title: title.trim().to_string(),
+                            preview: preview.trim().to_string(),
+                            workspace: ws_primary,
+                            workspaces: ws_all,
+                            status,
+                            agent_name: agent_name.trim().to_string(),
+                            parent_conversation_id: parent_id,
+                            nesting_depth,
+                            not_fully_idle,
+                            killed,
+                            last_modified_time,
+                            last_user_input_step_index,
+                        },
+                    );
+                }
+            }
+            tx.commit()?;
+
+            self.summaries.raw_rows = raw_rows;
+            self.summaries.fts_archived = fts_archived;
+            self.summaries.last_stamp = Some(db_key.clone());
         }
 
         let mut merged = HashMap::with_capacity(self.summaries.raw_rows.len());
@@ -509,8 +535,8 @@ impl LedgerReader {
                 .cloned()
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| r.title.clone());
-            let archived =
-                self.annotations.archived.contains(cid) || self.summaries.fts_archived.contains(cid);
+            let archived = self.annotations.archived.contains(cid)
+                || self.summaries.fts_archived.contains(cid);
             let pinned = self.annotations.pinned.contains(cid);
             merged.insert(
                 cid.clone(),
@@ -536,7 +562,7 @@ impl LedgerReader {
 
         self.summaries.merged = Arc::new(merged);
         self.summaries.last_merged_key = Some((db_key, ann_ver));
-        Arc::clone(&self.summaries.merged)
+        Ok(Arc::clone(&self.summaries.merged))
     }
 
     pub fn read_turns(
@@ -552,10 +578,25 @@ impl LedgerReader {
         cid: &str,
         prefetched: Option<&FileStamp>,
     ) -> (Arc<Vec<TurnSample>>, LiveStepProbe) {
-        if !is_safe_id(cid) {
-            return (Arc::new(Vec::new()), LiveStepProbe::default());
+        match self.try_read_turns_and_probe(cid, prefetched) {
+            Ok(data) => data,
+            Err(_) => self.db_cache.get(cid).map_or_else(
+                || (Arc::new(Vec::new()), LiveStepProbe::default()),
+                |cached| (Arc::clone(&cached.turns), cached.live_probe.clone()),
+            ),
         }
-        let db_path = self.conv_dir.join(format!("{cid}.db"));
+    }
+
+    /// Read one complete host snapshot. A failed read leaves the previous cursor and caches intact.
+    pub fn try_read_turns_and_probe(
+        &mut self,
+        cid: &str,
+        prefetched: Option<&FileStamp>,
+    ) -> rusqlite::Result<(Arc<Vec<TurnSample>>, LiveStepProbe)> {
+        if !is_safe_id(cid) {
+            return Ok((Arc::new(Vec::new()), LiveStepProbe::default()));
+        }
+        let db_path = self.db_path(cid);
         let owned_stamp;
         let stamp = match prefetched {
             Some(s) => s,
@@ -564,57 +605,52 @@ impl LedgerReader {
                     owned_stamp = s;
                     &owned_stamp
                 }
-                None => return (Arc::new(Vec::new()), LiveStepProbe::default()),
+                None => return Ok((Arc::new(Vec::new()), LiveStepProbe::default())),
             },
         };
 
-        if let Some(cached) = self.db_cache.get(cid) {
+        let mut base_state = self.db_cache.get(cid);
+        if let Some(cached) = base_state {
             if cached.dev == stamp.dev && cached.ino == stamp.ino && cached.sig == stamp.sig {
-                return (Arc::clone(&cached.turns), cached.live_probe.clone());
+                return Ok((Arc::clone(&cached.turns), cached.live_probe.clone()));
             }
         }
 
-        let mut base_state: Option<ParsedLedgerState> = self.db_cache.remove(cid);
+        let disk_state;
         if base_state.is_none() {
-            if let Some(dc) = &mut self.disk_cache {
-                if let Some(disk_state) = dc.load(cid, stamp.dev, stamp.ino) {
-                    if disk_state.sig == stamp.sig {
-                        let out = (Arc::clone(&disk_state.turns), disk_state.live_probe.clone());
-                        self.db_cache.insert(cid.to_string(), disk_state);
-                        return out;
-                    }
-                    if stamp.sig.db_size >= disk_state.sig.db_size {
-                        base_state = Some(disk_state);
-                    }
+            disk_state = self
+                .disk_cache
+                .as_mut()
+                .and_then(|dc| dc.load(cid, stamp.dev, stamp.ino));
+            if let Some(state) = disk_state.as_ref() {
+                if state.sig == stamp.sig {
+                    let out = (Arc::clone(&state.turns), state.live_probe.clone());
+                    self.db_cache.insert(cid.to_string(), state.clone());
+                    return Ok(out);
                 }
+                base_state = Some(state);
             }
         }
 
-        if let Some(prev) = base_state {
-            if prev.dev == stamp.dev
-                && prev.ino == stamp.ino
-                && stamp.sig.db_size >= prev.sig.db_size
-            {
-                if let Some(updated) = parse_db_incremental(&db_path, prev, stamp) {
-                    let out = (Arc::clone(&updated.turns), updated.live_probe.clone());
-                    if let Some(dc) = &mut self.disk_cache {
-                        dc.save(cid, &updated);
-                    }
-                    self.db_cache.insert(cid.to_string(), updated);
-                    return out;
-                }
-            }
-        }
-
-        let Some(state) = parse_db_full(&db_path, stamp) else {
-            return (Arc::new(Vec::new()), LiveStepProbe::default());
+        let mut conn = open_host_readonly(&db_path)?;
+        let tx = conn.transaction()?;
+        let state = match base_state.filter(|prev| {
+            prev.dev == stamp.dev && prev.ino == stamp.ino && stamp.sig.db_size >= prev.sig.db_size
+        }) {
+            Some(prev) => match parse_db_incremental(&tx, prev.clone(), stamp)? {
+                Some(state) => state,
+                None => parse_db_full(&tx, stamp)?,
+            },
+            None => parse_db_full(&tx, stamp)?,
         };
+        tx.commit()?;
+
         let out = (Arc::clone(&state.turns), state.live_probe.clone());
         if let Some(dc) = &mut self.disk_cache {
             dc.save(cid, &state);
         }
         self.db_cache.insert(cid.to_string(), state);
-        out
+        Ok(out)
     }
 
     pub fn scan_dir(&self) -> (HashMap<String, f64>, HashMap<String, FileStamp>) {
@@ -626,41 +662,97 @@ impl LedgerReader {
     }
 }
 
-fn parse_db_incremental(
-    db_path: &Path,
-    mut prev: ParsedLedgerState,
-    stamp: &FileStamp,
-) -> Option<ParsedLedgerState> {
-    let conn = open_host_readonly(db_path).ok()?;
-    let cur_max_step: i64 = conn
-        .prepare_cached("SELECT MAX(idx) FROM steps")
-        .ok()?
-        .query_row([], |r| r.get::<_, Option<i64>>(0))
-        .ok()?
-        .unwrap_or(-1);
-    if cur_max_step < prev.max_step_idx {
-        return None;
+fn prepare_optional<'conn>(
+    conn: &'conn Connection,
+    sql: &str,
+    missing_schema: &[&str],
+) -> rusqlite::Result<Option<CachedStatement<'conn>>> {
+    match conn.prepare_cached(sql) {
+        Ok(stmt) => Ok(Some(stmt)),
+        Err(err) => {
+            let message = match &err {
+                rusqlite::Error::SqlInputError { msg, .. } => Some(msg.as_str()),
+                rusqlite::Error::SqliteFailure(_, msg) => msg.as_deref(),
+                _ => None,
+            };
+            if message.is_some_and(|msg| missing_schema.contains(&msg)) {
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
     }
+}
 
-    if let Ok(mut gstmt) = conn.prepare_cached(
-        "SELECT idx, data FROM gen_metadata WHERE idx > ?1 AND data IS NOT NULL ORDER BY idx",
-    ) {
-        if let Ok(mut rows) = gstmt.query(params![prev.max_gen_idx]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(gidx) = row.get::<_, i64>(0) {
-                    if gidx > prev.max_gen_idx {
-                        prev.max_gen_idx = gidx;
-                    }
-                    if let Some(bytes) = row.get_ref(1).ok().and_then(|v| v.as_bytes().ok()) {
-                        let (m_id, m_disp) = extract_gen_model(bytes);
-                        if !m_id.is_empty() || !m_disp.is_empty() {
-                            prev.models.insert(gidx, (m_id, m_disp));
-                        }
-                    }
+type GenModels = HashMap<i64, (String, String)>;
+const MISSING_GEN_METADATA_SCHEMA: &[&str] = &[
+    "no such table: gen_metadata",
+    "no such column: idx",
+    "no such column: data",
+];
+
+fn read_gen_models(
+    conn: &Connection,
+    after: Option<i64>,
+    models: &mut GenModels,
+    max_gen_idx: &mut i64,
+) -> rusqlite::Result<()> {
+    let sql = if after.is_some() {
+        "SELECT idx, data FROM gen_metadata WHERE idx > ?1 AND data IS NOT NULL ORDER BY idx"
+    } else {
+        "SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx"
+    };
+    if let Some(mut stmt) = prepare_optional(conn, sql, MISSING_GEN_METADATA_SCHEMA)? {
+        let mut rows = stmt.query(rusqlite::params_from_iter(after))?;
+        while let Some(row) = rows.next()? {
+            let idx: i64 = row.get(0)?;
+            *max_gen_idx = (*max_gen_idx).max(idx);
+            if let Ok(bytes) = row.get_ref(1)?.as_bytes() {
+                let pair = extract_gen_model(bytes);
+                if !pair.0.is_empty() || !pair.1.is_empty() {
+                    models.insert(idx, pair);
                 }
             }
         }
     }
+    Ok(())
+}
+
+fn lookup_gen_model(conn: &Connection, idx: i64) -> rusqlite::Result<Option<(String, String)>> {
+    let Some(mut stmt) = prepare_optional(
+        conn,
+        "SELECT data FROM gen_metadata WHERE idx = ?1 AND data IS NOT NULL",
+        MISSING_GEN_METADATA_SCHEMA,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut rows = stmt.query(params![idx])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(row.get_ref(0)?.as_bytes().ok().map(extract_gen_model))
+}
+
+fn parse_db_incremental(
+    conn: &Connection,
+    mut prev: ParsedLedgerState,
+    stamp: &FileStamp,
+) -> rusqlite::Result<Option<ParsedLedgerState>> {
+    let cur_max_step = conn
+        .prepare_cached("SELECT MAX(idx) FROM steps")?
+        .query_row([], |r| r.get::<_, Option<i64>>(0))?
+        .unwrap_or(-1);
+    if cur_max_step < prev.max_step_idx {
+        return Ok(None);
+    }
+
+    read_gen_models(
+        conn,
+        Some(prev.max_gen_idx),
+        &mut prev.models,
+        &mut prev.max_gen_idx,
+    )?;
 
     // Look back up to 4 steps so late-arriving streaming metadata on a recent step
     // (after a subsequent tool/boundary step was inserted) is never missed.
@@ -672,14 +764,16 @@ fn parse_db_incremental(
         "SELECT idx, 15, metadata FROM steps WHERE idx >= ?1 AND metadata IS NOT NULL ORDER BY idx"
     };
 
-    let mut stmt = conn.prepare_cached(sql).ok()?;
-    let mut rows = stmt.query(params![start_idx]).ok()?;
+    let Some(mut stmt) = prepare_optional(conn, sql, &["no such column: step_type"])? else {
+        return Ok(None);
+    };
+    let mut rows = stmt.query(params![start_idx])?;
     let turns_mut = Arc::make_mut(&mut prev.turns);
 
     let mut new_max_step = prev.max_step_idx;
-    while let Ok(Some(row)) = rows.next() {
-        let sidx = row.get::<_, i64>(0).unwrap_or(0);
-        let stype = row.get::<_, Option<i32>>(1).unwrap_or(Some(0)).unwrap_or(0);
+    while let Some(row) = rows.next()? {
+        let sidx = row.get::<_, i64>(0)?;
+        let stype = row.get::<_, Option<i32>>(1)?.unwrap_or(0);
         let is_recheck = sidx <= prev.max_step_idx;
         if sidx > new_max_step {
             new_max_step = sidx;
@@ -706,14 +800,9 @@ fn parse_db_incremental(
 
         let gen_idx = parsed.gen_idx;
         if !prev.models.contains_key(&gen_idx) && gen_idx <= prev.max_gen_idx {
-            if let Ok(mut q) = conn.prepare_cached(
-                "SELECT data FROM gen_metadata WHERE idx = ?1 AND data IS NOT NULL",
-            ) {
-                if let Ok(Some(blob)) = q.query_row(params![gen_idx], |r| r.get::<_, Vec<u8>>(0)).optional() {
-                    let pair = extract_gen_model(&blob);
-                    if !pair.0.is_empty() || !pair.1.is_empty() {
-                        prev.models.insert(gen_idx, pair);
-                    }
+            if let Some(pair) = lookup_gen_model(conn, gen_idx)? {
+                if !pair.0.is_empty() || !pair.1.is_empty() {
+                    prev.models.insert(gen_idx, pair);
                 }
             }
         }
@@ -726,7 +815,11 @@ fn parse_db_incremental(
             _ => prev.last_known_model.clone(),
         };
 
-        let model_out = if m_id.is_empty() { "unknown".to_string() } else { m_id.clone() };
+        let model_out = if m_id.is_empty() {
+            "unknown".to_string()
+        } else {
+            m_id.clone()
+        };
         let disp_out = if !m_disp.is_empty() {
             m_disp
         } else if !m_id.is_empty() {
@@ -738,7 +831,11 @@ fn parse_db_incremental(
         if !parsed.response_id.is_empty() {
             if let Some(&pos) = prev.by_resp.get(&parsed.response_id) {
                 let existing = &turns_mut[pos];
-                let began = if existing.timestamp > 0.0 { existing.timestamp } else { parsed.began };
+                let began = if existing.timestamp > 0.0 {
+                    existing.timestamp
+                } else {
+                    parsed.began
+                };
                 let (mut ttft_ms, total_ms) = compute_times(began, parsed.first, parsed.ended);
                 if existing.ttft_ms > 0 && ttft_ms == 0 {
                     ttft_ms = existing.ttft_ms;
@@ -773,7 +870,11 @@ fn parse_db_incremental(
         if is_recheck {
             if let Some(pos) = turns_mut.iter().rposition(|t| t.step_idx == sidx) {
                 let existing = &turns_mut[pos];
-                let began = if existing.timestamp > 0.0 { existing.timestamp } else { parsed.began };
+                let began = if existing.timestamp > 0.0 {
+                    existing.timestamp
+                } else {
+                    parsed.began
+                };
                 let (mut ttft_ms, total_ms) = compute_times(began, parsed.first, parsed.ended);
                 if existing.ttft_ms > 0 && ttft_ms == 0 {
                     ttft_ms = existing.ttft_ms;
@@ -826,7 +927,11 @@ fn parse_db_incremental(
             response_id: resp_id.clone(),
             step_type: stype,
             is_checkpoint: stype == 23,
-            after_turn_start: if prev.has_step_type { Some(prev.saw_turn_start) } else { None },
+            after_turn_start: if prev.has_step_type {
+                Some(prev.saw_turn_start)
+            } else {
+                None
+            },
             after_checkpoint: prev.saw_ckpt_boundary,
         };
         prev.saw_ckpt_boundary = stype == 23;
@@ -838,59 +943,37 @@ fn parse_db_incremental(
     }
 
     let live_probe = probe_live_step_state(
-        &conn,
+        conn,
         prev.has_step_type,
         &prev.turns,
         &prev.models,
         prev.max_gen_idx,
-    );
+    )?;
     prev.dev = stamp.dev;
     prev.ino = stamp.ino;
     prev.sig = stamp.sig.clone();
     prev.max_step_idx = new_max_step.max(cur_max_step);
     prev.live_probe = live_probe;
-    Some(prev)
+    Ok(Some(prev))
 }
 
-fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState> {
-    let conn = open_host_readonly(db_path).ok()?;
+fn parse_db_full(conn: &Connection, stamp: &FileStamp) -> rusqlite::Result<ParsedLedgerState> {
+    let mut models = GenModels::new();
+    let mut max_gen_idx = -1;
+    read_gen_models(conn, None, &mut models, &mut max_gen_idx)?;
 
-    let mut models: HashMap<i64, (String, String)> = HashMap::new();
-    let mut max_gen_idx: i64 = -1;
-    if let Ok(mut gstmt) =
-        conn.prepare("SELECT idx, data FROM gen_metadata WHERE data IS NOT NULL ORDER BY idx")
-    {
-        if let Ok(mut rows) = gstmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                if let Ok(gidx) = row.get::<_, i64>(0) {
-                    if gidx > max_gen_idx {
-                        max_gen_idx = gidx;
-                    }
-                    if let Some(bytes) = row.get_ref(1).ok().and_then(|v| v.as_bytes().ok()) {
-                        let (m_id, m_disp) = extract_gen_model(bytes);
-                        if !m_id.is_empty() || !m_disp.is_empty() {
-                            models.insert(gidx, (m_id, m_disp));
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut has_step_type = true;
-    let stmt_res = conn.prepare(
+    let typed_stmt = prepare_optional(
+        conn,
         "SELECT idx, step_type, CASE WHEN step_type IN (14, 101) THEN NULL ELSE metadata END
          FROM steps WHERE step_type NOT IN (17, 132) ORDER BY idx",
-    );
-    let mut stmt = match stmt_res {
-        Ok(s) => s,
-        Err(_) => {
-            has_step_type = false;
-            conn.prepare(
-                "SELECT idx, 15, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx",
-            )
-            .ok()?
-        }
+        &["no such column: step_type"],
+    )?;
+    let has_step_type = typed_stmt.is_some();
+    let mut stmt = match typed_stmt {
+        Some(stmt) => stmt,
+        None => conn.prepare_cached(
+            "SELECT idx, 15, metadata FROM steps WHERE metadata IS NOT NULL ORDER BY idx",
+        )?,
     };
 
     let mut turns: Vec<TurnSample> = Vec::new();
@@ -901,13 +984,13 @@ fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState>
     let mut saw_turn_start = false;
     let mut max_step_idx: i64 = -1;
 
-    let mut rows = stmt.query([]).ok()?;
-    while let Ok(Some(row)) = rows.next() {
-        let sidx = row.get::<_, i64>(0).unwrap_or(0);
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let sidx = row.get::<_, i64>(0)?;
         if sidx > max_step_idx {
             max_step_idx = sidx;
         }
-        let stype = row.get::<_, Option<i32>>(1).unwrap_or(Some(0)).unwrap_or(0);
+        let stype = row.get::<_, Option<i32>>(1)?.unwrap_or(0);
         if has_step_type && (stype == 14 || stype == 101) {
             saw_turn_start = true;
             continue;
@@ -933,7 +1016,11 @@ fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState>
             _ => last_known_model.clone(),
         };
 
-        let model_out = if m_id.is_empty() { "unknown".to_string() } else { m_id.clone() };
+        let model_out = if m_id.is_empty() {
+            "unknown".to_string()
+        } else {
+            m_id.clone()
+        };
         let disp_out = if !m_disp.is_empty() {
             m_disp
         } else if !m_id.is_empty() {
@@ -945,8 +1032,16 @@ fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState>
         if !parsed.response_id.is_empty() {
             if let Some(&pos) = by_resp.get(&parsed.response_id) {
                 let prev_t = &turns[pos];
-                let began = if prev_t.timestamp > 0.0 { prev_t.timestamp } else { parsed.began };
-                let first = if first_ts_by_turn[pos] > 0.0 { first_ts_by_turn[pos] } else { parsed.first };
+                let began = if prev_t.timestamp > 0.0 {
+                    prev_t.timestamp
+                } else {
+                    parsed.began
+                };
+                let first = if first_ts_by_turn[pos] > 0.0 {
+                    first_ts_by_turn[pos]
+                } else {
+                    parsed.first
+                };
                 first_ts_by_turn[pos] = first;
                 let (ttft_ms, total_ms) = compute_times(began, first, parsed.ended);
                 turns[pos] = TurnSample {
@@ -996,7 +1091,11 @@ fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState>
             response_id: resp_id.clone(),
             step_type: stype,
             is_checkpoint: stype == 23,
-            after_turn_start: if has_step_type { Some(saw_turn_start) } else { None },
+            after_turn_start: if has_step_type {
+                Some(saw_turn_start)
+            } else {
+                None
+            },
             after_checkpoint: saw_ckpt_boundary,
         });
         first_ts_by_turn.push(parsed.first);
@@ -1007,17 +1106,14 @@ fn parse_db_full(db_path: &Path, stamp: &FileStamp) -> Option<ParsedLedgerState>
         }
     }
 
-    if let Ok(Some(exact_max)) =
-        conn.query_row("SELECT MAX(idx) FROM steps", [], |r| r.get::<_, Option<i64>>(0))
-    {
-        if exact_max > max_step_idx {
-            max_step_idx = exact_max;
-        }
-    }
+    let exact_max = conn.query_row("SELECT MAX(idx) FROM steps", [], |r| {
+        r.get::<_, Option<i64>>(0)
+    })?;
+    max_step_idx = max_step_idx.max(exact_max.unwrap_or(-1));
 
-    let live_probe = probe_live_step_state(&conn, has_step_type, &turns, &models, max_gen_idx);
+    let live_probe = probe_live_step_state(conn, has_step_type, &turns, &models, max_gen_idx)?;
 
-    Some(ParsedLedgerState {
+    Ok(ParsedLedgerState {
         dev: stamp.dev,
         ino: stamp.ino,
         sig: stamp.sig.clone(),
@@ -1042,33 +1138,34 @@ fn probe_live_step_state(
     turns: &[TurnSample],
     models: &HashMap<i64, (String, String)>,
     max_gen_idx: i64,
-) -> LiveStepProbe {
+) -> rusqlite::Result<LiveStepProbe> {
     let mut probe = LiveStepProbe::default();
     if !has_step_type {
-        return probe;
+        return Ok(probe);
     }
 
     // 1. Active in-flight steps via `idx_steps_status`
-    if let Ok(mut stmt) = conn.prepare_cached(
+    if let Some(mut stmt) = prepare_optional(
+        conn,
         "SELECT idx, step_type, status, metadata
          FROM steps
          WHERE status IN (1, 2, 8, 9, 11)
          ORDER BY idx DESC
          LIMIT 4",
-    ) {
+        &["no such column: status"],
+    )? {
         let mut active_rows: Vec<(i64, i32, i32, Option<Vec<u8>>)> = Vec::with_capacity(4);
-        if let Ok(mut rows) = stmt.query([]) {
-            while let Ok(Some(row)) = rows.next() {
-                let idx = row.get::<_, i64>(0).unwrap_or(-1);
-                let stype = row.get::<_, Option<i32>>(1).unwrap_or(Some(0)).unwrap_or(0);
-                let status = row.get::<_, Option<i32>>(2).unwrap_or(Some(0)).unwrap_or(0);
-                let meta = row
-                    .get_ref(3)
-                    .ok()
-                    .and_then(|v| v.as_bytes().ok())
-                    .map(|b| b.to_vec());
-                active_rows.push((idx, stype, status, meta));
-            }
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let idx = row.get::<_, i64>(0)?;
+            let stype = row.get::<_, Option<i32>>(1)?.unwrap_or(0);
+            let status = row.get::<_, Option<i32>>(2)?.unwrap_or(0);
+            let meta = row
+                .get_ref(3)
+                .ok()
+                .and_then(|v| v.as_bytes().ok())
+                .map(|b| b.to_vec());
+            active_rows.push((idx, stype, status, meta));
         }
         let chosen = if let Some(ckpt_row) = active_rows.iter().find(|r| r.1 == 23) {
             probe.live_phase = "compacting".to_string();
@@ -1105,15 +1202,8 @@ fn probe_live_step_state(
                     } else {
                         m_disp.clone()
                     };
-                } else if let Ok(mut gq) = conn.prepare_cached(
-                    "SELECT data FROM gen_metadata WHERE idx = ?1 AND data IS NOT NULL",
-                ) {
-                    if let Ok(Some(blob)) =
-                        gq.query_row(params![gidx], |r| r.get::<_, Vec<u8>>(0)).optional()
-                    {
-                        let (m_id, m_disp) = extract_gen_model(&blob);
-                        probe.live_model = if !m_id.is_empty() { m_id } else { m_disp };
-                    }
+                } else if let Some((m_id, m_disp)) = lookup_gen_model(conn, gidx)? {
+                    probe.live_model = if !m_id.is_empty() { m_id } else { m_disp };
                 }
             }
         }
@@ -1121,16 +1211,18 @@ fn probe_live_step_state(
 
     // 2. Latest terminal/active step across step_type IN (15, 17, 23) using zero-sort O(log N) index seeks
     let latest_completed_turn_step_idx = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
-    if let Ok(mut stmt) = conn.prepare_cached(
+    if let Some(mut stmt) = prepare_optional(
+        conn,
         "SELECT idx, step_type, status, error_details
          FROM steps
          WHERE step_type = ?1
          ORDER BY idx DESC
          LIMIT 1",
-    ) {
+        &["no such column: status", "no such column: error_details"],
+    )? {
         let mut best: Option<(i64, i32, Option<Vec<u8>>)> = None;
         for st in [15i32, 17, 23] {
-            if let Ok(Some((idx, status, err_blob))) = stmt
+            if let Some((idx, status, err_blob)) = stmt
                 .query_row(params![st], |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
@@ -1138,7 +1230,7 @@ fn probe_live_step_state(
                         r.get::<_, Option<Vec<u8>>>(3)?,
                     ))
                 })
-                .optional()
+                .optional()?
             {
                 if best.as_ref().map(|b| idx > b.0).unwrap_or(true) {
                     best = Some((idx, status, err_blob));
@@ -1162,21 +1254,22 @@ fn probe_live_step_state(
     }
 
     // 3. Latest completed checkpoint summary byte length via `idx_steps_step_type` (zero-alloc)
-    if let Ok(mut stmt) = conn.prepare_cached(
+    if let Some(mut stmt) = prepare_optional(
+        conn,
         "SELECT idx, step_payload
          FROM steps
          WHERE step_type = 23 AND status = 3
          ORDER BY idx DESC
          LIMIT 1",
-    ) {
-        if let Ok(mut rows) = stmt.query([]) {
-            if let Ok(Some(row)) = rows.next() {
-                if let Some(bytes) = row.get_ref(1).ok().and_then(|v| v.as_bytes().ok()) {
-                    probe.compact_summary_bytes = extract_checkpoint_summary_len(bytes);
-                }
+        &["no such column: status", "no such column: step_payload"],
+    )? {
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            if let Ok(bytes) = row.get_ref(1)?.as_bytes() {
+                probe.compact_summary_bytes = extract_checkpoint_summary_len(bytes);
             }
         }
     }
 
-    probe
+    Ok(probe)
 }

@@ -383,7 +383,11 @@ pub fn format_live_status_tag(item: &SessionTelemetry, zh: bool) -> String {
             String::new()
         };
         let xmod = if item.cross_model_compact {
-            if zh { "·跨模型" } else { "·cross-model" }
+            if zh {
+                "·跨模型"
+            } else {
+                "·cross-model"
+            }
         } else {
             ""
         };
@@ -408,7 +412,11 @@ pub fn format_live_status_tag(item: &SessionTelemetry, zh: bool) -> String {
     }
     if item.is_active {
         return if item.is_subagent {
-            if zh { " [运行中]" } else { " [running]" }
+            if zh {
+                " [运行中]"
+            } else {
+                " [running]"
+            }
         } else if zh {
             " [进行中]"
         } else {
@@ -426,12 +434,20 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
     let zh = snap.lang == "zh-CN";
     let s = &snap.summary;
     let ccode = if snap.currency_code.is_empty() {
-        if zh { "CNY" } else { "USD" }
+        if zh {
+            "CNY"
+        } else {
+            "USD"
+        }
     } else {
         snap.currency_code.as_str()
     };
     let sym = if snap.currency_symbol.is_empty() {
-        if zh { "¥" } else { "$" }
+        if zh {
+            "¥"
+        } else {
+            "$"
+        }
     } else {
         snap.currency_symbol.as_str()
     };
@@ -494,14 +510,24 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
                 String::new()
             };
             let xmod_note = if item.cross_model_compact {
-                if zh { "·跨模型" } else { "·cross-model" }
+                if zh {
+                    "·跨模型"
+                } else {
+                    "·cross-model"
+                }
             } else {
                 ""
             };
             if zh {
-                format!(" [已压缩·原{}{kb_note}{xmod_note}]", fmt_k(item.pre_compact_tokens))
+                format!(
+                    " [已压缩·原{}{kb_note}{xmod_note}]",
+                    fmt_k(item.pre_compact_tokens)
+                )
             } else {
-                format!(" [compacted from {}{kb_note}{xmod_note}]", fmt_k(item.pre_compact_tokens))
+                format!(
+                    " [compacted from {}{kb_note}{xmod_note}]",
+                    fmt_k(item.pre_compact_tokens)
+                )
             }
         } else if item.suggest_compact {
             if zh {
@@ -525,7 +551,9 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
         let cb = &item.cold_cache_breakdown;
         let mb = &item.mid_loop_breakdown;
         let mid_sub = if cb.mid_loop_cold > 0
-            && (mb.slow_turn_self_expiry > 0 || mb.replica_spillover > 0 || mb.model_switch_cold > 0)
+            && (mb.slow_turn_self_expiry > 0
+                || mb.replica_spillover > 0
+                || mb.model_switch_cold > 0)
         {
             if zh {
                 format!(

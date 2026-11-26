@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "radar": {
+    "context-radar-mcp": {
       "command": "/usr/bin/env",
       "args": [
         "${PLUGIN_ROOT}/bin/context-radar-mcp",

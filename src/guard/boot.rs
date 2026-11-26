@@ -105,7 +105,9 @@ pub fn is_inside_workspace(candidate: &str, workspace_root: &str) -> bool {
     if cand_norm == root_norm || cand_norm.starts_with(&root_norm) {
         return true;
     }
-    if let (Ok(root_real), Ok(cand_real)) = (fs::canonicalize(&root_norm), fs::canonicalize(&cand_norm)) {
+    if let (Ok(root_real), Ok(cand_real)) =
+        (fs::canonicalize(&root_norm), fs::canonicalize(&cand_norm))
+    {
         return cand_real == root_real || cand_real.starts_with(&root_real);
     }
     false
@@ -335,7 +337,11 @@ fn summarize_markdown_bullets(markdown: &str, spec: &serde_json::Map<String, Val
 }
 
 fn summarize_plain(content: &str, spec: &serde_json::Map<String, Value>) -> String {
-    let lines: Vec<&str> = content.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
     if lines.is_empty() {
         return String::new();
     }
@@ -401,7 +407,9 @@ pub fn evaluate_boot_guard(payload: &Value, hook_cfg: &Value) -> Value {
     let mut messages: Vec<String> = Vec::new();
 
     for spec_val in state_files {
-        let Some(spec) = spec_val.as_object() else { continue };
+        let Some(spec) = spec_val.as_object() else {
+            continue;
+        };
         let Some(raw_path) = spec.get("path").and_then(Value::as_str).map(str::trim) else {
             continue;
         };
@@ -446,7 +454,9 @@ pub fn evaluate_boot_guard(payload: &Value, hook_cfg: &Value) -> Value {
     }
 
     for rule_val in extra_rules {
-        let Some(rule) = rule_val.as_object() else { continue };
+        let Some(rule) = rule_val.as_object() else {
+            continue;
+        };
         let ws_root = rule
             .get("workspace_root")
             .and_then(Value::as_str)
@@ -460,8 +470,7 @@ pub fn evaluate_boot_guard(payload: &Value, hook_cfg: &Value) -> Value {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            let Some((fpath, bound_root)) =
-                resolve_across_candidates(f, ws_root, &matched_cand)
+            let Some((fpath, bound_root)) = resolve_across_candidates(f, ws_root, &matched_cand)
             else {
                 continue;
             };
@@ -526,5 +535,8 @@ pub fn run_boot_guard_cli() {
     };
     let settings = load_settings_once(None);
     let out = evaluate_boot_guard(&payload, &settings.guards.boot);
-    println!("{}", serde_json::to_string(&out).unwrap_or_else(|_| "{}".into()));
+    println!(
+        "{}",
+        serde_json::to_string(&out).unwrap_or_else(|_| "{}".into())
+    );
 }

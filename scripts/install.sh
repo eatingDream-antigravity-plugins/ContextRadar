@@ -112,7 +112,7 @@ main() {
   [ -f "${stage_dir}/bin/${PLUGIN_NAME}" ] || die "archive missing bin/${PLUGIN_NAME}"
   [ -f "${stage_dir}/plugin.json" ] || die "archive missing plugin.json"
 
-  mkdir -p "${INSTALL_DIR}/bin" "${INSTALL_DIR}/panel/dist" "${INSTALL_DIR}/rules" "${INSTALL_DIR}/skills/context-radar" "${INSTALL_DIR}/assets"
+  mkdir -p "${INSTALL_DIR}/bin" "${INSTALL_DIR}/panel/dist" "${INSTALL_DIR}/rules" "${INSTALL_DIR}/skills/context-radar" "${INSTALL_DIR}/assets" "${INSTALL_DIR}/docs"
 
   # Atomic binary swap so an active daemon binary is never overwritten in place
   cp "${stage_dir}/bin/${PLUGIN_NAME}" "${INSTALL_DIR}/bin/${PLUGIN_NAME}.new"
@@ -123,7 +123,10 @@ main() {
   cp "${stage_dir}/rules/AGENTS.md" "${INSTALL_DIR}/rules/AGENTS.md"
   cp "${stage_dir}/skills/context-radar/SKILL.md" "${INSTALL_DIR}/skills/context-radar/SKILL.md"
   cp "${stage_dir}/assets/logo.svg" "${INSTALL_DIR}/assets/logo.svg"
-  for f in plugin.json mcp_config.json hooks.json LICENSE README.md settings.example.json settings.schema.json; do
+  if [ -f "${stage_dir}/docs/ai-guide.md" ]; then
+    cp "${stage_dir}/docs/ai-guide.md" "${INSTALL_DIR}/docs/ai-guide.md"
+  fi
+  for f in plugin.json mcp_config.json hooks.json LICENSE README.md llms.txt settings.example.json settings.schema.json; do
     if [ -f "${stage_dir}/${f}" ]; then
       cp "${stage_dir}/${f}" "${INSTALL_DIR}/${f}"
     fi

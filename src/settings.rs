@@ -22,6 +22,25 @@ pub const ACP_PROXY_ENV: &str = "CONTEXT_RADAR_ACP_PROXY";
 pub const AGY_AUTO_COMPACT_OVERRIDE_ENV: &str = "AGY_CLI_AUTO_COMPACT_OVERRIDE";
 pub const AGY_BIN_ENV: &str = "AGY_BIN";
 
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )
+))]
+pub(crate) const UNIX_O_NOFOLLOW: i32 = 0x0100;
+#[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+pub(crate) const UNIX_O_NOFOLLOW: i32 = 0o100000;
+#[cfg(all(
+    target_os = "linux",
+    not(any(target_arch = "aarch64", target_arch = "arm"))
+))]
+pub(crate) const UNIX_O_NOFOLLOW: i32 = 0o400000;
+
 pub const DEFAULT_CONTEXT_LIMIT: u64 = 512_000;
 pub const DEFAULT_WARN_THRESHOLD: u64 = 220_000;
 pub const DEFAULT_COMPACT_THRESHOLD: u64 = 270_000;
@@ -132,7 +151,9 @@ pub fn select_data_root_from_home(home: &Path) -> PathBuf {
         if let Some(ts) = candidate_root_activity_ns(&cand) {
             let take = match &best_active {
                 None => true,
-                Some((prev_ts, prev_idx, _)) => ts > *prev_ts || (ts == *prev_ts && idx < *prev_idx),
+                Some((prev_ts, prev_idx, _)) => {
+                    ts > *prev_ts || (ts == *prev_ts && idx < *prev_idx)
+                }
             };
             if take {
                 best_active = Some((ts, idx, cand));
@@ -472,13 +493,33 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
     };
 
     let ctx_obj = obj.get("context").and_then(Value::as_object);
-    let default_limit = val_u64(ctx_obj.and_then(|o| o.get("default_limit")), DEFAULT_CONTEXT_LIMIT, 1000);
+    let default_limit = val_u64(
+        ctx_obj.and_then(|o| o.get("default_limit")),
+        DEFAULT_CONTEXT_LIMIT,
+        1000,
+    );
     let context = ContextConfig {
         default_limit,
-        warn_threshold: val_u64(ctx_obj.and_then(|o| o.get("warn_threshold")), DEFAULT_WARN_THRESHOLD, 1000),
-        compact_threshold: val_u64(ctx_obj.and_then(|o| o.get("compact_threshold")), DEFAULT_COMPACT_THRESHOLD, 1000),
-        critical_threshold: val_u64(ctx_obj.and_then(|o| o.get("critical_threshold")), DEFAULT_CRITICAL_THRESHOLD, 1000),
-        est_post_compact_base: val_u64(ctx_obj.and_then(|o| o.get("est_post_compact_base")), DEFAULT_POST_COMPACT_BASE, 0),
+        warn_threshold: val_u64(
+            ctx_obj.and_then(|o| o.get("warn_threshold")),
+            DEFAULT_WARN_THRESHOLD,
+            1000,
+        ),
+        compact_threshold: val_u64(
+            ctx_obj.and_then(|o| o.get("compact_threshold")),
+            DEFAULT_COMPACT_THRESHOLD,
+            1000,
+        ),
+        critical_threshold: val_u64(
+            ctx_obj.and_then(|o| o.get("critical_threshold")),
+            DEFAULT_CRITICAL_THRESHOLD,
+            1000,
+        ),
+        est_post_compact_base: val_u64(
+            ctx_obj.and_then(|o| o.get("est_post_compact_base")),
+            DEFAULT_POST_COMPACT_BASE,
+            0,
+        ),
         subagent_silent_timeout_sec: val_f64(
             ctx_obj.and_then(|o| o.get("subagent_silent_timeout_sec")),
             DEFAULT_SUBAGENT_SILENT_TIMEOUT_SEC,
@@ -497,15 +538,24 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
         .map(|v| !v.is_null())
         .unwrap_or(false);
     let fx_rate = if fx_configured {
-        val_f64(pr_obj.and_then(|o| o.get("fx_rate")), DEFAULT_FX_RATE, 0.0001)
+        val_f64(
+            pr_obj.and_then(|o| o.get("fx_rate")),
+            DEFAULT_FX_RATE,
+            0.0001,
+        )
     } else {
         DEFAULT_FX_RATE
     };
 
     let mut overrides = Vec::new();
-    if let Some(arr) = pr_obj.and_then(|o| o.get("overrides")).and_then(Value::as_array) {
+    if let Some(arr) = pr_obj
+        .and_then(|o| o.get("overrides"))
+        .and_then(Value::as_array)
+    {
         for item in arr {
-            let Some(item_obj) = item.as_object() else { continue };
+            let Some(item_obj) = item.as_object() else {
+                continue;
+            };
             let in_p = val_f64(item_obj.get("input_per_m"), -1.0, 0.0);
             let out_p = val_f64(item_obj.get("output_per_m"), -1.0, 0.0);
             if in_p < 0.0 || out_p < 0.0 {
@@ -527,7 +577,11 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
                 cache_write_per_m: val_f64(item_obj.get("cache_write_per_m"), in_p, 0.0),
                 output_per_m: out_p,
                 context_limit: val_u64(item_obj.get("context_limit"), default_limit, 1000),
-                source: if src.is_empty() { "user-override".to_string() } else { src },
+                source: if src.is_empty() {
+                    "user-override".to_string()
+                } else {
+                    src
+                },
                 tier_threshold: val_u64(item_obj.get("tier_threshold"), 0, 0),
                 tier_input: val_f64(item_obj.get("tier_input"), 0.0, 0.0),
                 tier_cache_read: val_f64(item_obj.get("tier_cache_read"), 0.0, 0.0),
@@ -538,7 +592,10 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
     }
 
     let mut models = HashMap::new();
-    if let Some(m_obj) = pr_obj.and_then(|o| o.get("models")).and_then(Value::as_object) {
+    if let Some(m_obj) = pr_obj
+        .and_then(|o| o.get("models"))
+        .and_then(Value::as_object)
+    {
         for (k, v) in m_obj {
             let key = k.trim().to_ascii_lowercase();
             let Some(vo) = v.as_object() else { continue };
@@ -559,7 +616,11 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
                     cache_write_per_m: val_f64(vo.get("cache_write_per_m"), in_p, 0.0),
                     output_per_m: out_p,
                     context_limit: val_u64(vo.get("context_limit"), default_limit, 1000),
-                    source: if src.is_empty() { "user-config".to_string() } else { src },
+                    source: if src.is_empty() {
+                        "user-config".to_string()
+                    } else {
+                        src
+                    },
                     tier_threshold: val_u64(vo.get("tier_threshold"), 0, 0),
                     tier_input: val_f64(vo.get("tier_input"), 0.0, 0.0),
                     tier_cache_read: val_f64(vo.get("tier_cache_read"), 0.0, 0.0),
@@ -571,7 +632,10 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
     }
 
     let mut short_labels = Vec::new();
-    if let Some(arr) = pr_obj.and_then(|o| o.get("short_labels")).and_then(Value::as_array) {
+    if let Some(arr) = pr_obj
+        .and_then(|o| o.get("short_labels"))
+        .and_then(Value::as_array)
+    {
         for item in arr {
             let Some(io) = item.as_object() else { continue };
             let contains = val_str(io.get("contains")).to_ascii_lowercase();
@@ -592,8 +656,12 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
         currency_configured,
         fx_rate,
         fx_rate_configured: fx_configured,
-        external_fxrate_path: expand_tilde(&val_str(pr_obj.and_then(|o| o.get("external_fxrate_path")))),
-        external_models_path: expand_tilde(&val_str(pr_obj.and_then(|o| o.get("external_models_path")))),
+        external_fxrate_path: expand_tilde(&val_str(
+            pr_obj.and_then(|o| o.get("external_fxrate_path")),
+        )),
+        external_models_path: expand_tilde(&val_str(
+            pr_obj.and_then(|o| o.get("external_models_path")),
+        )),
         overrides,
         models,
         short_labels,
@@ -650,9 +718,14 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
         }
     }
 
-    let def_prof = val_str(bud_obj.and_then(|o| o.get("default_tier").or_else(|| o.get("default_profile"))));
+    let def_prof =
+        val_str(bud_obj.and_then(|o| o.get("default_tier").or_else(|| o.get("default_profile"))));
     let budgets = BudgetsConfig {
-        default_profile: if def_prof.is_empty() { "standard".to_string() } else { def_prof },
+        default_profile: if def_prof.is_empty() {
+            "standard".to_string()
+        } else {
+            def_prof
+        },
         profiles,
         profile_rules,
     };

@@ -6,8 +6,8 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 use crate::i18n::{resolve_active_lang, Lang};
-pub use crate::settings::{BudgetTierSpec, TierMatchRule};
 use crate::settings::Settings;
+pub use crate::settings::{BudgetTierSpec, TierMatchRule};
 
 /// Empirical Gemini 4 implicit KV cache TTL (3 minutes, anchored to prefill start `prev.began`).
 pub const GEMINI_4_CACHE_TTL_SEC: f64 = 180.0;
@@ -31,7 +31,8 @@ pub fn is_gemini_4_carbon(model: &str, model_display: &str) -> bool {
     let d = model_display.trim().to_ascii_lowercase();
     m.starts_with("gemini-4-carbon")
         || m.contains("/gemini-4-carbon")
-        || (is_gemini_4_model(model, model_display) && (m.contains("carbon") || d.contains("carbon")))
+        || (is_gemini_4_model(model, model_display)
+            && (m.contains("carbon") || d.contains("carbon")))
 }
 
 #[inline]
@@ -164,11 +165,19 @@ pub fn builtin_tiers() -> HashMap<String, BudgetTierSpec> {
 }
 
 fn rule_matches(rule: &TierMatchRule, raw: &str) -> bool {
-    if !rule.exclude_any.is_empty() && rule.exclude_any.iter().any(|tok| raw.contains(tok.as_str()))
+    if !rule.exclude_any.is_empty()
+        && rule
+            .exclude_any
+            .iter()
+            .any(|tok| raw.contains(tok.as_str()))
     {
         return false;
     }
-    if !rule.require_all.is_empty() && !rule.require_all.iter().all(|tok| raw.contains(tok.as_str()))
+    if !rule.require_all.is_empty()
+        && !rule
+            .require_all
+            .iter()
+            .all(|tok| raw.contains(tok.as_str()))
     {
         return false;
     }
