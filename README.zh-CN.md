@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/con
 ### 自主压缩与交接（仅使用官方协议）
 
 - **Antigravity App（SEP-1865 `ui/message`）**：通过全部硬门槛（`running_subagent_count == 0`、预算与回本达标）后，可见挂载的内联交接卡片（`ui://context-radar-mcp/handoff`）或归属匹配的侧边栏（`!document.hidden`）会核销单次票据并触发 `/compact`（失败自动复制兜底）或拉起新对话（`com.google.antigravity/message`，`target: "new"`）。由于 Antigravity App 不会为折叠工具调用静默挂载无头 iframe，也未提供无 UI 的 MCP/Hook `/compact` 接口，无人值守压缩需使用下方官方 ACP 方案。
-- **`agy` CLI 与 ACP 编辑器（ACP v1 `session/prompt`）**：在 Antigravity CLI（`agy`）及支持 ACP 的编辑器（Zed、JetBrains、Android Studio、Xcode、VS Code ACP）中，将自定义 ACP Agent 指向 `acp-proxy`（替代 `agy acp`），即可在同一连接上自动核销 `auto_fire` 票据并原地执行原生 `/compact`；也可通过 `acp-run` 无头托管长任务：
+- **`agy` CLI 与 ACP 编辑器（ACP v1 `session/prompt`）**：`acp-proxy` 与 `acp-run` 为纯协议薄客户端（零本地 SQLite / 票据文件耦合，原生兼容 `--remote-agent`、SSH 及 Zed、JetBrains、Android Studio、Xcode、VS Code ACP 等编辑器）。将自定义 ACP Agent 指向 `acp-proxy`（替代 `agy acp`），当 `context_radar_commit_handoff(kind: "compact", auto_fire: true)` 成功返回后，代理会在本轮 `end_turn` 原地注入原生 `/compact`（门禁拦截时服务端返回 `isError: true`，绝不误触发），也支持可选 `--native-auto-compact <val>`（透传 `AGY_CLI_AUTO_COMPACT_OVERRIDE`，如 `300K` 或 `80%`）或使用 `acp-run` 无头托管长任务：
 
 ```json
 {

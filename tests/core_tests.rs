@@ -1795,7 +1795,8 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
     assert_eq!(legacy["result"]["structuredContent"]["mode"], json!("snapshot"));
     assert_eq!(daemon.grants.get_settings().allow_auto_handoff, true);
 
-    // Create compact grant with CONTEXT_RADAR_ACP_PROXY=1 -> persisted acp_proxy_active=true on pending_grant
+    // Create compact grant with CONTEXT_RADAR_ACP_PROXY=1 -> persisted acp_proxy_active=true on pending_grant,
+    // scratch_note_path included in compact_command, and ACP gate blocks return isError=true (while App UI stays isError=false)
     let prev_acp = env::var(ACP_PROXY_ENV).ok();
     env::set_var(ACP_PROXY_ENV, "1");
     let commit = daemon
@@ -1807,17 +1808,91 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
                     "kind": "compact",
                     "conversation_id": cid,
                     "preserve_points": "Keep locks",
+                    "scratch_note_path": "scratch/slice_1_6.md",
                     "estimated_remaining_turns": 20
                 }
             }
         }))
         .unwrap();
+    assert_eq!(commit["result"]["isError"], json!(false));
+    assert_eq!(commit["result"]["structuredContent"]["acp_proxy_active"], json!(true));
+    assert_eq!(commit["result"]["structuredContent"]["lang"], json!("zh-CN"));
+    assert!(commit["result"]["structuredContent"]["compact_command"]
+        .as_str()
+        .unwrap()
+        .contains("scratch/slice_1_6.md"));
+
+    // Gate block under CONTEXT_RADAR_ACP_PROXY=1 (estimated_remaining_turns=1 fails break-even) -> isError=true
+    let acp_blocked_gate = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 120, "method": "tools/call",
+            "params": {
+                "name": "context_radar_commit_handoff",
+                "arguments": {
+                    "kind": "compact",
+                    "conversation_id": cid,
+                    "preserve_points": "Keep locks",
+                    "estimated_remaining_turns": 1
+                }
+            }
+        }))
+        .unwrap();
+    assert_eq!(acp_blocked_gate["result"]["isError"], json!(true));
+    assert_eq!(acp_blocked_gate["result"]["structuredContent"]["mode"], json!("handoff_blocked"));
+
+    // Disabling allow_auto_handoff under CONTEXT_RADAR_ACP_PROXY=1 -> isError=true on auto_fire compact
+    let _ = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 1201, "method": "tools/call",
+            "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "allow_auto_handoff": false } }
+        }))
+        .unwrap();
+    let acp_blocked_pref = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 121, "method": "tools/call",
+            "params": {
+                "name": "context_radar_commit_handoff",
+                "arguments": {
+                    "kind": "compact",
+                    "conversation_id": cid,
+                    "preserve_points": "Keep locks",
+                    "estimated_remaining_turns": 20
+                }
+            }
+        }))
+        .unwrap();
+    assert_eq!(acp_blocked_pref["result"]["isError"], json!(true));
+    assert_eq!(acp_blocked_pref["result"]["structuredContent"]["mode"], json!("handoff_blocked"));
+    let _ = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 1211, "method": "tools/call",
+            "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "allow_auto_handoff": true } }
+        }))
+        .unwrap();
+
+    // Unset ACP proxy env -> App UI gate block keeps isError=false so inline card renders normally
+    env::remove_var(ACP_PROXY_ENV);
+    let app_blocked_gate = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 122, "method": "tools/call",
+            "params": {
+                "name": "context_radar_commit_handoff",
+                "arguments": {
+                    "kind": "compact",
+                    "conversation_id": cid,
+                    "preserve_points": "Keep locks",
+                    "estimated_remaining_turns": 1
+                }
+            }
+        }))
+        .unwrap();
+    assert_eq!(app_blocked_gate["result"]["isError"], json!(false));
+    assert_eq!(app_blocked_gate["result"]["structuredContent"]["mode"], json!("handoff_blocked"));
+
     match prev_acp {
         Some(v) => env::set_var(ACP_PROXY_ENV, v),
         None => env::remove_var(ACP_PROXY_ENV),
     }
-    assert_eq!(commit["result"]["structuredContent"]["acp_proxy_active"], json!(true));
-    assert_eq!(commit["result"]["structuredContent"]["lang"], json!("zh-CN"));
 
     let ov = daemon
         .handle_request(&json!({
