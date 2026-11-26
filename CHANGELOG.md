@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.4.0...v1.5.0) (2026-11-26)
+
+
+### Features
+
+* Editorial-Warm UI with Pinned/Recent session grouping, backend hardening, and SEP-1865 negotiation ([#27](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/issues/27)) ([ba39453](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/commit/ba3945319036c81808ed2728f780d3ca98289f55))
+
 ## [1.4.0](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.3.4...v1.4.0) (2026-11-26)
 
 
