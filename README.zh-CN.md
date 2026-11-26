@@ -70,6 +70,24 @@ curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/con
 - **不破缓存的 `scratch/` 旁路提炼**：不删改线上历史消息，而是将旧片段提炼到 `scratch/`，保住当前 KV 前缀热缓存并供新会话或子 Agent 按需读取。
 - **作用域票据与安全护栏**：单次交接票据绑定 `conversation_id` 与 `workspace` 并以 `0600` 权限存盘；可选 `PreToolUse` 等待守护自动放行后台守护进程与异步构建。
 
+## AI Agent 接入指南
+
+- **Antigravity**：执行上方一键安装脚本即自动注册 MCP 服务、实时面板与 [`skills/context-radar/SKILL.md`](skills/context-radar/SKILL.md)。
+- **Claude Code / Codex / Cursor / OpenCode（任意 stdio MCP 客户端）**：将 MCP 配置指向已安装的二进制，并加载通用 Skill [`skills/context-radar/SKILL.md`](skills/context-radar/SKILL.md)（或运行 `npx skills add eatingDream-antigravity-plugins/context-radar-mcp`）：
+
+```json
+{
+  "mcpServers": {
+    "radar": {
+      "command": "/path/to/context-radar-mcp",
+      "args": ["daemon", "--data-dir", "/path/to/context-radar-data"]
+    }
+  }
+}
+```
+
+- **LLM 索引与协作指南**：[`llms.txt`](llms.txt) · [`AGENTS.md`](AGENTS.md)
+
 ## 从源码构建
 
 需要 Rust（`cargo`）和 Node.js 20+（仅用于打包和测试前端面板）。

@@ -23,3 +23,7 @@ description: >-
 - **Respect hard gates & boundaries**: Call `context_radar_commit_handoff` only at a clean phase boundary once `context_radar_prepare_handoff` reports `gate_allowed: true`.
 - **Subagent baton pass**: Subagents lack `/compact`; wrap up cleanly near their budget threshold and let the coordinator spawn a fresh worker if work remains.
 - **Command waiting**: Pass `WaitMsBeforeAsync: 10000` for normal `run_command` calls (`IsDaemon: true` for long-running servers/watchers); the `PreToolUse` guard exempts daemons automatically.
+
+## Cross-Client Setup
+
+Any stdio MCP client (Antigravity, Claude Code, Codex, Cursor, OpenCode) can connect via `context-radar-mcp daemon --data-dir <dir>`. For unattended CLI compaction, wrap `agy acp` via `context-radar-mcp acp-proxy` or `acp-run`.

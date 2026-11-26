@@ -70,6 +70,24 @@ No config file is needed out of the box—language (`en` / `zh-CN`), currency (`
 - **Prefix-safe `scratch/` distillation**: Writes summaries out-of-band instead of mutating history, keeping the live KV prefix hot while fresh chats or subagents read digests on demand.
 - **Scoped grants & safe guards**: Single-use grants bind to `conversation_id` + `workspace` in `0600` local files; the optional `PreToolUse` wait guard exempts explicit daemons and async builds automatically.
 
+## AI Agent Integration
+
+- **Antigravity**: One-line installer above registers the MCP server, live panel, and `skills/context-radar/SKILL.md` automatically.
+- **Claude Code / Codex / Cursor / OpenCode (any MCP stdio client)**: Point your MCP config to the installed binary and add the portable skill [`skills/context-radar/SKILL.md`](skills/context-radar/SKILL.md) (or `npx skills add eatingDream-antigravity-plugins/context-radar-mcp`):
+
+```json
+{
+  "mcpServers": {
+    "radar": {
+      "command": "/path/to/context-radar-mcp",
+      "args": ["daemon", "--data-dir", "/path/to/context-radar-data"]
+    }
+  }
+}
+```
+
+- **LLM index & coding-agent guide**: [`llms.txt`](llms.txt) · [`AGENTS.md`](AGENTS.md)
+
 ## Build from source
 
 Requires Rust (`cargo`) and Node.js 20+ (only to bundle and test the panel).
