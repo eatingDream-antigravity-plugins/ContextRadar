@@ -5,7 +5,6 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -14,11 +13,14 @@ use serde_json::{json, Map, Value};
 
 use crate::engine::budget::{evaluate_handoff_gate, prepare_handoff_plan};
 use crate::engine::grants::{
-    default_grants_path_in, is_acp_proxy_active, sanitize_scratch_note_path_for_lang,
+    default_grants_path_in, is_acp_proxy_active, paths_overlap,
+    sanitize_scratch_note_path_for_lang, workspaces_overlap, ClaimOutcome, GrantFileSignature,
     RelayGrantStore,
 };
 use crate::engine::pruner::distill_slice_with_lang;
-use crate::engine::telemetry::{compute_snapshot_digest, OverviewSnapshot, TelemetryEngine};
+use crate::engine::telemetry::{
+    compute_snapshot_digest, now_epoch_sec, OverviewSnapshot, TelemetryEngine,
+};
 use crate::i18n::{parse_lang_tag, select_display_cost};
 use crate::rpc::tools::{
     fmt_k, format_live_status_tag, resources_spec, summarize_snapshot_text, tools_spec, APP_MIME,
@@ -28,12 +30,21 @@ use crate::settings::{expand_tilde, PANEL_HTML_ENV};
 
 pub const SERVER_NAME: &str = "context-radar-mcp";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
-pub const PROTOCOL_VERSION: &str = "2025-03-26";
+const SUPPORTED_PROTOCOL_VERSIONS: &[&str] = &[
+    "2025-11-25", // Latest supported version.
+    "2025-06-18",
+    "2025-03-26", // Antigravity clients.
+    "2024-11-05",
+];
+pub const PROTOCOL_VERSION: &str = SUPPORTED_PROTOCOL_VERSIONS[0];
+const APPS_EXTENSION: &str = "io.modelcontextprotocol/ui";
 const MAX_HTML_BYTES: usize = 10 * 1024 * 1024;
 const BOOT_MARKER: &str = "/*__CONTEXT_RADAR_BOOT__*/";
 /// Short burst-coalescing TTL (paired with live disk-activity validation so any new LLM
 /// request invalidates the cache immediately without waiting for TTL expiry).
 pub const SWR_STALE_TTL: Duration = Duration::from_millis(150);
+// Conditional polls can reuse a snapshot until a known transition or this safety limit.
+const POLL_CACHE_MAX_AGE: Duration = Duration::from_secs(15);
 
 fn serialize_boot_json(val: &Value) -> String {
     let raw = serde_json::to_string(val).unwrap_or_else(|_| "null".to_string());
@@ -96,6 +107,7 @@ struct DiskActivitySig {
     wal_mtime_ns: i128,
     wal_size: u64,
     conv_mtime_ns: i128,
+    annotations_mtime_ns: i128,
     active_wal_hash: u64,
 }
 
@@ -113,6 +125,7 @@ fn quick_disk_activity_sig(data_root: &Path) -> DiskActivitySig {
     let (wal_mtime_ns, wal_size) = stat_pair(&data_root.join("conversation_summaries.db-wal"));
     let conv_dir = data_root.join("conversations");
     let (conv_mtime_ns, _) = stat_pair(&conv_dir);
+    let (annotations_mtime_ns, _) = stat_pair(&data_root.join("annotations"));
     // Also fold every active `.db-wal` (and `.db` mtime/size) so new LLM turns written
     // directly into an existing conversation SQLite WAL immediately invalidate burst cache
     // even when parent directory mtime does not change on APFS/ext4.
@@ -120,12 +133,16 @@ fn quick_disk_activity_sig(data_root: &Path) -> DiskActivitySig {
     if let Ok(entries) = fs::read_dir(&conv_dir) {
         for entry in entries.flatten() {
             let name_os = entry.file_name();
-            let Some(name) = name_os.to_str() else { continue };
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
             if name.ends_with(".db-wal") || name.ends_with(".db") {
                 if let Ok(m) = entry.metadata() {
                     let ns = (m.mtime() as i128) * 1_000_000_000 + (m.mtime_nsec() as i128);
                     let mix = (ns as u64) ^ m.size().rotate_left(17) ^ (m.ino().rotate_left(7));
-                    active_wal_hash = active_wal_hash.wrapping_add(mix).wrapping_mul(0x100000001b3);
+                    // Directory enumeration order is unspecified.
+                    active_wal_hash = active_wal_hash
+                        .wrapping_add((mix ^ (mix >> 32)).wrapping_mul(0x100000001b3));
                 }
             }
         }
@@ -136,23 +153,38 @@ fn quick_disk_activity_sig(data_root: &Path) -> DiskActivitySig {
         wal_mtime_ns,
         wal_size,
         conv_mtime_ns,
+        annotations_mtime_ns,
         active_wal_hash,
     }
 }
 
-#[derive(Clone)]
+#[derive(PartialEq, Eq)]
+struct SnapshotInputs {
+    disk: DiskActivitySig,
+    grants: Option<GrantFileSignature>,
+    settings_generation: u64,
+}
+
+impl SnapshotInputs {
+    fn capture(engine: &mut TelemetryEngine, grants: &RelayGrantStore) -> Self {
+        Self {
+            disk: quick_disk_activity_sig(&engine.ledger.data_root),
+            grants: grants.disk_signature(),
+            settings_generation: engine.rates.current_settings().generation,
+        }
+    }
+}
+
 struct CachedDefaultSnap {
-    snap: OverviewSnapshot,
+    snap: Arc<OverviewSnapshot>,
     built_at: Instant,
-    grants_rev: u64,
-    disk_sig: DiskActivitySig,
+    inputs: SnapshotInputs,
 }
 
 struct SwrHub {
     cached: RwLock<Option<CachedDefaultSnap>>,
     html: RwLock<Option<HtmlCache>>,
     rendered_panel: RwLock<Option<RenderedPanelCache>>,
-    grants_rev: AtomicU64,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -162,36 +194,42 @@ impl SwrHub {
             cached: RwLock::new(None),
             html: RwLock::new(None),
             rendered_panel: RwLock::new(None),
-            grants_rev: AtomicU64::new(0),
             worker: Mutex::new(None),
         }
     }
 
-    #[inline]
-    fn grants_rev(&self) -> u64 {
-        self.grants_rev.load(Ordering::Acquire)
+    fn valid_snapshot(
+        &self,
+        inputs: &SnapshotInputs,
+        lang: &str,
+        max_age: Duration,
+        now: f64,
+    ) -> Option<Arc<OverviewSnapshot>> {
+        let guard = self.cached.read().ok()?;
+        let cached = guard.as_ref()?;
+        (cached.built_at.elapsed() < max_age
+            && now < cached.snap.refresh_at
+            && cached.snap.lang == lang
+            && &cached.inputs == inputs)
+            .then(|| Arc::clone(&cached.snap))
     }
 
-    fn bump_grants_rev(&self) -> u64 {
-        let next = self.grants_rev.fetch_add(1, Ordering::AcqRel) + 1;
-        if let Ok(mut rp) = self.rendered_panel.write() {
-            *rp = None;
+    fn put_cached(&self, snap: Arc<OverviewSnapshot>, inputs: SnapshotInputs, built_at: Instant) {
+        if now_epoch_sec() >= snap.refresh_at {
+            return;
         }
-        next
-    }
-
-    fn get_cached(&self) -> Option<CachedDefaultSnap> {
-        self.cached.read().ok().and_then(|g| g.clone())
-    }
-
-    fn put_cached(&self, snap: OverviewSnapshot, grants_rev: u64, disk_sig: DiskActivitySig) {
-        if let Ok(mut g) = self.cached.write() {
-            *g = Some(CachedDefaultSnap {
-                snap,
-                built_at: Instant::now(),
-                grants_rev,
-                disk_sig,
-            });
+        if let Ok(mut guard) = self.cached.write() {
+            // A background pre-warm can finish after a synchronous build.
+            if guard
+                .as_ref()
+                .is_none_or(|cached| cached.built_at <= built_at)
+            {
+                *guard = Some(CachedDefaultSnap {
+                    snap,
+                    inputs,
+                    built_at,
+                });
+            }
         }
     }
 
@@ -307,26 +345,38 @@ fn attach_grant_and_rehash_inner(
         .or(daemon_ws.as_deref());
 
     if let Some(mut pending) = grants.get_pending_grant_scoped(scope_cid, eff_ws, None) {
+        if let Some(deadline) = pending.display_until() {
+            snap.refresh_at = snap.refresh_at.min(deadline);
+        }
         let cid = pending.conversation_id.clone();
+        let mut telemetry_ok = true;
         let mut valid = true;
         if !cid.is_empty() && !pending.claimed {
-            let (cur_turns, cur_ckpts) = engine.get_turn_and_checkpoint_counts(&cid);
-            if cur_ckpts > pending.created_checkpoints {
-                valid = false;
-            } else if pending.created_turns > 0
-                && cur_turns.saturating_sub(pending.created_turns) > 4
-            {
-                valid = false;
+            match engine.try_get_turn_and_checkpoint_counts(&cid) {
+                Ok((cur_turns, cur_ckpts)) => {
+                    valid = cur_ckpts <= pending.created_checkpoints
+                        && (pending.created_turns == 0
+                            || cur_turns.saturating_sub(pending.created_turns) <= 4);
+                }
+                Err(_) => {
+                    telemetry_ok = false;
+                }
             }
         }
         if valid {
             let live_subs = if !cid.is_empty() {
-                engine.get_running_subagent_count(&cid, None)
+                match engine.try_get_running_subagent_count(&cid, None) {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        telemetry_ok = false;
+                        None
+                    }
+                }
             } else {
-                0
+                Some(0)
             };
-            pending.running_subagent_count = Some(live_subs);
-            pending.allow_auto_handoff = Some(settings.allow_auto_handoff);
+            pending.running_subagent_count = live_subs;
+            pending.allow_auto_handoff = Some(settings.allow_auto_handoff && telemetry_ok);
             snap.pending_grant = Some(pending);
         }
     }
@@ -351,6 +401,9 @@ pub struct McpDaemon {
     plugin_data_dir: Option<PathBuf>,
     panel_html_override: Option<PathBuf>,
     swr: Arc<SwrHub>,
+    initialized: bool,
+    protocol_version: String,
+    client_supports_apps: bool,
 }
 
 impl Drop for McpDaemon {
@@ -391,12 +444,17 @@ impl McpDaemon {
             plugin_data_dir,
             panel_html_override,
             swr: Arc::new(SwrHub::new()),
+            initialized: false,
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            client_supports_apps: false,
         }
     }
 
     fn sync_panel_lang(&mut self) {
         let lang_pref = self.grants.get_settings().lang;
-        self.engine.rates.set_lang_override(parse_lang_tag(&lang_pref));
+        self.engine
+            .rates
+            .set_lang_override(parse_lang_tag(&lang_pref));
     }
 
     /// Run a one-shot background startup pre-warm so initial panel opens hit RAM immediately,
@@ -433,21 +491,16 @@ impl McpDaemon {
                     .unwrap_or_else(default_panel_html_path);
                 let html_loaded = hub.load_html(&panel_path).ok();
 
-                let disk_sig = quick_disk_activity_sig(&bg_engine.ledger.data_root);
-                let rev_before = hub.grants_rev();
+                let built_at = Instant::now();
+                let inputs = SnapshotInputs::capture(&mut bg_engine, &bg_grants);
                 let mut snap = bg_engine.build_overview_snapshot(25, false, false, "", None);
-                attach_grant_and_rehash_inner(&mut bg_engine, &mut bg_grants, &mut snap, None, None);
-                let rev_after = hub.grants_rev();
-                if rev_after != rev_before {
-                    attach_grant_and_rehash_inner(
-                        &mut bg_engine,
-                        &mut bg_grants,
-                        &mut snap,
-                        None,
-                        None,
-                    );
-                }
-                let final_rev = hub.grants_rev();
+                attach_grant_and_rehash_inner(
+                    &mut bg_engine,
+                    &mut bg_grants,
+                    &mut snap,
+                    None,
+                    None,
+                );
                 snap.stale = false;
 
                 if let Some((template, mtime_ns, size)) = html_loaded {
@@ -463,7 +516,7 @@ impl McpDaemon {
                         );
                     }
                 }
-                hub.put_cached(snap, final_rev, disk_sig);
+                hub.put_cached(Arc::new(snap), inputs, built_at);
 
                 bg_engine.close();
                 drop(bg_grants);
@@ -476,7 +529,7 @@ impl McpDaemon {
     }
 
     pub fn swr_is_warm(&self) -> bool {
-        self.swr.get_cached().is_some()
+        self.swr.cached.read().is_ok_and(|cache| cache.is_some())
     }
 
     pub fn backdate_swr_cache(&self, age: Duration) {
@@ -509,42 +562,6 @@ impl McpDaemon {
         );
     }
 
-    fn on_grants_mutated(&mut self) {
-        let new_rev = self.swr.bump_grants_rev();
-        if let Some(mut cached) = self.swr.get_cached() {
-            self.attach_grant_and_rehash(&mut cached.snap, None, None);
-            if let Ok(mut g) = self.swr.cached.write() {
-                cached.grants_rev = new_rev;
-                *g = Some(cached);
-            }
-        }
-    }
-
-    fn get_fresh_default_snapshot(&mut self) -> Option<OverviewSnapshot> {
-        let mut cached = self.swr.get_cached()?;
-        if cached.built_at.elapsed() >= SWR_STALE_TTL {
-            return None;
-        }
-        let cur_sig = quick_disk_activity_sig(&self.engine.ledger.data_root);
-        if cached.disk_sig != cur_sig {
-            return None;
-        }
-        let active_lang = self.engine.rates.get_lang().as_str();
-        if cached.snap.lang != active_lang {
-            return None;
-        }
-        let cur_rev = self.swr.grants_rev();
-        if cached.grants_rev != cur_rev {
-            self.attach_grant_and_rehash(&mut cached.snap, None, None);
-            if let Ok(mut g) = self.swr.cached.write() {
-                cached.grants_rev = cur_rev;
-                *g = Some(cached.clone());
-            }
-        }
-        cached.snap.stale = false;
-        Some(cached.snap)
-    }
-
     fn claim_with_live_check(
         &mut self,
         grant_id: &str,
@@ -552,6 +569,15 @@ impl McpDaemon {
         hint_ws: &str,
         claim_mode: &str,
     ) -> Value {
+        let is_auto = matches!(
+            claim_mode,
+            "auto_handoff" | "auto_compact" | "acp_auto_compact"
+        );
+        let is_manual = matches!(claim_mode, "manual" | "manual_handoff" | "manual_compact");
+        if !is_auto && !is_manual {
+            return claim_outcome_response(ClaimOutcome::denied("invalid_claim_mode"));
+        }
+
         let grant_rec = self.grants.find_grant(grant_id);
         let cid = if !hint_cid.is_empty() {
             hint_cid.to_string()
@@ -563,43 +589,43 @@ impl McpDaemon {
         };
 
         let daemon_ws = self.engine.effective_daemon_workspace();
-        let expected_ws = if !hint_ws.is_empty() {
-            Some(hint_ws)
-        } else {
-            daemon_ws.as_deref()
-        };
-        let expected_cid = if !hint_cid.is_empty() {
-            Some(hint_cid)
-        } else {
-            None
-        };
+        if let Some(dws) = daemon_ws.as_deref() {
+            if !hint_ws.is_empty() && !paths_overlap(dws, hint_ws) {
+                return claim_outcome_response(ClaimOutcome::denied("workspace_mismatch"));
+            }
+            if !hint_ws.is_empty() {
+                if let Some(ref g) = grant_rec {
+                    let has_grant_ws = !g.workspace.is_empty() || !g.workspaces.is_empty();
+                    if has_grant_ws && !workspaces_overlap(&g.workspace, &g.workspaces, hint_ws) {
+                        return claim_outcome_response(ClaimOutcome::denied("workspace_mismatch"));
+                    }
+                }
+            }
+        }
+        let expected_ws = daemon_ws
+            .as_deref()
+            .or_else(|| (!hint_ws.is_empty()).then_some(hint_ws));
+        let expected_cid = (!hint_cid.is_empty()).then_some(hint_cid);
 
         let (cur_turns, cur_ckpts) = if !cid.is_empty() {
-            let (t, c) = self.engine.get_turn_and_checkpoint_counts(&cid);
-            (Some(t), Some(c))
+            match self.engine.try_get_turn_and_checkpoint_counts(&cid) {
+                Ok((t, c)) => (Some(t), Some(c)),
+                Err(_) => {
+                    return claim_outcome_response(ClaimOutcome::denied("telemetry_read_error"));
+                }
+            }
         } else {
             (None, None)
         };
         let running_subs = if !cid.is_empty() {
-            self.engine.get_running_subagent_count(&cid, None)
+            match self.engine.try_get_running_subagent_count(&cid, None) {
+                Ok(n) => n,
+                Err(_) => {
+                    return claim_outcome_response(ClaimOutcome::denied("telemetry_read_error"));
+                }
+            }
         } else {
             0
-        };
-        let require_auto = matches!(
-            claim_mode,
-            "auto_handoff" | "auto_compact" | "acp_auto_compact"
-        );
-        let check_subs = if matches!(
-            claim_mode,
-            "auto_handoff"
-                | "manual_handoff"
-                | "auto_compact"
-                | "manual_compact"
-                | "acp_auto_compact"
-        ) {
-            Some(running_subs)
-        } else {
-            None
         };
         let outcome = self.grants.claim_grant_scoped(
             grant_id,
@@ -607,30 +633,10 @@ impl McpDaemon {
             expected_ws,
             cur_turns,
             cur_ckpts,
-            check_subs,
-            require_auto,
+            Some(running_subs),
+            is_auto,
         );
-        if outcome.claimed
-            || matches!(
-                outcome.reason.as_deref(),
-                Some("already_compacted" | "session_advanced")
-            )
-        {
-            self.on_grants_mutated();
-        }
-        let text = if outcome.claimed {
-            "ok".to_string()
-        } else {
-            outcome
-                .reason
-                .clone()
-                .unwrap_or_else(|| "denied".to_string())
-        };
-        json!({
-            "content": [{ "type": "text", "text": text }],
-            "structuredContent": outcome,
-            "isError": false
-        })
+        claim_outcome_response(outcome)
     }
 
     fn handle_ui_action(&mut self, act: &str, args: &Map<String, Value>) -> Value {
@@ -640,11 +646,12 @@ impl McpDaemon {
             "set_prefs" => {
                 let allow = args.get("allow_auto_handoff").and_then(Value::as_bool);
                 let lang_pref = args.get("lang").and_then(Value::as_str);
-                let updated = self.grants.update_settings_with_lang(allow, lang_pref);
+                let Ok(updated) = self.grants.update_settings_with_lang(allow, lang_pref) else {
+                    return grant_storage_error(zh);
+                };
                 self.engine
                     .rates
                     .set_lang_override(parse_lang_tag(&updated.lang));
-                self.on_grants_mutated();
                 let zh = self.engine.rates.get_lang().is_zh();
                 let msg = if zh {
                     format!(
@@ -668,9 +675,6 @@ impl McpDaemon {
                     &str_arg(args, "grant_id"),
                     &str_arg(args, "handoff_conversation_id"),
                 );
-                if res.ok {
-                    self.on_grants_mutated();
-                }
                 let txt = if res.ok {
                     "ok".to_string()
                 } else {
@@ -687,9 +691,6 @@ impl McpDaemon {
                     &str_arg(args, "grant_id"),
                     &str_arg_or(args, "status", "sent"),
                 );
-                if res.ok {
-                    self.on_grants_mutated();
-                }
                 let txt = if res.ok {
                     res.reason.clone().unwrap_or_else(|| "ok".to_string())
                 } else {
@@ -703,9 +704,6 @@ impl McpDaemon {
             }
             "dismiss_grant" => {
                 let res = self.grants.dismiss_grant(&str_arg(args, "grant_id"));
-                if res.ok {
-                    self.on_grants_mutated();
-                }
                 let txt = if res.ok {
                     "ok".to_string()
                 } else {
@@ -753,11 +751,15 @@ impl McpDaemon {
                     &mut self.engine.ledger.journal_cache,
                     lang,
                 );
-                let is_err = !res.found;
+                let is_err = !res.found || res.error.is_some();
                 let txt = if is_err {
-                    res.error
-                        .clone()
-                        .unwrap_or_else(|| if zh { "提炼失败".into() } else { "Distillation failed".into() })
+                    res.error.clone().unwrap_or_else(|| {
+                        if zh {
+                            "提炼失败".into()
+                        } else {
+                            "Distillation failed".into()
+                        }
+                    })
                 } else {
                     res.saved_note_path.clone().unwrap_or_default()
                 };
@@ -890,7 +892,9 @@ impl McpDaemon {
             });
         }
 
-        let settings = self.grants.get_settings();
+        let Ok(settings) = self.grants.try_get_settings() else {
+            return grant_storage_error(zh);
+        };
         let allow_auto = settings.allow_auto_handoff;
         if acp_strict_error && !allow_auto {
             let reason = if zh {
@@ -934,7 +938,7 @@ impl McpDaemon {
             .unwrap_or(0);
         let resume_task = str_arg(args, "resume_task");
 
-        let grant = self.grants.create_grant_scoped(
+        let Ok(grant) = self.grants.create_grant_scoped(
             &preserve,
             &resume_task,
             auto_fire,
@@ -947,8 +951,9 @@ impl McpDaemon {
             &scratch_path,
             &title,
             lang,
-        );
-        self.on_grants_mutated();
+        ) else {
+            return grant_storage_error(zh);
+        };
         let acp_proxy_active = grant.acp_proxy_active;
 
         let card = json!({
@@ -974,7 +979,11 @@ impl McpDaemon {
         });
 
         let guide = if zh {
-            let auto_line = if kind == "compact" && acp_proxy_active && allow_auto && grant.auto_fire {
+            let auto_line = if kind == "compact"
+                && acp_proxy_active
+                && allow_auto
+                && grant.auto_fire
+            {
                 "检测到官方 ACP 自动压缩代理（acp-proxy / acp-run）已挂载且 running_subagent_count == 0：请立即结束本轮回复（不要再调用额外工具），代理将在本轮结束后通过官方 ACP `session/prompt` 原地执行下方 `/compact` 指令并无缝续跑。"
             } else if allow_auto && grant.auto_fire {
                 "面板「自动接力」已开启且 running_subagent_count == 0：当本工具内联卡片或同工作区 Context Radar 侧边栏处于可见挂载状态时，前端会自动核销票据并触发官方接力/压缩流程；若当前在无界面的 agy CLI、折叠卡片或后台标签页中运行，请使用 `context-radar-mcp acp-proxy` / `acp-run`，或展开面板点击/复制下方 `/compact` 指令。"
@@ -986,7 +995,11 @@ impl McpDaemon {
                 grant.compact_command
             )
         } else {
-            let auto_line = if kind == "compact" && acp_proxy_active && allow_auto && grant.auto_fire {
+            let auto_line = if kind == "compact"
+                && acp_proxy_active
+                && allow_auto
+                && grant.auto_fire
+            {
                 "Official ACP auto-compact proxy (`acp-proxy` / `acp-run`) is active and running_subagent_count == 0: end this turn cleanly now (avoid further tool calls) so the proxy can execute native ACP `session/prompt` `/compact` in-place on the same session and resume automatically."
             } else if allow_auto && grant.auto_fire {
                 "Auto-handoff is enabled and running_subagent_count == 0: when the inline card or matching-workspace Context Radar side pane is mounted and visible, the webview will claim this single-use grant automatically; in headless `agy` CLI or ACP editors, run via `context-radar-mcp acp-proxy` / `acp-run`, or copy the `/compact` command below."
@@ -1005,30 +1018,127 @@ impl McpDaemon {
         })
     }
 
-    pub fn handle_request(&mut self, msg: &Value) -> Option<Value> {
-        let obj = msg.as_object()?;
-        let req_id = obj.get("id")?;
-        if req_id.is_null() {
-            return None;
+    fn available_tools(&self) -> Vec<Value> {
+        let mut tools = tools_spec().as_array().cloned().unwrap_or_default();
+        if !self.client_supports_apps {
+            let app_only = json!(["app"]);
+            tools.retain(|tool| tool["_meta"]["ui"]["visibility"] != app_only);
         }
-        let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
-        let params = obj
-            .get("params")
-            .and_then(Value::as_object)
-            .cloned()
-            .unwrap_or_default();
+        tools
+    }
+
+    fn is_tool_available(&self, name: &str) -> bool {
+        self.available_tools()
+            .iter()
+            .any(|tool| tool["name"].as_str() == Some(name))
+    }
+
+    pub fn handle_message(&mut self, msg: &Value) -> Option<Value> {
+        match msg {
+            Value::Object(_) => self.handle_request(msg),
+            Value::Array(items) => {
+                if self.initialized
+                    && !matches!(self.protocol_version.as_str(), "2025-03-26" | "2024-11-05")
+                {
+                    return Some(rpc_err(
+                        &Value::Null,
+                        -32600,
+                        "JSON-RPC batching is not supported for this protocol version",
+                    ));
+                }
+                if items.is_empty() {
+                    return Some(rpc_err(
+                        &Value::Null,
+                        -32600,
+                        "Invalid Request: empty batch",
+                    ));
+                }
+                let mut responses = Vec::new();
+                for item in items {
+                    if item.is_object() {
+                        if let Some(resp) = self.handle_request(item) {
+                            responses.push(resp);
+                        }
+                    } else {
+                        responses.push(rpc_err(&Value::Null, -32600, "Invalid Request"));
+                    }
+                }
+                if responses.is_empty() {
+                    None
+                } else {
+                    Some(Value::Array(responses))
+                }
+            }
+            _ => Some(rpc_err(&Value::Null, -32600, "Invalid Request")),
+        }
+    }
+
+    pub fn handle_request(&mut self, msg: &Value) -> Option<Value> {
+        let Some(obj) = msg.as_object() else {
+            return Some(rpc_err(&Value::Null, -32600, "Invalid Request"));
+        };
+        let req_id_opt = obj.get("id");
+        let err_id = req_id_opt
+            .filter(|id| id.is_string() || id.is_number())
+            .unwrap_or(&Value::Null);
+        if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Some(rpc_err(
+                err_id,
+                -32600,
+                "Invalid Request: jsonrpc must be '2.0'",
+            ));
+        }
+        let Some(method) = obj
+            .get("method")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+        else {
+            return Some(rpc_err(
+                err_id,
+                -32600,
+                "Invalid Request: method must be a non-empty string",
+            ));
+        };
+        let req_id = req_id_opt?;
+        if !(req_id.is_string() || req_id.is_number()) {
+            return Some(rpc_err(
+                &Value::Null,
+                -32600,
+                "Invalid Request: id must be a string or number",
+            ));
+        }
+        let params = match obj.get("params") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(map)) => map.clone(),
+            Some(_) => {
+                return Some(rpc_err(req_id, -32602, "Invalid params: expected object"));
+            }
+        };
 
         match method {
             "initialize" => {
-                let ver = params
-                    .get("protocolVersion")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(PROTOCOL_VERSION);
+                if !self.initialized {
+                    let ver = params
+                        .get("protocolVersion")
+                        .and_then(Value::as_str)
+                        .filter(|ver| SUPPORTED_PROTOCOL_VERSIONS.contains(ver))
+                        .unwrap_or(PROTOCOL_VERSION);
+                    self.protocol_version = ver.to_string();
+                    self.client_supports_apps = params
+                        .get("capabilities")
+                        .and_then(|caps| caps.get("extensions"))
+                        .and_then(|extensions| extensions.get(APPS_EXTENSION))
+                        .and_then(|extension| extension.get("mimeTypes"))
+                        .and_then(Value::as_array)
+                        .is_some_and(|types| {
+                            types.iter().any(|mime| mime.as_str() == Some(APP_MIME))
+                        });
+                    self.initialized = true;
+                }
                 Some(rpc_ok(
                     req_id,
                     json!({
-                        "protocolVersion": ver,
+                        "protocolVersion": self.protocol_version,
                         "capabilities": {
                             "tools": { "listChanged": false },
                             "resources": { "subscribe": false, "listChanged": false }
@@ -1038,7 +1148,7 @@ impl McpDaemon {
                 ))
             }
             "ping" => Some(rpc_ok(req_id, json!({}))),
-            "tools/list" => Some(rpc_ok(req_id, json!({ "tools": tools_spec() }))),
+            "tools/list" => Some(rpc_ok(req_id, json!({ "tools": self.available_tools() }))),
             "tools/call" => match self.call_tool(&params) {
                 Ok(res) => Some(rpc_ok(req_id, res)),
                 Err((code, message)) => Some(rpc_err(req_id, code, &message)),
@@ -1060,7 +1170,14 @@ impl McpDaemon {
 
     fn call_tool(&mut self, params: &Map<String, Value>) -> Result<Value, (i64, String)> {
         self.sync_panel_lang();
-        let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| (-32602, "name must be a non-empty string".to_string()))?;
+        if !self.is_tool_available(name) {
+            return Err((-32602, format!("Unknown tool: {name}")));
+        }
         let args_val = params
             .get("arguments")
             .cloned()
@@ -1100,83 +1217,62 @@ impl McpDaemon {
                             && ws_filter.is_empty()
                             && cid_scope.is_empty();
 
-                        if is_default_query && if_digest.is_empty() && !fresh {
-                            if let Some(mut snap) = self.get_fresh_default_snapshot() {
-                                snap.server_ms = t0.elapsed().as_millis() as u64;
-                                let text = summarize_snapshot_text(&snap);
-                                return Ok(json!({
-                                    "content": [{ "type": "text", "text": text }],
-                                    "structuredContent": snap,
-                                    "isError": false
-                                }));
-                            }
-                        }
-
-                        if is_default_query && !if_digest.is_empty() && !fresh {
-                            let cur_lang = self.engine.rates.get_lang().as_str();
-                            let cur_sig = quick_disk_activity_sig(&self.engine.ledger.data_root);
-                            if let Some(cached) = self.swr.get_cached() {
-                                if cached.grants_rev == self.swr.grants_rev()
-                                    && cached.snap.lang == cur_lang
-                                    && cached.disk_sig == cur_sig
-                                    && cached.snap.digest != if_digest
-                                    && cached.built_at.elapsed() < SWR_STALE_TTL
-                                {
-                                    let mut snap = cached.snap;
-                                    snap.stale = false;
-                                    snap.server_ms = t0.elapsed().as_millis() as u64;
-                                    let text = summarize_snapshot_text(&snap);
-                                    return Ok(json!({
-                                        "content": [{ "type": "text", "text": text }],
-                                        "structuredContent": snap,
-                                        "isError": false
-                                    }));
-                                }
-                            }
-                        }
-
-                        let mut snap = self.engine.build_overview_snapshot(
-                            limit,
-                            show_history,
-                            include_archived,
-                            &ws_filter,
-                            None,
-                        );
-                        let cid_opt = if cid_scope.is_empty() {
-                            None
+                        let inputs = is_default_query
+                            .then(|| SnapshotInputs::capture(&mut self.engine, &self.grants));
+                        let max_age = if if_digest.is_empty() {
+                            SWR_STALE_TTL
                         } else {
-                            Some(cid_scope.as_str())
+                            POLL_CACHE_MAX_AGE
                         };
-                        let ws_opt = if ws_filter.is_empty() {
-                            None
+                        let cached = inputs.as_ref().filter(|_| !fresh).and_then(|inputs| {
+                            self.swr.valid_snapshot(
+                                inputs,
+                                self.engine.rates.get_lang().as_str(),
+                                max_age,
+                                now_epoch_sec(),
+                            )
+                        });
+                        let snap = if let Some(snap) = cached {
+                            snap
                         } else {
-                            Some(ws_filter.as_str())
+                            let mut snap = self.engine.build_overview_snapshot(
+                                limit,
+                                show_history,
+                                include_archived,
+                                &ws_filter,
+                                None,
+                            );
+                            let cid_opt = (!cid_scope.is_empty()).then_some(cid_scope.as_str());
+                            let ws_opt = (!ws_filter.is_empty()).then_some(ws_filter.as_str());
+                            self.attach_grant_and_rehash(&mut snap, cid_opt, ws_opt);
+                            let snap = Arc::new(snap);
+                            if let Some(inputs) = inputs {
+                                self.swr.put_cached(Arc::clone(&snap), inputs, t0);
+                            }
+                            snap
                         };
-                        self.attach_grant_and_rehash(&mut snap, cid_opt, ws_opt);
 
-                        let disk_sig = quick_disk_activity_sig(&self.engine.ledger.data_root);
-                        if is_default_query {
-                            let rev = self.swr.grants_rev();
-                            self.swr.put_cached(snap.clone(), rev, disk_sig);
-                        }
-
-                        if !if_digest.is_empty() && if_digest == snap.digest {
+                        let server_ms = t0.elapsed().as_millis() as u64;
+                        if if_digest == snap.digest {
                             return Ok(json!({
                                 "content": [{ "type": "text", "text": "unchanged" }],
                                 "structuredContent": {
                                     "mode": "snapshot",
                                     "unchanged": true,
                                     "digest": snap.digest,
-                                    "server_ms": snap.server_ms
+                                    "server_ms": server_ms
                                 },
                                 "isError": false
                             }));
                         }
 
                         let text = summarize_snapshot_text(&snap);
+                        let mut structured = serde_json::to_value(snap.as_ref())
+                            .map_err(|err| (-32603, err.to_string()))?;
+                        structured["server_ms"] = json!(server_ms);
                         Ok(json!({
                             "content": [{ "type": "text", "text": text }],
-                            "structuredContent": snap,
+                            "structuredContent": structured,
                             "isError": false
                         }))
                     }
@@ -1218,7 +1314,7 @@ impl McpDaemon {
                     &mut self.engine.ledger.journal_cache,
                     lang,
                 );
-                if !res.found {
+                if !res.found || res.error.is_some() {
                     return Ok(json!({
                         "content": [{ "type": "text", "text": res.error.clone().unwrap_or_else(|| if zh { "提炼失败".into() } else { "Distillation failed".into() }) }],
                         "structuredContent": res,
@@ -1315,12 +1411,8 @@ impl McpDaemon {
                 let rem_turns = u64_arg(args, "estimated_remaining_turns", 12) as usize;
                 let noisy = u64_arg(args, "upcoming_noisy_tokens", 0);
                 let target = self.engine.resolve_session_fast(&cid_arg, None);
-                let plan = prepare_handoff_plan(
-                    target.as_ref(),
-                    rem_turns,
-                    noisy,
-                    &mut self.engine.rates,
-                );
+                let plan =
+                    prepare_handoff_plan(target.as_ref(), rem_turns, noisy, &mut self.engine.rates);
                 if !plan.found {
                     return Ok(json!({
                         "content": [{ "type": "text", "text": plan.reason.clone().unwrap_or_else(|| plan.headline.clone()) }],
@@ -1332,7 +1424,11 @@ impl McpDaemon {
                 let prof = plan.profile.as_ref().unwrap();
                 let rcp = plan.partial_compaction_recipes.as_ref().unwrap();
                 let sym = if plan.currency_symbol.is_empty() {
-                    if zh { "¥" } else { "$" }
+                    if zh {
+                        "¥"
+                    } else {
+                        "$"
+                    }
                 } else {
                     plan.currency_symbol.as_str()
                 };
@@ -1415,13 +1511,7 @@ impl McpDaemon {
                 let kind = str_arg_or(args, "kind", "handoff");
                 Ok(self.prepare_commit_handoff(args, &kind))
             }
-            _ => {
-                let zh = self.engine.rates.get_lang().is_zh();
-                Ok(json!({
-                    "content": [{ "type": "text", "text": if zh { format!("未知工具：{name}") } else { format!("Unknown tool: {name}") } }],
-                    "isError": true
-                }))
-            }
+            _ => Err((-32602, format!("Unknown tool: {name}"))),
         }
     }
 
@@ -1477,7 +1567,9 @@ impl McpDaemon {
         let mid_note = detail
             .mid_loop_breakdown
             .as_ref()
-            .filter(|m| m.slow_turn_self_expiry > 0 || m.replica_spillover > 0 || m.model_switch_cold > 0)
+            .filter(|m| {
+                m.slow_turn_self_expiry > 0 || m.replica_spillover > 0 || m.model_switch_cold > 0
+            })
             .map(|m| {
                 if zh {
                     format!(
@@ -1493,9 +1585,15 @@ impl McpDaemon {
             })
             .unwrap_or_default();
         let text = if zh {
-            format!("会话 {short} 最近 {} 轮明细{extra_note}{mid_note}", detail.turns.len())
+            format!(
+                "会话 {short} 最近 {} 轮明细{extra_note}{mid_note}",
+                detail.turns.len()
+            )
         } else {
-            format!("Last {} turn(s) for session {short}{extra_note}{mid_note}", detail.turns.len())
+            format!(
+                "Last {} turn(s) for session {short}{extra_note}{mid_note}",
+                detail.turns.len()
+            )
         };
         json!({
             "content": [{ "type": "text", "text": text }],
@@ -1507,8 +1605,11 @@ impl McpDaemon {
     fn read_resource(&mut self, params: &Map<String, Value>) -> Result<Value, (i64, String)> {
         self.sync_panel_lang();
         let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
+        if uri.is_empty() {
+            return Err((-32602, "uri must be a non-empty string".to_string()));
+        }
         if uri != PANEL_URI && uri != HANDOFF_URI {
-            return Err((-32602, format!("Unknown resource URI: {uri}")));
+            return Err((-32002, format!("Resource not found: {uri}")));
         }
 
         let panel_path = self.resolve_panel_path();
@@ -1516,17 +1617,18 @@ impl McpDaemon {
         let html = if uri == PANEL_URI {
             // Opening the panel ALWAYS computes a live synchronous incremental snapshot (<1 ms warm)
             // so initial SSR boot data never lags behind a just-completed LLM request.
-            let disk_sig = quick_disk_activity_sig(&self.engine.ledger.data_root);
-            let mut snap = self.engine.build_overview_snapshot(25, false, false, "", None);
+            let built_at = Instant::now();
+            let inputs = SnapshotInputs::capture(&mut self.engine, &self.grants);
+            let mut snap = self
+                .engine
+                .build_overview_snapshot(25, false, false, "", None);
             self.attach_grant_and_rehash(&mut snap, None, None);
             snap.stale = false;
-            let rev = self.swr.grants_rev();
-            self.swr.put_cached(snap.clone(), rev, disk_sig);
+            let snap = Arc::new(snap);
+            self.swr.put_cached(Arc::clone(&snap), inputs, built_at);
 
-            let (template, mtime_ns, size) = self
-                .swr
-                .load_html(&panel_path)
-                .map_err(|e| (-32603, e))?;
+            let (template, mtime_ns, size) =
+                self.swr.load_html(&panel_path).map_err(|e| (-32603, e))?;
 
             if let Some(cached_html) =
                 self.swr
@@ -1534,23 +1636,20 @@ impl McpDaemon {
             {
                 cached_html
             } else {
-                let boot_val = serde_json::to_value(&snap).unwrap_or(Value::Null);
+                let boot_val = serde_json::to_value(snap.as_ref()).unwrap_or(Value::Null);
                 let rendered = inject_boot_html(&template, &boot_val);
                 self.swr.put_rendered_panel(
                     panel_path,
                     mtime_ns,
                     size,
-                    snap.digest,
+                    snap.digest.clone(),
                     false,
                     rendered.clone(),
                 );
                 rendered
             }
         } else {
-            let (template, _, _) = self
-                .swr
-                .load_html(&panel_path)
-                .map_err(|e| (-32603, e))?;
+            let (template, _, _) = self.swr.load_html(&panel_path).map_err(|e| (-32603, e))?;
             let lang = self.engine.rates.get_lang().as_str();
             inject_boot_html(&template, &json!({ "view": "handoff", "lang": lang }))
         };
@@ -1564,6 +1663,35 @@ impl McpDaemon {
             }]
         }))
     }
+}
+
+fn claim_outcome_response(outcome: ClaimOutcome) -> Value {
+    let text = if outcome.claimed {
+        "ok".to_string()
+    } else {
+        outcome
+            .reason
+            .clone()
+            .unwrap_or_else(|| "denied".to_string())
+    };
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": outcome,
+        "isError": false
+    })
+}
+
+fn grant_storage_error(zh: bool) -> Value {
+    let text = if zh {
+        "授权存储写入失败，请重试。"
+    } else {
+        "Could not update grant storage. Retry the request."
+    };
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "structuredContent": { "reason": "storage_error" },
+        "isError": true
+    })
 }
 
 fn str_arg(args: &Map<String, Value>, key: &str) -> String {
@@ -1636,13 +1764,7 @@ pub fn run_stdio_daemon(
             continue;
         }
         let resp = match serde_json::from_str::<Value>(trimmed) {
-            Ok(msg) => {
-                if msg.is_object() {
-                    daemon.handle_request(&msg)
-                } else {
-                    None
-                }
-            }
+            Ok(msg) => daemon.handle_message(&msg),
             Err(e) => Some(rpc_err(&Value::Null, -32700, &format!("Parse error: {e}"))),
         };
         if let Some(reply) = resp {
@@ -1658,4 +1780,421 @@ pub fn run_stdio_daemon(
 
 pub fn panel_path_exists(p: &Path) -> bool {
     p.is_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::rates::RateTable;
+    use crate::settings::SettingsWatcher;
+
+    fn daemon(root: &Path) -> McpDaemon {
+        let engine = TelemetryEngine::new(
+            Some(root.to_path_buf()),
+            Some(RateTable::new(
+                SettingsWatcher::new(Some("none".into())),
+                None,
+                None,
+            )),
+            Some(None),
+        );
+        let grants = RelayGrantStore::new(root.join("plugin/relay_grants.json"));
+        McpDaemon::new(Some(engine), Some(grants), None)
+    }
+
+    fn initialize(server: &mut McpDaemon, version: &str, capabilities: Value) -> Value {
+        server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {
+                    "protocolVersion": version,
+                    "capabilities": capabilities
+                }
+            }))
+            .unwrap()
+    }
+
+    fn list_tools(server: &mut McpDaemon) -> Vec<Value> {
+        let response = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/list"
+            }))
+            .unwrap();
+        response["result"]["tools"].as_array().unwrap().clone()
+    }
+
+    #[test]
+    fn initialize_negotiates_supported_protocol_versions() {
+        let root = tempfile::tempdir().unwrap();
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            let mut server = daemon(root.path());
+            let response = initialize(&mut server, version, json!({}));
+            assert_eq!(response["result"]["protocolVersion"], *version);
+        }
+        for version in ["2099-01-01", "arbitrary-version", ""] {
+            let mut server = daemon(root.path());
+            let response = initialize(&mut server, version, json!({}));
+            assert_eq!(response["result"]["protocolVersion"], "2025-11-25");
+        }
+    }
+
+    #[test]
+    fn tools_list_hides_app_only_tools_for_plain_text_hosts() {
+        let root = tempfile::tempdir().unwrap();
+        for caps in [
+            json!({}),
+            json!({ "extensions": {
+            APPS_EXTENSION: { "mimeTypes": ["text/html"] }
+        } }),
+        ] {
+            let mut server = daemon(root.path());
+            initialize(&mut server, "2025-03-26", caps);
+            let tools = list_tools(&mut server);
+            let names: Vec<_> = tools
+                .iter()
+                .map(|tool| tool["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    "context_radar_overview",
+                    "context_radar_turns",
+                    "context_radar_hotspots",
+                    "context_radar_prepare_handoff",
+                    "context_radar_commit_handoff"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn ui_action_is_gated_on_apps_capability_and_frozen_after_first_initialize() {
+        let root = tempfile::tempdir().unwrap();
+
+        // 1. Plain session (no Apps capability): tools/call rejects context_radar_ui_action with -32602
+        let mut plain = daemon(root.path());
+        initialize(&mut plain, "2025-03-26", json!({}));
+        let denied = plain
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "allow_auto_handoff": false } }
+            }))
+            .unwrap();
+        assert_eq!(denied["error"]["code"], json!(-32602));
+        assert!(plain.grants.get_settings().allow_auto_handoff);
+
+        // 2. Repeated initialize CANNOT escalate client_supports_apps or alter protocol version
+        let second_init = initialize(
+            &mut plain,
+            "2025-11-25",
+            json!({ "extensions": { APPS_EXTENSION: { "mimeTypes": [APP_MIME] } } }),
+        );
+        assert_eq!(second_init["result"]["protocolVersion"], "2025-03-26");
+        assert_eq!(list_tools(&mut plain).len(), 5);
+        let still_denied = plain
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "allow_auto_handoff": false } }
+            }))
+            .unwrap();
+        assert_eq!(still_denied["error"]["code"], json!(-32602));
+
+        // 3. Legitimate SEP-1865 App host succeeds, and repeated initialize cannot downgrade it
+        let mut app = daemon(root.path());
+        initialize(
+            &mut app,
+            "2025-03-26",
+            json!({ "extensions": { APPS_EXTENSION: { "mimeTypes": [APP_MIME] } } }),
+        );
+        let allowed = app
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "allow_auto_handoff": false } }
+            }))
+            .unwrap();
+        assert_eq!(
+            allowed["result"]["structuredContent"]["settings"]["allow_auto_handoff"],
+            json!(false)
+        );
+        initialize(&mut app, "2025-06-18", json!({}));
+        assert_eq!(list_tools(&mut app).len(), 6);
+    }
+
+    #[test]
+    fn batch_requests_and_jsonrpc_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = daemon(root.path());
+        initialize(&mut server, "2025-03-26", json!({}));
+
+        // Empty batch returns -32600
+        let empty = server.handle_message(&json!([])).unwrap();
+        assert_eq!(empty["error"]["code"], json!(-32600));
+
+        // Notification-only batch omits response
+        let notif_only = server.handle_message(&json!([
+            { "jsonrpc": "2.0", "method": "notifications/initialized" }
+        ]));
+        assert!(notif_only.is_none());
+
+        // Mixed batch returns responses only for requests
+        let batch = server
+            .handle_message(&json!([
+                { "jsonrpc": "2.0", "id": 10, "method": "ping" },
+                { "jsonrpc": "2.0", "method": "notifications/initialized" },
+                { "jsonrpc": "2.0", "id": 11, "method": "ping" }
+            ]))
+            .unwrap();
+        let arr = batch.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], json!(10));
+        assert_eq!(arr[1]["id"], json!(11));
+
+        // Unknown tool -> -32602; unknown resource -> -32002; invalid params -> -32602
+        let unk_tool = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                "params": { "name": "no_such_tool", "arguments": {} }
+            }))
+            .unwrap();
+        assert_eq!(unk_tool["error"]["code"], json!(-32602));
+        let unk_res = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 13, "method": "resources/read",
+                "params": { "uri": "ui://context-radar-mcp/missing" }
+            }))
+            .unwrap();
+        assert_eq!(unk_res["error"]["code"], json!(-32002));
+        let bad_params = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 14, "method": "ping", "params": "invalid"
+            }))
+            .unwrap();
+        assert_eq!(bad_params["error"]["code"], json!(-32602));
+
+        // Newer protocol version (2025-11-25) rejects batch arrays with -32600
+        let mut newer = daemon(root.path());
+        initialize(&mut newer, "2025-11-25", json!({}));
+        let rejected = newer
+            .handle_message(&json!([{ "jsonrpc": "2.0", "id": 1, "method": "ping" }]))
+            .unwrap();
+        assert_eq!(rejected["error"]["code"], json!(-32600));
+    }
+
+    #[test]
+    fn claim_enforces_daemon_workspace_auto_fire_and_claim_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = daemon(root.path());
+        server
+            .engine
+            .set_preferred_workspace(Some("/workspace/bound-a".into()), true);
+        initialize(
+            &mut server,
+            "2025-03-26",
+            json!({ "extensions": { APPS_EXTENSION: { "mimeTypes": [APP_MIME] } } }),
+        );
+
+        let grant_b = server
+            .grants
+            .create_grant_scoped(
+                "Keep B",
+                "Resume B",
+                true,
+                "",
+                "/workspace/other-b",
+                &["/workspace/other-b".into()],
+                0,
+                0,
+                "handoff",
+                "",
+                "Other B",
+                crate::i18n::Lang::En,
+            )
+            .unwrap();
+
+        // Caller cannot override daemon_workspace with hint workspace="/workspace/other-b"
+        let cross_ws = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                "params": {
+                    "name": "context_radar_ui_action",
+                    "arguments": {
+                        "action": "claim_grant",
+                        "grant_id": grant_b.grant_id,
+                        "workspace": "/workspace/other-b",
+                        "claim_mode": "manual_handoff"
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            cross_ws["result"]["structuredContent"]["claimed"],
+            json!(false)
+        );
+        assert_eq!(
+            cross_ws["result"]["structuredContent"]["reason"],
+            json!("workspace_mismatch")
+        );
+
+        // Unknown claim_mode is rejected
+        let grant_a = server
+            .grants
+            .create_grant_scoped(
+                "Keep A",
+                "Resume A",
+                false,
+                "",
+                "/workspace/bound-a",
+                &["/workspace/bound-a".into()],
+                0,
+                0,
+                "handoff",
+                "",
+                "Bound A",
+                crate::i18n::Lang::En,
+            )
+            .unwrap();
+        let bad_mode = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                "params": {
+                    "name": "context_radar_ui_action",
+                    "arguments": {
+                        "action": "claim_grant",
+                        "grant_id": grant_a.grant_id,
+                        "claim_mode": "bypass_checks"
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            bad_mode["result"]["structuredContent"]["reason"],
+            json!("invalid_claim_mode")
+        );
+
+        // Auto claim rejects auto_fire=false grant even when global allow_auto_handoff=true
+        let auto_denied = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                "params": {
+                    "name": "context_radar_ui_action",
+                    "arguments": {
+                        "action": "claim_grant",
+                        "grant_id": grant_a.grant_id,
+                        "claim_mode": "auto_handoff"
+                    }
+                }
+            }))
+            .unwrap();
+        assert_eq!(
+            auto_denied["result"]["structuredContent"]["reason"],
+            json!("auto_fire_disabled")
+        );
+    }
+
+    #[test]
+    fn tools_list_includes_app_only_tools_for_sep_1865_hosts() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = daemon(root.path());
+        initialize(
+            &mut server,
+            "2025-03-26",
+            json!({
+                "extensions": { APPS_EXTENSION: { "mimeTypes": [APP_MIME] } }
+            }),
+        );
+        let tools = list_tools(&mut server);
+        let app_tools: Vec<_> = tools
+            .iter()
+            .filter(|tool| tool["_meta"]["ui"]["visibility"] == json!(["app"]))
+            .collect();
+        assert_eq!(tools.len(), 6);
+        assert_eq!(app_tools.len(), 1);
+        assert_eq!(app_tools[0]["name"], "context_radar_ui_action");
+    }
+
+    #[test]
+    fn cached_overview_expires_when_pending_grant_expires() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = daemon(root.path());
+        let grant = server
+            .grants
+            .create_grant("Keep state", "Resume", true, "", 0, 0, "handoff", "", "")
+            .unwrap();
+        let built = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": { "name": "context_radar_overview", "arguments": {} }
+            }))
+            .unwrap();
+        let snapshot = &built["result"]["structuredContent"];
+        assert_eq!(snapshot["pending_grant"]["grant_id"], grant.grant_id);
+
+        let inputs = SnapshotInputs::capture(&mut server.engine, &server.grants);
+        let lang = snapshot["lang"].as_str().unwrap();
+        let deadline = grant.created_at + grant.ttl_sec;
+        assert!(server
+            .swr
+            .valid_snapshot(&inputs, lang, POLL_CACHE_MAX_AGE, deadline - 1.0)
+            .is_some());
+        assert!(server
+            .swr
+            .valid_snapshot(&inputs, lang, POLL_CACHE_MAX_AGE, deadline)
+            .is_none());
+    }
+
+    #[test]
+    fn unchanged_poll_reuses_valid_snapshot_and_rebuilds_after_invalidation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = daemon(root.path());
+        let overview = |server: &mut McpDaemon, args: Value| {
+            server
+                .handle_request(&json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "context_radar_overview", "arguments": args }
+                }))
+                .unwrap()["result"]["structuredContent"]
+                .clone()
+        };
+
+        let initial = overview(&mut server, json!({}));
+        let digest = initial["digest"].as_str().unwrap();
+        assert_eq!(server.engine.overview_build_count, 1);
+
+        let changed_for_client = overview(&mut server, json!({"if_digest": "older"}));
+        assert_eq!(changed_for_client["digest"], digest);
+        assert_eq!(changed_for_client["unchanged"], false);
+        server.backdate_swr_cache(Duration::from_secs(2));
+        for _ in 0..3 {
+            let poll = overview(&mut server, json!({"if_digest": digest}));
+            assert_eq!(poll["unchanged"], true);
+            assert_eq!(poll["digest"], digest);
+            assert!(poll.get("sessions").is_none());
+        }
+        assert_eq!(server.engine.overview_build_count, 1);
+
+        fs::create_dir(&server.engine.ledger.conv_dir).unwrap();
+        overview(&mut server, json!({"if_digest": digest}));
+        assert_eq!(server.engine.overview_build_count, 2);
+
+        // A separate process can update the grant store without a local mutation.
+        let mut other_store = RelayGrantStore::new(server.grants.path.clone());
+        other_store.update_settings(Some(false)).unwrap();
+        let after_grant_change = overview(&mut server, json!({"if_digest": digest}));
+        assert_eq!(after_grant_change["settings"]["allow_auto_handoff"], false);
+        assert_eq!(server.engine.overview_build_count, 3);
+
+        let next_digest = after_grant_change["digest"].as_str().unwrap();
+        server.backdate_swr_cache(POLL_CACHE_MAX_AGE);
+        assert_eq!(
+            overview(&mut server, json!({"if_digest": next_digest}))["unchanged"],
+            true
+        );
+        assert_eq!(server.engine.overview_build_count, 4);
+
+        overview(
+            &mut server,
+            json!({"if_digest": next_digest, "fresh": true}),
+        );
+        assert_eq!(server.engine.overview_build_count, 5);
+    }
 }

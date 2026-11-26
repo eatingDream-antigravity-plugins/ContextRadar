@@ -50,14 +50,13 @@ pub fn parse_lang_tag(raw: &str) -> Option<Lang> {
         return None;
     }
     let low = trimmed.to_ascii_lowercase();
-    if matches!(low.as_str(), "auto" | "default" | "system" | "utf-8" | "utf8") {
+    if matches!(
+        low.as_str(),
+        "auto" | "default" | "system" | "utf-8" | "utf8"
+    ) {
         return None;
     }
-    let base = low
-        .split(['.', '@'])
-        .next()
-        .unwrap_or(low.as_str())
-        .trim();
+    let base = low.split(['.', '@']).next().unwrap_or(low.as_str()).trim();
     if base.is_empty() {
         return None;
     }
@@ -143,11 +142,9 @@ pub fn resolve_active_lang(settings_lang: &str) -> Lang {
     let lc_all = env::var("LC_ALL").ok();
     let lc_msg = env::var("LC_MESSAGES").ok();
     let lang_var = env::var("LANG").ok();
-    for v in [&lc_all, &lc_msg, &lang_var] {
-        if let Some(ref s) = v {
-            if let Some(l) = parse_lang_tag(s) {
-                return l;
-            }
+    for locale in [&lc_all, &lc_msg, &lang_var].into_iter().flatten() {
+        if let Some(lang) = parse_lang_tag(locale) {
+            return lang;
         }
     }
     let apple = detect_macos_apple_language();

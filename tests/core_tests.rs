@@ -9,8 +9,8 @@ use serde_json::json;
 use tempfile::TempDir;
 
 use context_radar_mcp::engine::budget::{
-    builtin_tiers, compute_economics, evaluate_handoff_gate, is_gemini_4_carbon,
-    is_gemini_4_model, model_cache_ttl_sec, prepare_handoff_plan, resolve_budget_tier,
+    builtin_tiers, compute_economics, evaluate_handoff_gate, is_gemini_4_carbon, is_gemini_4_model,
+    model_cache_ttl_sec, prepare_handoff_plan, resolve_budget_tier,
 };
 use context_radar_mcp::engine::grants::{build_handoff_prompt, RelayGrantStore};
 use context_radar_mcp::engine::pruner::{analyze_hotspots_with_lang, distill_slice};
@@ -26,7 +26,9 @@ use context_radar_mcp::ledger::TurnSample;
 use context_radar_mcp::rpc::protocol::McpDaemon;
 use context_radar_mcp::rpc::tools::{summarize_snapshot_text, HANDOFF_URI, PANEL_URI};
 use context_radar_mcp::settings::{SettingsWatcher, DEFAULT_CONTEXT_LIMIT, DEFAULT_FX_RATE};
-use context_radar_mcp::wire::pb_cursor::{decode_step_metadata, decode_timestamp, extract_gen_model};
+use context_radar_mcp::wire::pb_cursor::{
+    decode_step_metadata, decode_timestamp, extract_gen_model,
+};
 
 fn encode_varint(mut val: u64) -> Vec<u8> {
     let mut out = Vec::new();
@@ -43,7 +45,7 @@ fn encode_varint(mut val: u64) -> Vec<u8> {
 }
 
 fn pb_varint(field: u32, val: u64) -> Vec<u8> {
-    let mut out = encode_varint(((field as u64) << 3) | 0);
+    let mut out = encode_varint((field as u64) << 3);
     out.extend_from_slice(&encode_varint(val));
     out
 }
@@ -182,11 +184,17 @@ fn test_builtin_defaults_and_external_user_config_live_reload() {
         assert_eq!(DEFAULT_CONTEXT_LIMIT, 512_000);
 
         let p = rates.resolve_rate("gemini-3-pro", "Gemini 3 Pro (High)");
-        assert_eq!((p.input_per_m, p.cache_read_per_m, p.output_per_m), (2.0, 0.20, 12.0));
+        assert_eq!(
+            (p.input_per_m, p.cache_read_per_m, p.output_per_m),
+            (2.0, 0.20, 12.0)
+        );
         assert_eq!(p.context_limit, 512_000);
 
         let cl = rates.resolve_rate("claude-sonnet-4", "Claude Sonnet 4");
-        assert_eq!((cl.input_per_m, cl.cache_read_per_m, cl.output_per_m), (3.0, 0.30, 15.0));
+        assert_eq!(
+            (cl.input_per_m, cl.cache_read_per_m, cl.output_per_m),
+            (3.0, 0.30, 15.0)
+        );
 
         let (fx, src) = rates.get_fx_rate();
         assert!((fx - DEFAULT_FX_RATE).abs() < 1e-4);
@@ -195,7 +203,11 @@ fn test_builtin_defaults_and_external_user_config_live_reload() {
 
     let td = TempDir::new().unwrap();
     let ext_fx = td.path().join("fx.json");
-    fs::write(&ext_fx, serde_json::to_string(&json!({"rate": 6.85})).unwrap()).unwrap();
+    fs::write(
+        &ext_fx,
+        serde_json::to_string(&json!({"rate": 6.85})).unwrap(),
+    )
+    .unwrap();
 
     let ext_models = td.path().join("ext_models.json");
     fs::write(
@@ -264,13 +276,26 @@ fn test_builtin_defaults_and_external_user_config_live_reload() {
 
     // Override hits BEFORE lazy external catalog load
     let p_alpha = rates.resolve_rate("custom-alpha-high", "Custom Alpha (High)");
-    assert_eq!((p_alpha.input_per_m, p_alpha.cache_read_per_m, p_alpha.output_per_m), (4.0, 0.20, 20.0));
+    assert_eq!(
+        (
+            p_alpha.input_per_m,
+            p_alpha.cache_read_per_m,
+            p_alpha.output_per_m
+        ),
+        (4.0, 0.20, 20.0)
+    );
     assert!(!rates.external_models_loaded());
-    assert_eq!(rates.short_model_label("Custom Alpha (High)", "custom-alpha-high"), "Alpha");
+    assert_eq!(
+        rates.short_model_label("Custom Alpha (High)", "custom-alpha-high"),
+        "Alpha"
+    );
 
     // Miss triggers lazy external catalog load
     let p_ext = rates.resolve_rate("fallback-catalog-model", "");
-    assert_eq!((p_ext.input_per_m, p_ext.output_per_m, p_ext.context_limit), (1.2, 6.0, 400_000));
+    assert_eq!(
+        (p_ext.input_per_m, p_ext.output_per_m, p_ext.context_limit),
+        (1.2, 6.0, 400_000)
+    );
     assert!(rates.external_models_loaded());
 
     // Custom budget tier matches
@@ -358,9 +383,18 @@ fn test_generic_tiers_and_hard_gates() {
     assert!(tiers.contains_key("fast"));
 
     let cfg = rates.current_settings();
-    assert_eq!(resolve_budget_tier("gemini-3-pro", "Gemini 3 Pro (XHigh)", &cfg).min_ctx, 250_000);
-    assert_eq!(resolve_budget_tier("gemini-3-pro", "Gemini 3 Pro (High)", &cfg).min_ctx, 270_000);
-    assert_eq!(resolve_budget_tier("gemini-3-flash", "Gemini 3 Flash", &cfg).min_ctx, 330_000);
+    assert_eq!(
+        resolve_budget_tier("gemini-3-pro", "Gemini 3 Pro (XHigh)", &cfg).min_ctx,
+        250_000
+    );
+    assert_eq!(
+        resolve_budget_tier("gemini-3-pro", "Gemini 3 Pro (High)", &cfg).min_ctx,
+        270_000
+    );
+    assert_eq!(
+        resolve_budget_tier("gemini-3-flash", "Gemini 3 Flash", &cfg).min_ctx,
+        330_000
+    );
 
     let mut base = build_session_telemetry(
         "10000000-0000-0000-0000-000000000099",
@@ -393,7 +427,10 @@ fn test_generic_tiers_and_hard_gates() {
         .reasons
         .iter()
         .any(|r| r.contains("切棒") || r.contains("baton")));
-    assert_eq!(prepare_handoff_plan(Some(&sub), 12, 0, &mut rates).action, "subagent_handoff");
+    assert_eq!(
+        prepare_handoff_plan(Some(&sub), 12, 0, &mut rates).action,
+        "subagent_handoff"
+    );
 
     // 3) Block when running_subagent_count > 0 (even at urgent context!)
     let mut busy = base.clone();
@@ -401,7 +438,10 @@ fn test_generic_tiers_and_hard_gates() {
     busy.running_subagent_count = 2;
     let busy_gate = evaluate_handoff_gate(Some(&busy), 20, &mut rates);
     assert!(!busy_gate.allowed);
-    assert!(busy_gate.reasons.iter().any(|r| r.contains("running_subagent_count == 0")));
+    assert!(busy_gate
+        .reasons
+        .iter()
+        .any(|r| r.contains("running_subagent_count == 0")));
 
     // 4) Allow healthy high-context main with 0 running subagents
     let mut ok = base.clone();
@@ -423,15 +463,32 @@ fn test_incremental_sqlite_and_disk_cache_match_full_parse_exactly() {
 
     let initial_steps = vec![
         (0, 14, None),
-        (1, 15, Some(make_step_meta(base_ts, 40_000, 0, 500, "r1", 0, 0))),
-        (2, 132, Some(make_step_meta(base_ts + 5, 1, 1, 1, "ignored-tool", 0, 0))),
+        (
+            1,
+            15,
+            Some(make_step_meta(base_ts, 40_000, 0, 500, "r1", 0, 0)),
+        ),
+        (
+            2,
+            132,
+            Some(make_step_meta(base_ts + 5, 1, 1, 1, "ignored-tool", 0, 0)),
+        ),
         (3, 15, None), // In-flight step with NULL metadata
     ];
-    create_conv_db(&db_path, &initial_steps, "gemini-3-pro", "Gemini 3 Pro (High)");
+    create_conv_db(
+        &db_path,
+        &initial_steps,
+        "gemini-3-pro",
+        "Gemini 3 Pro (High)",
+    );
 
     let mut eng = TelemetryEngine::new(
         Some(td.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(Some(cache_path.clone())),
     );
     let t1 = eng.ledger.read_turns(cid, None);
@@ -444,7 +501,11 @@ fn test_incremental_sqlite_and_disk_cache_match_full_parse_exactly() {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             "INSERT INTO gen_metadata (idx, data) VALUES (1, ?1)",
-            params![make_gen_blob("gemini-3-flash", "Gemini 3 Flash (High)", 4096)],
+            params![make_gen_blob(
+                "gemini-3-flash",
+                "Gemini 3 Flash (High)",
+                4096
+            )],
         )
         .unwrap();
         conn.execute(
@@ -454,11 +515,22 @@ fn test_incremental_sqlite_and_disk_cache_match_full_parse_exactly() {
         .unwrap();
         conn.execute(
             "INSERT INTO steps (idx, step_type, metadata) VALUES (4, 23, ?1)",
-            params![make_step_meta(base_ts + 30, 2_000, 46_000, 3_000, "r3", 0, 0)],
+            params![make_step_meta(
+                base_ts + 30,
+                2_000,
+                46_000,
+                3_000,
+                "r3",
+                0,
+                0
+            )],
         )
         .unwrap();
-        conn.execute("INSERT INTO steps (idx, step_type, metadata) VALUES (5, 14, NULL)", [])
-            .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (5, 14, NULL)",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO steps (idx, step_type, metadata) VALUES (6, 15, ?1)",
             params![make_step_meta(base_ts + 60, 25_000, 0, 600, "r4", 1, 0)],
@@ -469,7 +541,11 @@ fn test_incremental_sqlite_and_disk_cache_match_full_parse_exactly() {
     let t_inc = eng.ledger.read_turns(cid, None);
     let mut eng_full = TelemetryEngine::new(
         Some(td.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     let t_full = eng_full.ledger.read_turns(cid, None);
@@ -481,7 +557,11 @@ fn test_incremental_sqlite_and_disk_cache_match_full_parse_exactly() {
     // Cold restart loading from persistent disk index cache
     let mut eng_cold = TelemetryEngine::new(
         Some(td.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(Some(cache_path)),
     );
     let t_disk = eng_cold.ledger.read_turns(cid, None);
@@ -499,7 +579,11 @@ fn test_read_only_host_db_safety_and_live_wal_visibility() {
         &db_path,
         &[
             (0, 14, None),
-            (1, 15, Some(make_step_meta(base_ts, 30_000, 0, 400, "w1", 0, 0))),
+            (
+                1,
+                15,
+                Some(make_step_meta(base_ts, 30_000, 0, 400, "w1", 0, 0)),
+            ),
         ],
         "gemini-3-pro",
         "Gemini 3 Pro (High)",
@@ -507,11 +591,17 @@ fn test_read_only_host_db_safety_and_live_wal_visibility() {
 
     // Switch host DB into WAL mode and hold an active writer that appends to -wal without checkpoint
     let writer = Connection::open(&db_path).unwrap();
-    writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
 
     let mut eng = TelemetryEngine::new(
         Some(td.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     assert_eq!(eng.ledger.read_turns(cid, None).len(), 1);
@@ -519,7 +609,12 @@ fn test_read_only_host_db_safety_and_live_wal_visibility() {
     // Verify open_host_readonly refuses any mutation
     let ro = open_host_readonly(&db_path).unwrap();
     assert!(ro.execute("CREATE TABLE forbidden (x INT)", []).is_err());
-    assert!(ro.execute("INSERT INTO steps (idx, step_type, metadata) VALUES (99, 15, NULL)", []).is_err());
+    assert!(ro
+        .execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (99, 15, NULL)",
+            []
+        )
+        .is_err());
     drop(ro);
 
     // Commit live step into -wal file
@@ -539,37 +634,172 @@ fn test_read_only_host_db_safety_and_live_wal_visibility() {
     let turns = eng.ledger.read_turns(cid, None);
     assert_eq!(turns.len(), 2);
     assert_eq!(turns[1].cache_read, 32_000);
-    assert_eq!(fs::read(&db_path).unwrap(), before_db_bytes, "Host .db must remain unmodified");
+    assert_eq!(
+        fs::read(&db_path).unwrap(),
+        before_db_bytes,
+        "Host .db must remain unmodified"
+    );
+}
+
+#[test]
+fn test_sqlite_row_read_error_preserves_incremental_cursor_and_caches() {
+    use context_radar_mcp::ledger::index_db::IndexDbCache;
+    use context_radar_mcp::ledger::sqlite_ro::{stat_db_stamp, LedgerReader};
+
+    let td = TempDir::new().unwrap();
+    let root = td.path().join("host");
+    let cid = "31000000-0000-0000-0000-000000000032";
+    let index_path = td.path().join("plugin").join("ledger.db");
+    let mut ledger = LedgerReader::new(root.clone(), Some(index_path.clone()));
+    fs::create_dir_all(&ledger.conv_dir).unwrap();
+    let db_path = ledger.db_path(cid);
+    let writer = Connection::open(&db_path).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+         CREATE TABLE raw_steps (idx INTEGER PRIMARY KEY, metadata BLOB, bad INTEGER);
+         CREATE VIEW steps AS SELECT idx, 15 AS step_type,
+             CASE WHEN bad = 1 THEN json_extract('malformed', '$') ELSE metadata END AS metadata
+             FROM raw_steps;",
+        )
+        .unwrap();
+
+    let append = |idx: i64, bad: i32| {
+        writer
+            .execute(
+                "INSERT INTO raw_steps VALUES (?1, ?2, ?3)",
+                params![
+                    idx,
+                    make_step_meta(
+                        1_790_100_000 + idx as u64,
+                        30_000,
+                        0,
+                        400,
+                        &format!("step-{idx}"),
+                        0,
+                        0
+                    ),
+                    bad
+                ],
+            )
+            .unwrap();
+    };
+    append(1, 0);
+    let (before, _) = ledger.try_read_turns_and_probe(cid, None).unwrap();
+    let initial_stamp = stat_db_stamp(&db_path).unwrap();
+    assert_eq!(
+        before.iter().map(|turn| turn.step_idx).collect::<Vec<_>>(),
+        [1]
+    );
+
+    append(2, 0);
+    append(3, 1);
+    append(20, 0);
+    let failed_stamp = stat_db_stamp(&db_path).unwrap();
+    assert_ne!(initial_stamp.sig, failed_stamp.sig);
+
+    // SQLite emits the new row at idx=2 before failing when it evaluates idx=3.
+    let ro = open_host_readonly(&db_path).unwrap();
+    let mut stmt = ro
+        .prepare("SELECT idx, metadata FROM steps ORDER BY idx")
+        .unwrap();
+    let mut rows = stmt.query([]).unwrap();
+    assert_eq!(rows.next().unwrap().unwrap().get::<_, i64>(0).unwrap(), 1);
+    assert_eq!(rows.next().unwrap().unwrap().get::<_, i64>(0).unwrap(), 2);
+    assert!(rows.next().is_err());
+    drop(rows);
+    drop(stmt);
+    drop(ro);
+
+    let err = ledger
+        .try_read_turns_and_probe(cid, Some(&failed_stamp))
+        .unwrap_err();
+    assert!(err.to_string().contains("malformed JSON"), "{err}");
+    assert!(std::sync::Arc::ptr_eq(
+        &before,
+        &ledger.read_turns(cid, None)
+    ));
+    assert!(LedgerReader::new(root, None)
+        .try_read_turns_and_probe(cid, None)
+        .is_err());
+
+    let mut index = IndexDbCache::new(index_path);
+    let persisted = index
+        .load(cid, initial_stamp.dev, initial_stamp.ino)
+        .unwrap();
+    assert_eq!(persisted.max_step_idx, 1);
+    assert_eq!(persisted.sig, initial_stamp.sig);
+    assert_eq!(persisted.turns.as_ref(), before.as_ref());
+
+    writer
+        .execute("UPDATE raw_steps SET bad = 0 WHERE idx = 3", [])
+        .unwrap();
+    let (recovered, _) = ledger.try_read_turns_and_probe(cid, None).unwrap();
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|turn| turn.step_idx)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 20]
+    );
+    assert_eq!(
+        index
+            .load(cid, initial_stamp.dev, initial_stamp.ino)
+            .unwrap()
+            .max_step_idx,
+        20
+    );
 }
 
 #[test]
 fn test_journal_tail_backward_checkpoint_seek_and_incremental_append() {
     let td = TempDir::new().unwrap();
     let cid = "40000000-0000-0000-0000-000000000004";
-    let tdir = td.path().join("brain").join(cid).join(".system_generated").join("logs");
+    let tdir = td
+        .path()
+        .join("brain")
+        .join(cid)
+        .join(".system_generated")
+        .join("logs");
     fs::create_dir_all(&tdir).unwrap();
     let tpath = tdir.join("transcript.jsonl");
 
     // Write > 300 KiB pre-checkpoint noise (exceeding 256 KiB backward chunk!) + CHECKPOINT + post steps
     let mut content = String::new();
     for i in 1..=65 {
-        content.push_str(&serde_json::to_string(&json!({
-            "step_index": i,
-            "type": "PLANNER_RESPONSE",
-            "content": format!("old step {i} {}", "A".repeat(5000))
-        })).unwrap());
+        content.push_str(
+            &serde_json::to_string(&json!({
+                "step_index": i,
+                "type": "PLANNER_RESPONSE",
+                "content": format!("old step {i} {}", "A".repeat(5000))
+            }))
+            .unwrap(),
+        );
         content.push('\n');
     }
-    content.push_str(&serde_json::to_string(&json!({"step_index": 66, "type": "CHECKPOINT", "content": "summary"})).unwrap());
+    content.push_str(
+        &serde_json::to_string(
+            &json!({"step_index": 66, "type": "CHECKPOINT", "content": "summary"}),
+        )
+        .unwrap(),
+    );
     content.push('\n');
-    content.push_str(&serde_json::to_string(&json!({"step_index": 67, "type": "USER_INPUT", "content": "continue task"})).unwrap());
+    content.push_str(
+        &serde_json::to_string(
+            &json!({"step_index": 67, "type": "USER_INPUT", "content": "continue task"}),
+        )
+        .unwrap(),
+    );
     content.push('\n');
-    content.push_str(&serde_json::to_string(&json!({
-        "step_index": 68,
-        "type": "PLANNER_RESPONSE",
-        "content": "checked module A",
-        "tool_calls": [{ "name": "read_file", "args": { "Path": "/repo/app.rs" } }]
-    })).unwrap());
+    content.push_str(
+        &serde_json::to_string(&json!({
+            "step_index": 68,
+            "type": "PLANNER_RESPONSE",
+            "content": "checked module A",
+            "tool_calls": [{ "name": "read_file", "args": { "Path": "/repo/app.rs" } }]
+        }))
+        .unwrap(),
+    );
     content.push('\n');
     fs::write(&tpath, &content).unwrap();
 
@@ -580,12 +810,15 @@ fn test_journal_tail_backward_checkpoint_seek_and_incremental_append() {
 
     // Append step 69 -> incremental tail read adds only step 69
     thread::sleep(Duration::from_millis(20));
-    content.push_str(&serde_json::to_string(&json!({
-        "step_index": 69,
-        "type": "PLANNER_RESPONSE",
-        "status": "ERROR",
-        "content": "sample error msg"
-    })).unwrap());
+    content.push_str(
+        &serde_json::to_string(&json!({
+            "step_index": 69,
+            "type": "PLANNER_RESPONSE",
+            "status": "ERROR",
+            "content": "sample error msg"
+        }))
+        .unwrap(),
+    );
     content.push('\n');
     fs::write(&tpath, &content).unwrap();
 
@@ -593,7 +826,17 @@ fn test_journal_tail_backward_checkpoint_seek_and_incremental_append() {
     let idx2: Vec<i64> = win2.iter().map(|e| e.step_index).collect();
     assert_eq!(idx2, vec![67, 68, 69]);
 
-    let dist = distill_slice(td.path(), cid, &[], "distill", None, None, true, 8, &mut jcache);
+    let dist = distill_slice(
+        td.path(),
+        cid,
+        &[],
+        "distill",
+        None,
+        None,
+        true,
+        8,
+        &mut jcache,
+    );
     assert!(dist.found);
     assert_eq!(dist.slice_range, Some([67, 68]));
     let note_path = dist.saved_note_path.unwrap();
@@ -602,7 +845,92 @@ fn test_journal_tail_backward_checkpoint_seek_and_incremental_append() {
     let stypes = jcache.get_step_types(td.path(), cid);
     assert_eq!(stypes.get(&66).map(String::as_str), Some("CHECKPOINT"));
     assert_eq!(stypes.get(&67).map(String::as_str), Some("USER_INPUT"));
-    assert_eq!(stypes.get(&69).map(String::as_str), Some("PLANNER_RESPONSE"));
+    assert_eq!(
+        stypes.get(&69).map(String::as_str),
+        Some("PLANNER_RESPONSE")
+    );
+}
+
+#[test]
+fn test_distill_note_rejects_symlinks_and_atomically_replaces_file() {
+    use std::io::Read;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    let td = TempDir::new().unwrap();
+    let root = td.path().canonicalize().unwrap();
+    let cid = "32000000-0000-0000-0000-000000000032";
+    let brain = root.join("brain");
+    let conversation = brain.join(cid);
+    let scratch = conversation.join("scratch");
+    let transcript = conversation.join(".system_generated/logs/transcript.jsonl");
+    let note = scratch.join("slice_1_1.md");
+    let outside = root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let outside_note = outside.join("slice_1_1.md");
+    fs::write(&outside_note, "untouched").unwrap();
+    fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    fs::write(&transcript, "{\"step_index\":1,\"type\":\"USER_INPUT\",\"content\":\"Keep this\",\"status\":\"DONE\"}\n").unwrap();
+    let distill = || {
+        distill_slice(
+            &root,
+            cid,
+            &[],
+            "distill",
+            Some(1),
+            Some(1),
+            true,
+            8,
+            &mut JournalTailCache::default(),
+        )
+    };
+
+    for dir in [&brain, &conversation] {
+        let moved = dir.with_extension("moved");
+        fs::rename(dir, &moved).unwrap();
+        symlink(&moved, dir).unwrap();
+        let report = distill();
+        assert!(report.found);
+        assert!(report.digest.is_some());
+        assert!(report.error.is_some());
+        assert_eq!(report.saved_note_path.as_deref(), Some(""));
+        fs::remove_file(dir).unwrap();
+        fs::rename(moved, dir).unwrap();
+    }
+
+    symlink(&outside, &scratch).unwrap();
+    let scratch_err = distill();
+    assert!(scratch_err.found);
+    assert!(scratch_err.digest.is_some());
+    assert!(scratch_err.error.is_some());
+    assert_eq!(scratch_err.saved_note_path.as_deref(), Some(""));
+    fs::remove_file(&scratch).unwrap();
+    fs::create_dir(&scratch).unwrap();
+
+    symlink(&outside_note, &note).unwrap();
+    let note_err = distill();
+    assert!(note_err.found);
+    assert!(note_err.digest.is_some());
+    assert!(note_err.error.is_some());
+    assert_eq!(note_err.saved_note_path.as_deref(), Some(""));
+    assert!(fs::symlink_metadata(&note).unwrap().is_symlink());
+    assert_eq!(fs::read_to_string(&outside_note).unwrap(), "untouched");
+    fs::remove_file(&note).unwrap();
+
+    fs::write(&note, "old note").unwrap();
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o644)).unwrap();
+    let mut old = fs::File::open(&note).unwrap();
+    let report = distill();
+    assert!(report.error.is_none());
+    assert_eq!(report.saved_note_path.as_deref(), note.to_str());
+    let meta = fs::metadata(&note).unwrap();
+    assert_eq!(meta.mode() & 0o777, 0o600);
+    assert_ne!(meta.ino(), old.metadata().unwrap().ino());
+    let mut old_body = String::new();
+    old.read_to_string(&mut old_body).unwrap();
+    assert_eq!(old_body, "old note");
+    let body = fs::read_to_string(&note).unwrap();
+    assert!(body.ends_with(&format!("{}\n", report.digest.unwrap())));
+    assert_eq!(fs::read_dir(scratch).unwrap().count(), 1);
 }
 
 #[test]
@@ -622,16 +950,88 @@ fn test_active_subagent_filtering_and_three_way_cold_cache() {
 
     let main_steps = vec![
         (0, 14, None),
-        (1, 15, Some(make_step_meta((now - 500.0) as u64, 40_000, 0, 500, "r1", 0, 0))),
+        (
+            1,
+            15,
+            Some(make_step_meta(
+                (now - 500.0) as u64,
+                40_000,
+                0,
+                500,
+                "r1",
+                0,
+                0,
+            )),
+        ),
         (2, 132, None),
-        (3, 15, Some(make_step_meta((now - 480.0) as u64, 65_000, 0, 500, "r2", 0, 0))),
+        (
+            3,
+            15,
+            Some(make_step_meta(
+                (now - 480.0) as u64,
+                65_000,
+                0,
+                500,
+                "r2",
+                0,
+                0,
+            )),
+        ),
         (4, 132, None),
-        (5, 15, Some(make_step_meta((now - 460.0) as u64, 3_000, 68_000, 400, "r3", 0, 0))),
+        (
+            5,
+            15,
+            Some(make_step_meta(
+                (now - 460.0) as u64,
+                3_000,
+                68_000,
+                400,
+                "r3",
+                0,
+                0,
+            )),
+        ),
         (6, 101, None),
-        (7, 15, Some(make_step_meta((now - 100.0) as u64, 75_000, 0, 400, "r4", 0, 0))),
-        (8, 23, Some(make_step_meta((now - 80.0) as u64, 2_000, 75_000, 3_500, "r5", 0, 0))),
+        (
+            7,
+            15,
+            Some(make_step_meta(
+                (now - 100.0) as u64,
+                75_000,
+                0,
+                400,
+                "r4",
+                0,
+                0,
+            )),
+        ),
+        (
+            8,
+            23,
+            Some(make_step_meta(
+                (now - 80.0) as u64,
+                2_000,
+                75_000,
+                3_500,
+                "r5",
+                0,
+                0,
+            )),
+        ),
         (9, 14, None),
-        (10, 15, Some(make_step_meta((now - 30.0) as u64, 28_000, 0, 300, "r6", 0, 0))),
+        (
+            10,
+            15,
+            Some(make_step_meta(
+                (now - 30.0) as u64,
+                28_000,
+                0,
+                300,
+                "r6",
+                0,
+                0,
+            )),
+        ),
     ];
     create_conv_db(
         &conv_dir.join(format!("{main_active}.db")),
@@ -643,7 +1043,19 @@ fn test_active_subagent_filtering_and_three_way_cold_cache() {
     let one_step = |ts: f64, ctx: u64| {
         vec![
             (0, 14, None),
-            (1, 15, Some(make_step_meta(ts as u64, ctx, 0, 300, &format!("r-{}", ts as u64), 0, 0))),
+            (
+                1,
+                15,
+                Some(make_step_meta(
+                    ts as u64,
+                    ctx,
+                    0,
+                    300,
+                    &format!("r-{}", ts as u64),
+                    0,
+                    0,
+                )),
+            ),
         ]
     };
     for (cid, ts, ctx) in [
@@ -655,29 +1067,132 @@ fn test_active_subagent_filtering_and_three_way_cold_cache() {
         (sub_killed, now - 1_200.0, 150_000),
     ] {
         let p = conv_dir.join(format!("{cid}.db"));
-        create_conv_db(&p, &one_step(ts, ctx), "gemini-3-pro", "Gemini 3 Pro (High)");
+        create_conv_db(
+            &p,
+            &one_step(ts, ctx),
+            "gemini-3-pro",
+            "Gemini 3 Pro (High)",
+        );
         // Set mtime to match ts so stale subagent exceeds silent_timeout_sec
         let ft = filetime_set(&p, ts as i64);
         assert!(ft);
     }
-    assert!(filetime_set(&conv_dir.join(format!("{main_active}.db")), (now - 30.0) as i64));
+    assert!(filetime_set(
+        &conv_dir.join(format!("{main_active}.db")),
+        (now - 30.0) as i64
+    ));
 
     create_summaries_db(
         &td.path().join("conversation_summaries.db"),
         &[
-            (main_active, "Active Session", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_RUNNING", "", "", 0, 1, 0, iso(now - 30.0), 0),
-            (main_idle, "Idle Session", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_IDLE", "", "", 0, 0, 0, iso(now - 600.0), 0),
-            (sub_running, "", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_RUNNING", "worker-run", main_active, 1, 1, 0, iso(now - 10.0), -1),
-            (sub_parked, "", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_IDLE", "worker-park", main_active, 1, 1, 0, iso(now - 300.0), -1),
-            (sub_idle, "", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_IDLE", "browser", main_active, 1, 0, 0, iso(now - 18_000.0), -1),
-            (sub_stale, "", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_IDLE", "worker-stale", main_active, 1, 1, 0, iso(now - 7_200.0), -1),
-            (sub_killed, "", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_IDLE", "worker-dead", main_active, 1, 0, 1, iso(now - 1_200.0), -1),
+            (
+                main_active,
+                "Active Session",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_RUNNING",
+                "",
+                "",
+                0,
+                1,
+                0,
+                iso(now - 30.0),
+                0,
+            ),
+            (
+                main_idle,
+                "Idle Session",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_IDLE",
+                "",
+                "",
+                0,
+                0,
+                0,
+                iso(now - 600.0),
+                0,
+            ),
+            (
+                sub_running,
+                "",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_RUNNING",
+                "worker-run",
+                main_active,
+                1,
+                1,
+                0,
+                iso(now - 10.0),
+                -1,
+            ),
+            (
+                sub_parked,
+                "",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_IDLE",
+                "worker-park",
+                main_active,
+                1,
+                1,
+                0,
+                iso(now - 300.0),
+                -1,
+            ),
+            (
+                sub_idle,
+                "",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_IDLE",
+                "browser",
+                main_active,
+                1,
+                0,
+                0,
+                iso(now - 18_000.0),
+                -1,
+            ),
+            (
+                sub_stale,
+                "",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_IDLE",
+                "worker-stale",
+                main_active,
+                1,
+                1,
+                0,
+                iso(now - 7_200.0),
+                -1,
+            ),
+            (
+                sub_killed,
+                "",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_IDLE",
+                "worker-dead",
+                main_active,
+                1,
+                0,
+                1,
+                iso(now - 1_200.0),
+                -1,
+            ),
         ],
     );
 
     let mut eng = TelemetryEngine::new(
         Some(td.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     let snap = eng.build_overview_snapshot(20, false, false, "", Some(now));
@@ -701,7 +1216,9 @@ fn test_active_subagent_filtering_and_three_way_cold_cache() {
     let rows = format_turn_rows(&turns, 1, 7.2, &mut eng.rates, None);
     assert_eq!(rows[0].cold_cache_kind, "post_compact_cold");
 
-    let fast = eng.resolve_session_fast(&main_active[..10], Some(now)).unwrap();
+    let fast = eng
+        .resolve_session_fast(&main_active[..10], Some(now))
+        .unwrap();
     assert_eq!(fast.id, main_active);
     assert_eq!(fast.running_subagent_count, 2);
 }
@@ -755,27 +1272,33 @@ fn test_relay_grant_lifecycle_anti_replay_and_workspace_scoping() {
     assert!(prompt.contains("target:new"));
     assert!(prompt.contains("/tmp/slice_1_10.md"));
 
-    let grant = gs.create_grant(
-        "Keep finding A",
-        "Run regression suite",
-        true,
-        "50000000-0000-0000-0000-000000000005",
-        40,
-        0,
-        "handoff",
-        "",
-        "Demo Session",
-    );
+    let grant = gs
+        .create_grant(
+            "Keep finding A",
+            "Run regression suite",
+            true,
+            "50000000-0000-0000-0000-000000000005",
+            40,
+            0,
+            "handoff",
+            "",
+            "Demo Session",
+        )
+        .unwrap();
 
-    gs.update_settings(Some(false));
+    gs.update_settings(Some(false)).unwrap();
     assert_eq!(
-        gs.claim_grant(&grant.grant_id, Some(40), Some(0), Some(0), true).reason.as_deref(),
+        gs.claim_grant(&grant.grant_id, Some(40), Some(0), Some(0), true)
+            .reason
+            .as_deref(),
         Some("auto_handoff_disabled")
     );
 
-    gs.update_settings(Some(true));
+    gs.update_settings(Some(true)).unwrap();
     assert_eq!(
-        gs.claim_grant(&grant.grant_id, Some(40), Some(0), Some(1), true).reason.as_deref(),
+        gs.claim_grant(&grant.grant_id, Some(40), Some(0), Some(1), true)
+            .reason
+            .as_deref(),
         Some("running_subagents_active")
     );
 
@@ -784,13 +1307,18 @@ fn test_relay_grant_lifecycle_anti_replay_and_workspace_scoping() {
 
     // Anti-replay check
     assert_eq!(
-        gs.claim_grant(&grant.grant_id, Some(40), Some(0), Some(0), false).reason.as_deref(),
+        gs.claim_grant(&grant.grant_id, Some(40), Some(0), Some(0), false)
+            .reason
+            .as_deref(),
         Some("already_claimed")
     );
 
     let rec = gs.record_relay(&grant.grant_id, "new-session-999");
     assert!(rec.ok);
-    assert_eq!(rec.handoff_conversation_id.as_deref(), Some("new-session-999"));
+    assert_eq!(
+        rec.handoff_conversation_id.as_deref(),
+        Some("new-session-999")
+    );
 
     let dis = gs.dismiss_grant(&grant.grant_id);
     assert!(dis.ok);
@@ -798,23 +1326,29 @@ fn test_relay_grant_lifecycle_anti_replay_and_workspace_scoping() {
 
     // Scoped grants reject cross-workspace and cross-conversation claims
     let cid_a = "92000000-0000-0000-0000-000000000011";
-    let scoped = gs.create_grant_scoped(
-        "Keep A",
-        "Finish A",
-        true,
-        cid_a,
-        "/workspace/project-a",
-        &["/workspace/project-a".to_string()],
-        30,
-        0,
-        "handoff",
-        "",
-        "Project A",
-        Lang::En,
-    );
+    let scoped = gs
+        .create_grant_scoped(
+            "Keep A",
+            "Finish A",
+            true,
+            cid_a,
+            "/workspace/project-a",
+            &["/workspace/project-a".to_string()],
+            30,
+            0,
+            "handoff",
+            "",
+            "Project A",
+            Lang::En,
+        )
+        .unwrap();
 
-    assert!(gs.get_pending_grant_scoped(None, Some("/workspace/project-b"), None).is_none());
-    assert!(gs.get_pending_grant_scoped(None, Some("/workspace/project-a"), None).is_some());
+    assert!(gs
+        .get_pending_grant_scoped(None, Some("/workspace/project-b"), None)
+        .is_none());
+    assert!(gs
+        .get_pending_grant_scoped(None, Some("/workspace/project-a"), None)
+        .is_some());
 
     let wrong_cid = gs.claim_grant_scoped(
         &scoped.grant_id,
@@ -853,6 +1387,85 @@ fn test_relay_grant_lifecycle_anti_replay_and_workspace_scoping() {
 }
 
 #[test]
+fn test_grant_lock_failure_withholds_instructions_and_allows_one_retry() {
+    use std::os::unix::fs::symlink;
+
+    let td = TempDir::new().unwrap();
+    let store_path = td.path().join("relay_grants.json");
+    let lock_path = td.path().join("relay_grants.json.lock");
+    let mut store = RelayGrantStore::new(store_path.clone());
+    let create = |store: &mut RelayGrantStore| {
+        store.create_grant("Keep state", "Resume", true, "", 0, 0, "handoff", "", "")
+    };
+
+    let grant = create(&mut store).unwrap();
+    let before = fs::read(&store_path).unwrap();
+    fs::remove_file(&lock_path).unwrap();
+    symlink(&store_path, &lock_path).unwrap();
+    assert!(create(&mut store).is_err());
+    let failed = store.claim_grant(&grant.grant_id, None, None, None, false);
+    assert!(!failed.claimed);
+    assert_eq!(failed.reason.as_deref(), Some("lock_error"));
+    assert!(failed.handoff_prompt.is_none());
+    assert!(failed.compact_command.is_none());
+    assert_eq!(fs::read(&store_path).unwrap(), before);
+
+    fs::remove_file(&lock_path).unwrap();
+    let mut retry = RelayGrantStore::new(store_path.clone());
+    assert!(
+        retry
+            .claim_grant(&grant.grant_id, None, None, None, false)
+            .claimed
+    );
+    let replay =
+        RelayGrantStore::new(store_path).claim_grant(&grant.grant_id, None, None, None, false);
+    assert!(!replay.claimed);
+    assert_eq!(replay.reason.as_deref(), Some("already_claimed"));
+    assert!(replay.handoff_prompt.is_none());
+    assert!(replay.compact_command.is_none());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn test_grant_save_failure_withholds_instructions_and_preserves_replay_protection() {
+    #[cfg(target_os = "macos")]
+    const PATH_LIMIT: usize = 1024;
+    #[cfg(target_os = "linux")]
+    const PATH_LIMIT: usize = 4096;
+
+    let td = TempDir::new().unwrap();
+    let root = td.path().canonicalize().unwrap();
+    let path = root.join("plugin/g");
+    let mut store = RelayGrantStore::new(path.clone());
+    let grant = store
+        .create_grant("Keep state", "Resume", true, "", 0, 0, "handoff", "", "")
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+
+    // The padded path reaches the same store and lock. The longer temporary
+    // filename exceeds the OS path limit, so saving fails before replacement.
+    let mut padded = root;
+    while padded.as_os_str().len() < PATH_LIMIT - 22 {
+        padded.push(".");
+    }
+    let mut fault = RelayGrantStore::new(padded.join("plugin/g"));
+    assert!(fault.find_grant(&grant.grant_id).is_some());
+    let failed = fault.claim_grant(&grant.grant_id, None, None, None, false);
+    assert!(!failed.claimed);
+    assert_eq!(failed.reason.as_deref(), Some("storage_error"));
+    assert!(failed.compact_command.is_none());
+    assert!(failed.handoff_prompt.is_none());
+    assert_eq!(fs::read(&path).unwrap(), before);
+
+    let retry = store.claim_grant(&grant.grant_id, None, None, None, false);
+    assert!(retry.claimed);
+    assert!(retry.handoff_prompt.is_some());
+    let replay = RelayGrantStore::new(path).claim_grant(&grant.grant_id, None, None, None, false);
+    assert!(!replay.claimed);
+    assert_eq!(replay.reason.as_deref(), Some("already_claimed"));
+}
+
+#[test]
 fn test_zero_copy_protobuf_cursor_with_large_padding_and_edge_cases() {
     let gen_blob = make_gen_blob("gemini-3-pro", "Gemini 3 Pro (High)", 65_536);
     assert_eq!(
@@ -872,7 +1485,10 @@ fn test_zero_copy_protobuf_cursor_with_large_padding_and_edge_cases() {
     // Truncated / malformed inputs must not panic
     assert_eq!(decode_timestamp(&[0x08, 0x80, 0x80]), 0.0);
     assert!(decode_step_metadata(&[0x0a, 0xff, 0xff]).is_none());
-    assert_eq!(extract_gen_model(&[0x0a, 0x05, 0x00]), (String::new(), String::new()));
+    assert_eq!(
+        extract_gen_model(&[0x0a, 0x05, 0x00]),
+        (String::new(), String::new())
+    );
 }
 
 #[test]
@@ -885,7 +1501,11 @@ fn test_ssr_boot_data_injection_xss_escaping_and_digest_dedup() {
         &db_path,
         &[
             (0, 14, None),
-            (1, 15, Some(make_step_meta(now as u64, 50_000, 100_000, 400, "d1", 0, 0))),
+            (
+                1,
+                15,
+                Some(make_step_meta(now as u64, 50_000, 100_000, 400, "d1", 0, 0)),
+            ),
         ],
         "gemini-3-pro",
         "Gemini 3 Pro (High)",
@@ -922,7 +1542,11 @@ fn test_ssr_boot_data_injection_xss_escaping_and_digest_dedup() {
 
     let eng = TelemetryEngine::new(
         Some(td.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     let grants = RelayGrantStore::new(td.path().join("relay_grants.json"));
@@ -940,7 +1564,10 @@ fn test_ssr_boot_data_injection_xss_escaping_and_digest_dedup() {
     let html = r_panel["result"]["contents"][0]["text"].as_str().unwrap();
     assert!(html.contains("window.__CONTEXT_RADAR_BOOT__="));
     assert!(html.contains(cid));
-    assert!(!html.contains("</script><img"), "raw XSS sequence must be escaped");
+    assert!(
+        !html.contains("</script><img"),
+        "raw XSS sequence must be escaped"
+    );
     assert!(html.contains("\\u003c/script\\u003e"));
 
     // 2) SSR hint for ui://context-radar-mcp/handoff
@@ -990,7 +1617,15 @@ fn test_ssr_boot_data_injection_xss_escaping_and_digest_dedup() {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 15, ?1)",
-            params![make_step_meta((now + 10.0) as u64, 5_000, 155_000, 300, "d2", 0, 0)],
+            params![make_step_meta(
+                (now + 10.0) as u64,
+                5_000,
+                155_000,
+                300,
+                "d2",
+                0,
+                0
+            )],
         )
         .unwrap();
     }
@@ -1017,7 +1652,13 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
         &db_path,
         &[
             (0, 14, None),
-            (1, 15, Some(make_step_meta(now as u64, 45_000, 95_000, 400, "swr1", 0, 0))),
+            (
+                1,
+                15,
+                Some(make_step_meta(
+                    now as u64, 45_000, 95_000, 400, "swr1", 0, 0,
+                )),
+            ),
         ],
         "gemini-3-pro",
         "Gemini 3 Pro (High)",
@@ -1046,7 +1687,11 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
         .join("panel.html");
     let eng = TelemetryEngine::new(
         Some(td.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     let grants = RelayGrantStore::new(td.path().join("relay_grants.json"));
@@ -1060,7 +1705,10 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
         }
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(daemon.swr_is_warm(), "background pre-warm should warm snapshot in RAM");
+    assert!(
+        daemon.swr_is_warm(),
+        "background pre-warm should warm snapshot in RAM"
+    );
 
     // 1) Warm resources/read and context_radar_overview({}) should return matching digest instantly
     let r1 = daemon
@@ -1071,7 +1719,10 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
         .unwrap();
     let html1 = r1["result"]["contents"][0]["text"].as_str().unwrap();
     assert!(html1.contains(cid));
-    assert_eq!(r1["result"]["contents"][0]["_meta"]["ui"]["prefersBorder"], json!(false));
+    assert_eq!(
+        r1["result"]["contents"][0]["_meta"]["ui"]["prefersBorder"],
+        json!(false)
+    );
 
     let o1 = daemon
         .handle_request(&json!({
@@ -1079,7 +1730,10 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
             "params": { "name": "context_radar_overview", "arguments": {} }
         }))
         .unwrap();
-    let digest1 = o1["result"]["structuredContent"]["digest"].as_str().unwrap().to_string();
+    let digest1 = o1["result"]["structuredContent"]["digest"]
+        .as_str()
+        .unwrap()
+        .to_string();
     assert!(o1["result"]["structuredContent"].get("stale").is_none());
 
     // 2) Mutate DB + backdate cache past SWR_STALE_TTL:
@@ -1089,7 +1743,15 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             "INSERT INTO steps (idx, step_type, metadata) VALUES (2, 15, ?1)",
-            params![make_step_meta((now + 10.0) as u64, 5_000, 160_000, 350, "swr2", 0, 0)],
+            params![make_step_meta(
+                (now + 10.0) as u64,
+                5_000,
+                160_000,
+                350,
+                "swr2",
+                0,
+                0
+            )],
         )
         .unwrap();
     }
@@ -1105,17 +1767,34 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
         .as_str()
         .unwrap()
         .to_string();
-    assert_ne!(refreshed_digest, digest1, "expired cache must refresh live immediately without serving stale data");
+    assert_ne!(
+        refreshed_digest, digest1,
+        "expired cache must refresh live immediately without serving stale data"
+    );
     assert!(o_live["result"]["structuredContent"].get("stale").is_none());
 
     // 3) context_radar_ui_action updates prefs and immediately reflects in subsequent SWR reads
+    daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 500, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": { "extensions": {
+                    "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] }
+                } }
+            }
+        }))
+        .unwrap();
     let pref = daemon
         .handle_request(&json!({
             "jsonrpc": "2.0", "id": 5, "method": "tools/call",
             "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "allow_auto_handoff": false } }
         }))
         .unwrap();
-    assert_eq!(pref["result"]["structuredContent"]["settings"]["allow_auto_handoff"], json!(false));
+    assert_eq!(
+        pref["result"]["structuredContent"]["settings"]["allow_auto_handoff"],
+        json!(false)
+    );
 
     let o_after_pref = daemon
         .handle_request(&json!({
@@ -1123,7 +1802,10 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
             "params": { "name": "context_radar_overview", "arguments": {} }
         }))
         .unwrap();
-    assert_eq!(o_after_pref["result"]["structuredContent"]["settings"]["allow_auto_handoff"], json!(false));
+    assert_eq!(
+        o_after_pref["result"]["structuredContent"]["settings"]["allow_auto_handoff"],
+        json!(false)
+    );
 
     // 3) Mutate DB WITHOUT backdating SWR cache: live per-conversation disk activity stamp
     //    MUST invalidate burst cache immediately and resources/read MUST always serve fresh SSR data!
@@ -1132,7 +1814,15 @@ fn test_startup_prewarm_and_swr_stale_while_revalidate() {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute(
             "INSERT INTO steps (idx, step_type, metadata) VALUES (3, 15, ?1)",
-            params![make_step_meta((now + 20.0) as u64, 4_000, 175_000, 320, "swr3", 0, 0)],
+            params![make_step_meta(
+                (now + 20.0) as u64,
+                4_000,
+                175_000,
+                320,
+                "swr3",
+                0,
+                0
+            )],
         )
         .unwrap();
     }
@@ -1171,7 +1861,16 @@ fn test_security_path_traversal_and_symlink_guards() {
     use context_radar_mcp::ledger::is_safe_id;
 
     // 1) is_safe_id must reject traversal & dot-prefixed IDs
-    for bad in ["", ".", "..", ".hidden", "a..b", "../secret", "abc/def", "abc\\def"] {
+    for bad in [
+        "",
+        ".",
+        "..",
+        ".hidden",
+        "a..b",
+        "../secret",
+        "abc/def",
+        "abc\\def",
+    ] {
         assert!(!is_safe_id(bad), "expected unsafe id: {bad}");
     }
     assert!(is_safe_id("70000000-0000-0000-0000-000000000007"));
@@ -1208,7 +1907,10 @@ fn test_security_path_traversal_and_symlink_guards() {
         ]
     });
     assert_eq!(
-        context_radar_mcp::guard::boot::evaluate_boot_guard(&json!({ "cwd": ws.path().to_string_lossy() }), &cfg),
+        context_radar_mcp::guard::boot::evaluate_boot_guard(
+            &json!({ "cwd": ws.path().to_string_lossy() }),
+            &cfg
+        ),
         json!({})
     );
 }
@@ -1220,26 +1922,59 @@ fn test_live_antigravity_models_unpriced_break_even_and_i18n() {
 
     for (id, disp, exp_tier) in [
         ("gemini-4-neon-high", "Gemini 4 Neon (High)", "flagship"),
-        ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)", "high_reasoning"),
+        (
+            "gemini-4-neon-xhigh",
+            "Gemini 4 Neon (XHigh)",
+            "high_reasoning",
+        ),
         ("gemini-4-carbon-high", "Gemini 4 Carbon (High)", "standard"),
-        ("gemini-4-argon-medium", "Gemini 4 Argon (Medium)", "standard"),
-        ("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)", "fast"),
-        ("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)", "fast_reasoning"),
+        (
+            "gemini-4-argon-medium",
+            "Gemini 4 Argon (Medium)",
+            "standard",
+        ),
+        (
+            "gemini-4-hydrogen-medium",
+            "Gemini 4 Hydrogen (Medium)",
+            "fast",
+        ),
+        (
+            "gemini-4-hydrogen-xhigh",
+            "Gemini 4 Hydrogen (XHigh)",
+            "fast_reasoning",
+        ),
         ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", "fast"),
-        ("gemini-pro-orchestrator-neon", "Gemini Pro Orchestrator", "flagship"),
+        (
+            "gemini-pro-orchestrator-neon",
+            "Gemini Pro Orchestrator",
+            "flagship",
+        ),
         ("claude-opus-5-5-high", "Claude Opus 5.5", "claude_tier"),
-        ("claude-sonnet-5-5-medium", "Claude Sonnet 5.5", "claude_tier"),
+        (
+            "claude-sonnet-5-5-medium",
+            "Claude Sonnet 5.5",
+            "claude_tier",
+        ),
         ("gpt-oss-120b-medium", "GPT OSS 120B (Medium)", "standard"),
     ] {
         let card = rates.resolve_rate(id, disp);
         assert!(card.pricing_known, "expected known pricing for {id}");
-        assert_eq!(resolve_budget_tier(id, disp, &cfg).profile_id, exp_tier, "tier mismatch for {id}");
+        assert_eq!(
+            resolve_budget_tier(id, disp, &cfg).profile_id,
+            exp_tier,
+            "tier mismatch for {id}"
+        );
     }
 
     // Unknown brand-new model must NEVER deadlock at break_even_turns = 999
     let unknown_card = rates.resolve_rate("future-brand-new-model-9", "Future Brand New");
     assert!(!unknown_card.pricing_known);
-    let econ = compute_economics(320_000, "future-brand-new-model-9", "Future Brand New", &mut rates);
+    let econ = compute_economics(
+        320_000,
+        "future-brand-new-model-9",
+        "Future Brand New",
+        &mut rates,
+    );
     assert!(!econ.pricing_known);
     assert!(
         (2..=12).contains(&econ.break_even_turns),
@@ -1263,11 +1998,21 @@ fn test_live_antigravity_models_unpriced_break_even_and_i18n() {
     s.turns = 30;
     s.turns_since_compact = 30;
     let gate = evaluate_handoff_gate(Some(&s), 12, &mut rates);
-    assert!(gate.allowed, "unpriced model at 340k should pass handoff gate: {:?}", gate.reasons);
+    assert!(
+        gate.allowed,
+        "unpriced model at 340k should pass handoff gate: {:?}",
+        gate.reasons
+    );
 
     // i18n locale & currency resolution
-    assert_eq!(resolve_lang_from_sources("", None, Some("zh_CN.UTF-8"), None, None, None), Lang::ZhCn);
-    assert_eq!(resolve_lang_from_sources("", None, Some("en_US.UTF-8"), None, None, None), Lang::En);
+    assert_eq!(
+        resolve_lang_from_sources("", None, Some("zh_CN.UTF-8"), None, None, None),
+        Lang::ZhCn
+    );
+    assert_eq!(
+        resolve_lang_from_sources("", None, Some("en_US.UTF-8"), None, None, None),
+        Lang::En
+    );
     assert_eq!(Lang::ZhCn.default_currency(), ("CNY", "¥"));
     assert_eq!(Lang::En.default_currency(), ("USD", "$"));
 }
@@ -1276,7 +2021,12 @@ fn test_live_antigravity_models_unpriced_break_even_and_i18n() {
 fn test_hotspot_attribution_excludes_outgoing_step_and_detects_partial_cold() {
     let td = TempDir::new().unwrap();
     let cid = "91000000-0000-0000-0000-000000000010";
-    let log_dir = td.path().join("brain").join(cid).join(".system_generated").join("logs");
+    let log_dir = td
+        .path()
+        .join("brain")
+        .join(cid)
+        .join(".system_generated")
+        .join("logs");
     fs::create_dir_all(&log_dir).unwrap();
     let transcript = [
         json!({
@@ -1344,7 +2094,11 @@ fn test_hotspot_attribution_excludes_outgoing_step_and_detects_partial_cold() {
     assert!(rep.found);
     let hotspots = rep.hotspots.unwrap();
     assert_eq!(hotspots.len(), 1);
-    assert!(hotspots[0].cause.contains("run_command"), "got: {}", hotspots[0].cause);
+    assert!(
+        hotspots[0].cause.contains("run_command"),
+        "got: {}",
+        hotspots[0].cause
+    );
     assert!(
         !hotspots[0].cause.contains("unexecuted_outgoing.rs"),
         "must not attribute turn 2's own unexecuted outgoing tool call: {}",
@@ -1358,6 +2112,7 @@ fn test_hotspot_attribution_excludes_outgoing_step_and_detects_partial_cold() {
     assert_eq!(rows[0].cold_cache_kind, "mid_loop_cold");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sample_turn(
     turn_index: usize,
     began: f64,
@@ -1393,20 +2148,52 @@ fn sample_turn(
 
 #[test]
 fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
-    assert!(is_gemini_4_model("gemini-4-carbon-high", "Gemini 4 Carbon (High)"));
-    assert!(is_gemini_4_model("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"));
+    assert!(is_gemini_4_model(
+        "gemini-4-carbon-high",
+        "Gemini 4 Carbon (High)"
+    ));
+    assert!(is_gemini_4_model(
+        "gemini-4-neon-xhigh",
+        "Gemini 4 Neon (XHigh)"
+    ));
     assert!(!is_gemini_4_model("claude-sonnet-4-5", "Claude Sonnet 4.5"));
     assert!(!is_gemini_4_model("gpt-5", "GPT-5"));
 
-    assert_eq!(model_cache_ttl_sec("gemini-4-carbon-high", "Gemini 4 Carbon (High)"), 180.0);
-    assert_eq!(model_cache_ttl_sec("claude-sonnet-4-5", "Claude Sonnet 4.5"), 300.0);
+    assert_eq!(
+        model_cache_ttl_sec("gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+        180.0
+    );
+    assert_eq!(
+        model_cache_ttl_sec("claude-sonnet-4-5", "Claude Sonnet 4.5"),
+        300.0
+    );
 
     let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
 
     // Gap of 190s (>=180s, <300s): Gemini 4 treats it as expired TTL (TurnStart), Claude treats it as MidLoop (<300s)
     let g4_turns = vec![
-        sample_turn(1, 1000.0, 5_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 25_000, 0, 0, Some(true)),
-        sample_turn(2, 1190.0, 4_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 28_000, 0, 0, None),
+        sample_turn(
+            1,
+            1000.0,
+            5_000,
+            "gemini-4-carbon-high",
+            "Gemini 4 Carbon (High)",
+            25_000,
+            0,
+            0,
+            Some(true),
+        ),
+        sample_turn(
+            2,
+            1190.0,
+            4_000,
+            "gemini-4-carbon-high",
+            "Gemini 4 Carbon (High)",
+            28_000,
+            0,
+            0,
+            None,
+        ),
     ];
     let g4_tel = build_session_telemetry(
         "g4-ttl-test",
@@ -1428,13 +2215,46 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
         }
     );
     let g4_rows = format_turn_rows(&g4_turns, 5, 7.2, &mut rates, None);
-    assert!(g4_rows[0].cold_cache_reason.contains("3m") || g4_rows[0].cold_cache_reason.contains("180s"));
+    assert!(
+        g4_rows[0].cold_cache_reason.contains("3m")
+            || g4_rows[0].cold_cache_reason.contains("180s")
+    );
 
     // Claude at 190s (<300s) is NOT TTL-expired -> MidLoop; at 310s (>=300s) -> TurnStart
     let cl_turns = vec![
-        sample_turn(1, 1000.0, 5_000, "claude-sonnet-4-5", "Claude Sonnet 4.5", 25_000, 0, 0, Some(true)),
-        sample_turn(2, 1190.0, 4_000, "claude-sonnet-4-5", "Claude Sonnet 4.5", 28_000, 0, 0, None),
-        sample_turn(3, 1500.0, 4_000, "claude-sonnet-4-5", "Claude Sonnet 4.5", 30_000, 0, 0, None),
+        sample_turn(
+            1,
+            1000.0,
+            5_000,
+            "claude-sonnet-4-5",
+            "Claude Sonnet 4.5",
+            25_000,
+            0,
+            0,
+            Some(true),
+        ),
+        sample_turn(
+            2,
+            1190.0,
+            4_000,
+            "claude-sonnet-4-5",
+            "Claude Sonnet 4.5",
+            28_000,
+            0,
+            0,
+            None,
+        ),
+        sample_turn(
+            3,
+            1500.0,
+            4_000,
+            "claude-sonnet-4-5",
+            "Claude Sonnet 4.5",
+            30_000,
+            0,
+            0,
+            None,
+        ),
     ];
     let cl_tel = build_session_telemetry(
         "cl-ttl-test",
@@ -1465,20 +2285,100 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
     // 2) replica_spillover: partial rollback to turn 1 prompt (22_847)
     // 3) model_switch_cold: Carbon -> Hydrogen AND Neon XHigh -> Neon High
     let turns = vec![
-        sample_turn(1, 1000.0, 4_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 22_847, 0, 0, Some(true)),
-        sample_turn(2, 1010.0, 185_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 5_000, 60_000, 0, Some(false)),
+        sample_turn(
+            1,
+            1000.0,
+            4_000,
+            "gemini-4-carbon-high",
+            "Gemini 4 Carbon (High)",
+            22_847,
+            0,
+            0,
+            Some(true),
+        ),
+        sample_turn(
+            2,
+            1010.0,
+            185_000,
+            "gemini-4-carbon-high",
+            "Gemini 4 Carbon (High)",
+            5_000,
+            60_000,
+            0,
+            Some(false),
+        ),
         // Turn 3 begins at 1202.0: start_dt = 192s >= 180s, prev.ended = 1195.0 -> idle_gap = 7s < 60s
-        sample_turn(3, 1202.0, 5_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 72_000, 0, 0, Some(false)),
+        sample_turn(
+            3,
+            1202.0,
+            5_000,
+            "gemini-4-carbon-high",
+            "Gemini 4 Carbon (High)",
+            72_000,
+            0,
+            0,
+            Some(false),
+        ),
         // Turn 4 warm
-        sample_turn(4, 1212.0, 4_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 4_000, 72_000, 0, Some(false)),
+        sample_turn(
+            4,
+            1212.0,
+            4_000,
+            "gemini-4-carbon-high",
+            "Gemini 4 Carbon (High)",
+            4_000,
+            72_000,
+            0,
+            Some(false),
+        ),
         // Turn 5 partial rollback matching turn 1 static prompt (22_847)
-        sample_turn(5, 1220.0, 4_000, "gemini-4-carbon-high", "Gemini 4 Carbon (High)", 58_000, 22_847, 58_000, Some(false)),
+        sample_turn(
+            5,
+            1220.0,
+            4_000,
+            "gemini-4-carbon-high",
+            "Gemini 4 Carbon (High)",
+            58_000,
+            22_847,
+            58_000,
+            Some(false),
+        ),
         // Turn 6 model switch Carbon -> Hydrogen
-        sample_turn(6, 1228.0, 3_000, "gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)", 82_000, 0, 0, Some(false)),
+        sample_turn(
+            6,
+            1228.0,
+            3_000,
+            "gemini-4-hydrogen-high",
+            "Gemini 4 Hydrogen (High)",
+            82_000,
+            0,
+            0,
+            Some(false),
+        ),
         // Turn 7 warm on Neon XHigh baseline
-        sample_turn(7, 1235.0, 3_000, "gemini-4-neon", "Gemini 4 Neon (XHigh)", 3_000, 82_000, 0, Some(false)),
+        sample_turn(
+            7,
+            1235.0,
+            3_000,
+            "gemini-4-neon",
+            "Gemini 4 Neon (XHigh)",
+            3_000,
+            82_000,
+            0,
+            Some(false),
+        ),
         // Turn 8 reasoning-effort switch Neon XHigh -> Neon High
-        sample_turn(8, 1242.0, 3_000, "gemini-4-neon", "Gemini 4 Neon (High)", 87_000, 0, 0, Some(false)),
+        sample_turn(
+            8,
+            1242.0,
+            3_000,
+            "gemini-4-neon",
+            "Gemini 4 Neon (High)",
+            87_000,
+            0,
+            0,
+            Some(false),
+        ),
     ];
 
     let detailed = classify_cold_cache_turns_detailed(&turns, None, None);
@@ -1515,8 +2415,14 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
 
 #[test]
 fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
-    assert!(is_gemini_4_carbon("gemini-4-carbon-high", "Gemini 4 Carbon (High)"));
-    assert!(!is_gemini_4_carbon("gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"));
+    assert!(is_gemini_4_carbon(
+        "gemini-4-carbon-high",
+        "Gemini 4 Carbon (High)"
+    ));
+    assert!(!is_gemini_4_carbon(
+        "gemini-4-hydrogen-high",
+        "Gemini 4 Hydrogen (High)"
+    ));
     let now = 1_795_400_000.0;
     let td = TempDir::new().unwrap();
     let conv_dir = td.path().join("conversations");
@@ -1533,9 +2439,33 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
         &conv_dir.join(format!("{c1}.db")),
         &[
             (0, 14, None),
-            (1, 15, Some(make_step_meta((now - 40.0) as u64, 30_000, 0, 400, "r1", 0, 0))),
+            (
+                1,
+                15,
+                Some(make_step_meta(
+                    (now - 40.0) as u64,
+                    30_000,
+                    0,
+                    400,
+                    "r1",
+                    0,
+                    0,
+                )),
+            ),
             (2, 132, None),
-            (3, 15, Some(make_step_meta((now - 10.0) as u64, 36_000, 0, 400, "r2", 0, 0))),
+            (
+                3,
+                15,
+                Some(make_step_meta(
+                    (now - 10.0) as u64,
+                    36_000,
+                    0,
+                    400,
+                    "r2",
+                    0,
+                    0,
+                )),
+            ),
         ],
         "gemini-4-carbon-high",
         "Gemini 4 Carbon (High)",
@@ -1550,7 +2480,19 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
             &conv_dir.join(format!("{cid}.db")),
             &[
                 (0, 14, None),
-                (1, 15, Some(make_step_meta((now - 20.0) as u64, 25_000, 0, 300, "r1", 0, 0))),
+                (
+                    1,
+                    15,
+                    Some(make_step_meta(
+                        (now - 20.0) as u64,
+                        25_000,
+                        0,
+                        300,
+                        "r1",
+                        0,
+                        0,
+                    )),
+                ),
             ],
             model,
             disp,
@@ -1561,17 +2503,86 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
     create_summaries_db(
         &td.path().join("conversation_summaries.db"),
         &[
-            (c1, "Carbon 1", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_RUNNING", "", "", 0, 1, 0, iso(now - 10.0), 0),
-            (c2, "Carbon 2", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_RUNNING", "w-c2", c1, 1, 1, 0, iso(now - 15.0), -1),
-            (c3, "Carbon 3 (idle)", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_IDLE", "w-c3", c1, 1, 0, 0, iso(now - 20.0), -1),
-            (h1, "Hydrogen 1", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_RUNNING", "w-h1", c1, 1, 1, 0, iso(now - 12.0), -1),
-            (idle_c, "Idle Carbon", "", r#"["file:///workspace/demo"]"#, "CASCADE_RUN_STATUS_IDLE", "", "", 0, 0, 0, iso(now - 20.0), 0),
+            (
+                c1,
+                "Carbon 1",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_RUNNING",
+                "",
+                "",
+                0,
+                1,
+                0,
+                iso(now - 10.0),
+                0,
+            ),
+            (
+                c2,
+                "Carbon 2",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_RUNNING",
+                "w-c2",
+                c1,
+                1,
+                1,
+                0,
+                iso(now - 15.0),
+                -1,
+            ),
+            (
+                c3,
+                "Carbon 3 (idle)",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_IDLE",
+                "w-c3",
+                c1,
+                1,
+                0,
+                0,
+                iso(now - 20.0),
+                -1,
+            ),
+            (
+                h1,
+                "Hydrogen 1",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_RUNNING",
+                "w-h1",
+                c1,
+                1,
+                1,
+                0,
+                iso(now - 12.0),
+                -1,
+            ),
+            (
+                idle_c,
+                "Idle Carbon",
+                "",
+                r#"["file:///workspace/demo"]"#,
+                "CASCADE_RUN_STATUS_IDLE",
+                "",
+                "",
+                0,
+                0,
+                0,
+                iso(now - 20.0),
+                0,
+            ),
         ],
     );
 
     let mut eng = TelemetryEngine::new(
         Some(td.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     let snap2 = eng.build_overview_snapshot(20, false, false, "", Some(now));
@@ -1593,15 +2604,25 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
     assert_eq!(snap3.summary.active_carbon_count, 3);
     assert!(snap3.summary.carbon_concurrency_warning);
     assert!(snap3.carbon_concurrency_warning);
-    assert!(snap3.carbon_concurrency_note.as_deref().unwrap().contains("<= 2"));
+    assert!(snap3
+        .carbon_concurrency_note
+        .as_deref()
+        .unwrap()
+        .contains("<= 2"));
     assert!(summarize_snapshot_text(&snap3).contains("<= 2"));
 
     let c1_tel = snap3.sessions.iter().find(|s| s.id == c1).unwrap();
     assert_eq!(c1_tel.mid_loop_breakdown.replica_spillover, 1);
 
     let turns_payload = eng.get_session_turns(c1, 10);
-    assert_eq!(turns_payload.mid_loop_breakdown.unwrap().replica_spillover, 1);
-    assert_eq!(turns_payload.turns[0].cold_cache_sub_reason, "replica_spillover");
+    assert_eq!(
+        turns_payload.mid_loop_breakdown.unwrap().replica_spillover,
+        1
+    );
+    assert_eq!(
+        turns_payload.turns[0].cold_cache_sub_reason,
+        "replica_spillover"
+    );
 }
 
 #[test]
@@ -1620,7 +2641,10 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
     let t_direct = tiers::resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Neon (High)", &cfg);
     let t_reexp = resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Neon (High)", &cfg);
     assert_eq!(t_direct.profile_id, t_reexp.profile_id);
-    assert_eq!(tiers::model_cache_ttl_sec("gemini-4-carbon-high", ""), 180.0);
+    assert_eq!(
+        tiers::model_cache_ttl_sec("gemini-4-carbon-high", ""),
+        180.0
+    );
     assert!(tiers::is_gemini_4_carbon("gemini-4-carbon-high", ""));
     assert!(tiers::is_gemini_4_model("gemini-4-hydrogen-high", ""));
 
@@ -1632,7 +2656,11 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
     assert_eq!(all_ws, vec!["/Users/demo/My Project Alpha"]);
     let boot_cands = extract_workspace_candidates(&json!({ "workspaceRoots": [uri] }));
     assert_eq!(boot_cands, vec!["/Users/demo/My Project Alpha"]);
-    assert!(workspaces_overlap(uri, &[], "/Users/demo/My Project Alpha/sub"));
+    assert!(workspaces_overlap(
+        uri,
+        &[],
+        "/Users/demo/My Project Alpha/sub"
+    ));
     assert!(workspaces_overlap("/Users/demo/My Project Alpha", &[], uri));
 
     // 3. Concurrent RelayGrantStore advisory flock: zero lost updates & single-winner atomic claim
@@ -1662,13 +2690,16 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
                     &format!("T-{i}"),
                     Lang::En,
                 )
+                .unwrap()
                 .grant_id
         }));
     }
     let created_ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
     let mut verifier = RelayGrantStore::new(grants_path.clone());
     for gid in &created_ids {
-        let g = verifier.find_grant(gid).expect("locked concurrent create must not lose any grant");
+        let g = verifier
+            .find_grant(gid)
+            .expect("locked concurrent create must not lose any grant");
         assert_eq!(g.workspace, "/Users/demo/My Project Alpha");
     }
     // Lock file must exist with 0600 permissions
@@ -1705,7 +2736,10 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
         .map(|h| h.join().unwrap())
         .filter(|&ok| ok)
         .count();
-    assert_eq!(winners, 1, "flock must guarantee strictly one winner under concurrent claims");
+    assert_eq!(
+        winners, 1,
+        "flock must guarantee strictly one winner under concurrent claims"
+    );
 
     // Symlinked .lock file must fail closed (O_NOFOLLOW)
     let sym_dir = TempDir::new().unwrap();
@@ -1766,7 +2800,11 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
     );
     let eng = TelemetryEngine::new(
         Some(td_mcp.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     let gstore = RelayGrantStore::new(td_mcp.path().join("relay_grants.json"));
@@ -1774,6 +2812,17 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
     daemon
         .engine
         .set_preferred_workspace(Some("/Users/demo/My Project Alpha".into()), true);
+    daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 9, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": { "extensions": {
+                    "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] }
+                } }
+            }
+        }))
+        .unwrap();
 
     // Unified PanelPrefs.lang via context_radar_ui_action updates RateTable::get_lang()
     let set_zh = daemon
@@ -1782,7 +2831,10 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
             "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "lang": "zh-CN" } }
         }))
         .unwrap();
-    assert_eq!(set_zh["result"]["structuredContent"]["settings"]["lang"], json!("zh-CN"));
+    assert_eq!(
+        set_zh["result"]["structuredContent"]["settings"]["lang"],
+        json!("zh-CN")
+    );
     assert_eq!(daemon.engine.rates.get_lang(), Lang::ZhCn);
 
     // Legacy hidden alias on context_radar_overview(action="set_prefs") is gone (returns snapshot instead of mutating prefs)
@@ -1792,8 +2844,11 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
             "params": { "name": "context_radar_overview", "arguments": { "action": "set_prefs", "allow_auto_handoff": false } }
         }))
         .unwrap();
-    assert_eq!(legacy["result"]["structuredContent"]["mode"], json!("snapshot"));
-    assert_eq!(daemon.grants.get_settings().allow_auto_handoff, true);
+    assert_eq!(
+        legacy["result"]["structuredContent"]["mode"],
+        json!("snapshot")
+    );
+    assert!(daemon.grants.get_settings().allow_auto_handoff);
 
     // Create compact grant with CONTEXT_RADAR_ACP_PROXY=1 -> persisted acp_proxy_active=true on pending_grant,
     // scratch_note_path included in compact_command, and ACP gate blocks return isError=true (while App UI stays isError=false)
@@ -1815,8 +2870,14 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
         }))
         .unwrap();
     assert_eq!(commit["result"]["isError"], json!(false));
-    assert_eq!(commit["result"]["structuredContent"]["acp_proxy_active"], json!(true));
-    assert_eq!(commit["result"]["structuredContent"]["lang"], json!("zh-CN"));
+    assert_eq!(
+        commit["result"]["structuredContent"]["acp_proxy_active"],
+        json!(true)
+    );
+    assert_eq!(
+        commit["result"]["structuredContent"]["lang"],
+        json!("zh-CN")
+    );
     assert!(commit["result"]["structuredContent"]["compact_command"]
         .as_str()
         .unwrap()
@@ -1838,7 +2899,10 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
         }))
         .unwrap();
     assert_eq!(acp_blocked_gate["result"]["isError"], json!(true));
-    assert_eq!(acp_blocked_gate["result"]["structuredContent"]["mode"], json!("handoff_blocked"));
+    assert_eq!(
+        acp_blocked_gate["result"]["structuredContent"]["mode"],
+        json!("handoff_blocked")
+    );
 
     // Disabling allow_auto_handoff under CONTEXT_RADAR_ACP_PROXY=1 -> isError=true on auto_fire compact
     let _ = daemon
@@ -1862,7 +2926,10 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
         }))
         .unwrap();
     assert_eq!(acp_blocked_pref["result"]["isError"], json!(true));
-    assert_eq!(acp_blocked_pref["result"]["structuredContent"]["mode"], json!("handoff_blocked"));
+    assert_eq!(
+        acp_blocked_pref["result"]["structuredContent"]["mode"],
+        json!("handoff_blocked")
+    );
     let _ = daemon
         .handle_request(&json!({
             "jsonrpc": "2.0", "id": 1211, "method": "tools/call",
@@ -1887,7 +2954,10 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
         }))
         .unwrap();
     assert_eq!(app_blocked_gate["result"]["isError"], json!(false));
-    assert_eq!(app_blocked_gate["result"]["structuredContent"]["mode"], json!("handoff_blocked"));
+    assert_eq!(
+        app_blocked_gate["result"]["structuredContent"]["mode"],
+        json!("handoff_blocked")
+    );
 
     match prev_acp {
         Some(v) => env::set_var(ACP_PROXY_ENV, v),
@@ -1922,20 +2992,43 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
         .unwrap();
         conn.execute(
             "INSERT INTO gen_metadata (idx, metadata) VALUES (0, ?1)",
-            params![make_gen_blob("gemini-4-neon-high", "Gemini 4 Neon (High)", 0)],
+            params![make_gen_blob(
+                "gemini-4-neon-high",
+                "Gemini 4 Neon (High)",
+                0
+            )],
         )
         .unwrap();
         // Legacy steps table WITHOUT step_type column -> after_turn_start is None
-        conn.execute("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)", [])
-            .unwrap();
+        conn.execute(
+            "CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)",
+            [],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
-            params![make_step_meta((now - 100.0) as u64, 30_000, 0, 300, "lr1", 0, 0)],
+            params![make_step_meta(
+                (now - 100.0) as u64,
+                30_000,
+                0,
+                300,
+                "lr1",
+                0,
+                0
+            )],
         )
         .unwrap();
         conn.execute(
             "INSERT INTO steps (idx, metadata) VALUES (3, ?1)",
-            params![make_step_meta((now - 80.0) as u64, 35_000, 0, 300, "lr2", 0, 0)],
+            params![make_step_meta(
+                (now - 80.0) as u64,
+                35_000,
+                0,
+                300,
+                "lr2",
+                0,
+                0
+            )],
         )
         .unwrap();
     }
@@ -1958,7 +3051,11 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
     );
     let mut eng_tr = TelemetryEngine::new(
         Some(td_tr.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     // Before transcript.jsonl exists: step 1 is initial turn_start_cold, step 3 cold miss is mid_loop_cold
@@ -1968,7 +3065,12 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
     assert_eq!(s_before.cold_cache_breakdown.turn_start_cold, 1);
 
     // Now write transcript.jsonl with USER_INPUT at step 2 WITHOUT modifying ldb
-    let tdir = td_tr.path().join("brain").join(lcid).join(".system_generated").join("logs");
+    let tdir = td_tr
+        .path()
+        .join("brain")
+        .join(lcid)
+        .join(".system_generated")
+        .join("logs");
     fs::create_dir_all(&tdir).unwrap();
     fs::write(
         tdir.join("transcript.jsonl"),
@@ -1984,4 +3086,234 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
         "MetricsCacheKey must invalidate when transcript.jsonl changes for legacy DBs"
     );
     assert_eq!(s_after.cold_cache_breakdown.mid_loop_cold, 0);
+}
+
+#[test]
+fn test_summary_and_turn_read_errors_fail_closed_and_manual_claim_checks_subagents() {
+    let td = TempDir::new().unwrap();
+    let root = td.path();
+    let main_cid = "e1000000-0000-0000-0000-000000000001";
+    let sub_cid = "e1000000-0000-0000-0000-000000000002";
+    let now = 1_795_600_000.0;
+
+    // 1. Set up main conversation + active subagent in conversation_summaries.db
+    let main_db = root.join("conversations").join(format!("{main_cid}.db"));
+    let sub_db = root.join("conversations").join(format!("{sub_cid}.db"));
+    create_conv_db(
+        &main_db,
+        &[(
+            1,
+            15,
+            Some(make_step_meta(
+                now as u64 - 10,
+                10_000,
+                300_000,
+                400,
+                "m1",
+                0,
+                0,
+            )),
+        )],
+        "gemini-3-pro",
+        "Gemini 3 Pro (High)",
+    );
+    create_conv_db(
+        &sub_db,
+        &[(
+            1,
+            15,
+            Some(make_step_meta(
+                now as u64 - 5,
+                5_000,
+                20_000,
+                200,
+                "s1",
+                0,
+                0,
+            )),
+        )],
+        "gemini-3-pro",
+        "Gemini 3 Pro (High)",
+    );
+
+    let sum_db = root.join("conversation_summaries.db");
+    {
+        let conn = Connection::open(&sum_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE raw_summaries (
+                conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT, workspace_uris TEXT,
+                status TEXT, agent_name TEXT, parent_conversation_id TEXT, nesting_depth INTEGER,
+                not_fully_idle INTEGER, killed INTEGER, last_modified_time TEXT, last_user_input_step_index INTEGER,
+                bad INTEGER DEFAULT 0
+            );
+            CREATE VIEW conversation_summaries AS
+            SELECT conversation_id,
+                CASE WHEN bad = 1 THEN json_extract('malformed', '$') ELSE title END AS title,
+                preview, workspace_uris, status, agent_name, parent_conversation_id,
+                nesting_depth, not_fully_idle, killed, last_modified_time, last_user_input_step_index
+            FROM raw_summaries;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_summaries VALUES (?1,'Main','','[\"file:///ws/a\"]','CASCADE_RUN_STATUS_RUNNING','','',0,1,0,?2,0,0)",
+            params![main_cid, iso(now - 5.0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO raw_summaries VALUES (?1,'Sub','','[\"file:///ws/a\"]','CASCADE_RUN_STATUS_RUNNING','worker-1',?2,1,1,0,?3,0,0)",
+            params![sub_cid, main_cid, iso(now - 2.0)],
+        )
+        .unwrap();
+    }
+
+    let eng = TelemetryEngine::new(
+        Some(root.to_path_buf()),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
+        Some(None),
+    );
+    let gstore = RelayGrantStore::new(root.join("relay_grants.json"));
+    let mut daemon = McpDaemon::new(Some(eng), Some(gstore), None);
+    daemon
+        .engine
+        .set_preferred_workspace(Some("/ws/a".into()), true);
+    daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": { "extensions": {
+                    "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] }
+                } }
+            }
+        }))
+        .unwrap();
+
+    let grant = daemon
+        .grants
+        .create_grant_scoped(
+            "Keep state",
+            "Resume",
+            true,
+            main_cid,
+            "/ws/a",
+            &["/ws/a".into()],
+            1,
+            0,
+            "handoff",
+            "",
+            "Main",
+            Lang::En,
+        )
+        .unwrap();
+
+    // 2. Default "manual" claim_mode MUST enforce running_subagent_count check!
+    let manual_blocked = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {
+                "name": "context_radar_ui_action",
+                "arguments": {
+                    "action": "claim_grant",
+                    "grant_id": grant.grant_id,
+                    "conversation_id": main_cid,
+                    "claim_mode": "manual"
+                }
+            }
+        }))
+        .unwrap();
+    assert_eq!(
+        manual_blocked["result"]["structuredContent"]["claimed"],
+        json!(false)
+    );
+    assert_eq!(
+        manual_blocked["result"]["structuredContent"]["reason"],
+        json!("running_subagents_active")
+    );
+
+    // 3. Inject summary query error: try_read_summaries fails, does NOT advance DB stamp,
+    //    preserves prior display cache, AND claim_grant fails closed with telemetry_read_error!
+    thread::sleep(Duration::from_millis(20));
+    {
+        let conn = Connection::open(&sum_db).unwrap();
+        conn.execute(
+            "UPDATE raw_summaries SET bad = 1 WHERE conversation_id = ?1",
+            params![sub_cid],
+        )
+        .unwrap();
+    }
+    assert!(daemon.engine.ledger.try_read_summaries().is_err());
+    assert!(
+        daemon.engine.ledger.read_summaries().contains_key(sub_cid),
+        "display fallback must retain prior cached summaries without advancing stamp"
+    );
+    let claim_on_sum_err = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {
+                "name": "context_radar_ui_action",
+                "arguments": {
+                    "action": "claim_grant",
+                    "grant_id": grant.grant_id,
+                    "conversation_id": main_cid,
+                    "claim_mode": "manual_handoff"
+                }
+            }
+        }))
+        .unwrap();
+    assert_eq!(
+        claim_on_sum_err["result"]["structuredContent"]["claimed"],
+        json!(false)
+    );
+    assert_eq!(
+        claim_on_sum_err["result"]["structuredContent"]["reason"],
+        json!("telemetry_read_error")
+    );
+
+    // Recover summaries DB (and mark subagent idle): cached stamp was NOT advanced, so recovery is seen immediately!
+    thread::sleep(Duration::from_millis(20));
+    {
+        let conn = Connection::open(&sum_db).unwrap();
+        conn.execute(
+            "UPDATE raw_summaries SET bad = 0, status = 'CASCADE_RUN_STATUS_IDLE', not_fully_idle = 0 WHERE conversation_id = ?1",
+            params![sub_cid],
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        daemon
+            .engine
+            .try_get_running_subagent_count(main_cid, Some(now))
+            .unwrap(),
+        0
+    );
+
+    // 4. Corrupt main conversation DB: claim_grant must NOT fall back to (0, 0) turns/ckpts -> fails closed!
+    thread::sleep(Duration::from_millis(20));
+    fs::write(&main_db, b"not a valid sqlite database").unwrap();
+    let claim_on_turn_err = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": {
+                "name": "context_radar_ui_action",
+                "arguments": {
+                    "action": "claim_grant",
+                    "grant_id": grant.grant_id,
+                    "conversation_id": main_cid,
+                    "claim_mode": "manual_handoff"
+                }
+            }
+        }))
+        .unwrap();
+    assert_eq!(
+        claim_on_turn_err["result"]["structuredContent"]["claimed"],
+        json!(false)
+    );
+    assert_eq!(
+        claim_on_turn_err["result"]["structuredContent"]["reason"],
+        json!("telemetry_read_error")
+    );
 }

@@ -11,7 +11,7 @@ use context_radar_mcp::engine::telemetry::TelemetryEngine;
 use context_radar_mcp::guard::boot::{evaluate_boot_guard, run_boot_guard_cli};
 use context_radar_mcp::guard::exec_gate::{evaluate_exec_gate, run_exec_gate_cli};
 use context_radar_mcp::rpc::protocol::{run_stdio_daemon, SERVER_NAME, SERVER_VERSION};
-use context_radar_mcp::settings::{default_data_root, SettingsWatcher};
+use context_radar_mcp::settings::{default_data_root, expand_tilde, SettingsWatcher};
 use context_radar_mcp::wire::pb_cursor::{decode_step_metadata, extract_gen_model};
 
 fn print_usage() {
@@ -49,7 +49,11 @@ fn run_bench(args: &[String]) {
     let root = data_root.unwrap_or_else(default_data_root);
     let mut cold_engine = TelemetryEngine::new(
         Some(root.clone()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     let t_cold = Instant::now();
@@ -153,17 +157,20 @@ fn main() {
             while i < args.len() {
                 let arg = args[i].as_str();
                 if arg == "--panel-html" && i + 1 < args.len() {
-                    panel_override = Some(PathBuf::from(&args[i + 1]));
+                    let val = args[i + 1].trim();
+                    if !val.is_empty() {
+                        panel_override = Some(PathBuf::from(expand_tilde(val)));
+                    }
                     i += 2;
                 } else if let Some(val) = arg.strip_prefix("--panel-html=") {
                     if !val.trim().is_empty() {
-                        panel_override = Some(PathBuf::from(val.trim()));
+                        panel_override = Some(PathBuf::from(expand_tilde(val.trim())));
                     }
                     i += 1;
                 } else if (arg == "--data-dir" || arg == "--data_dir") && i + 1 < args.len() {
                     let val = args[i + 1].trim();
                     if !val.is_empty() {
-                        plugin_data_dir = Some(PathBuf::from(val));
+                        plugin_data_dir = Some(PathBuf::from(expand_tilde(val)));
                     }
                     i += 2;
                 } else if let Some(val) = arg
@@ -171,7 +178,7 @@ fn main() {
                     .or_else(|| arg.strip_prefix("--data_dir="))
                 {
                     if !val.trim().is_empty() {
-                        plugin_data_dir = Some(PathBuf::from(val.trim()));
+                        plugin_data_dir = Some(PathBuf::from(expand_tilde(val.trim())));
                     }
                     i += 1;
                 } else {

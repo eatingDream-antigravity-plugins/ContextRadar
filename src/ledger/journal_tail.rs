@@ -119,9 +119,7 @@ fn rfind_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .rposition(|w| w == needle)
+    haystack.windows(needle.len()).rposition(|w| w == needle)
 }
 
 fn find_byte(haystack: &[u8], byte: u8, start: usize) -> Option<usize> {
@@ -351,7 +349,10 @@ fn project_entry(obj: &serde_json::Map<String, Value>) -> Option<JournalEntry> {
         .to_string();
     let content = obj.get("content").and_then(Value::as_str).unwrap_or("");
     let thinking = obj.get("thinking").and_then(Value::as_str).unwrap_or("");
-    let raw_chars = content.chars().count().saturating_add(thinking.chars().count() / 4);
+    let raw_chars = content
+        .chars()
+        .count()
+        .saturating_add(thinking.chars().count() / 4);
     let has_truncated_fields = obj
         .get("truncated_fields")
         .and_then(Value::as_array)
@@ -442,7 +443,10 @@ fn extract_json_int_field(buf: &[u8], key: &[u8]) -> Option<i64> {
     if i == start || (i == start + 1 && buf[start] == b'-') {
         return None;
     }
-    std::str::from_utf8(&buf[start..i]).ok()?.parse::<i64>().ok()
+    std::str::from_utf8(&buf[start..i])
+        .ok()?
+        .parse::<i64>()
+        .ok()
 }
 
 fn extract_json_upper_str_field(buf: &[u8], key: &[u8]) -> Option<String> {

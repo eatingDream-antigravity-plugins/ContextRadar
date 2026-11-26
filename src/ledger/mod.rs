@@ -135,11 +135,7 @@ impl TurnSample {
         }
         let pd = prev.model_display.trim().to_ascii_lowercase();
         let cd = self.model_display.trim().to_ascii_lowercase();
-        !pd.is_empty()
-            && !cd.is_empty()
-            && pd != "未知模型"
-            && cd != "未知模型"
-            && pd != cd
+        !pd.is_empty() && !cd.is_empty() && pd != "未知模型" && cd != "未知模型" && pd != cd
     }
 
     #[inline]

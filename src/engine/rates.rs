@@ -60,112 +60,389 @@ impl RateCard {
     }
 }
 
-fn builtin_rates_table() -> &'static (HashMap<String, RateCard>, Vec<(String, RateCard)>) {
-    static TABLE: OnceLock<(HashMap<String, RateCard>, Vec<(String, RateCard)>)> = OnceLock::new();
+type BuiltinRates = (HashMap<String, RateCard>, Vec<(String, RateCard)>);
+
+fn builtin_rates_table() -> &'static BuiltinRates {
+    static TABLE: OnceLock<BuiltinRates> = OnceLock::new();
     TABLE.get_or_init(|| {
         let entries: Vec<(&str, RateCard)> = vec![
             // Current Antigravity Gemini 4 & Orchestrator families
             (
                 "gemini-4-neon",
-                RateCard::builtin(2.50, 0.25, 2.50, 15.0, DEFAULT_CONTEXT_LIMIT, 200_000, 5.0, 0.50, 5.0, 22.5),
+                RateCard::builtin(
+                    2.50,
+                    0.25,
+                    2.50,
+                    15.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    5.0,
+                    0.50,
+                    5.0,
+                    22.5,
+                ),
             ),
             (
                 "gemini-4-carbon",
-                RateCard::builtin(1.50, 0.15, 1.50, 10.0, DEFAULT_CONTEXT_LIMIT, 200_000, 3.0, 0.30, 3.0, 15.0),
+                RateCard::builtin(
+                    1.50,
+                    0.15,
+                    1.50,
+                    10.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    3.0,
+                    0.30,
+                    3.0,
+                    15.0,
+                ),
             ),
             (
                 "gemini-4-argon",
-                RateCard::builtin(1.50, 0.15, 1.50, 10.0, DEFAULT_CONTEXT_LIMIT, 200_000, 3.0, 0.30, 3.0, 15.0),
+                RateCard::builtin(
+                    1.50,
+                    0.15,
+                    1.50,
+                    10.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    3.0,
+                    0.30,
+                    3.0,
+                    15.0,
+                ),
             ),
             (
                 "gemini-4-hydrogen",
-                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 200_000, 1.0, 0.10, 1.0, 6.0),
+                RateCard::builtin(
+                    0.50,
+                    0.05,
+                    0.50,
+                    3.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    1.0,
+                    0.10,
+                    1.0,
+                    6.0,
+                ),
             ),
             (
                 "gemini-4-pro",
-                RateCard::builtin(2.50, 0.25, 2.50, 15.0, DEFAULT_CONTEXT_LIMIT, 200_000, 5.0, 0.50, 5.0, 22.5),
+                RateCard::builtin(
+                    2.50,
+                    0.25,
+                    2.50,
+                    15.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    5.0,
+                    0.50,
+                    5.0,
+                    22.5,
+                ),
             ),
             (
                 "gemini-4-flash-lite",
-                RateCard::builtin(0.15, 0.015, 0.15, 0.60, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.15,
+                    0.015,
+                    0.15,
+                    0.60,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gemini-4-flash",
-                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 200_000, 1.0, 0.10, 1.0, 6.0),
+                RateCard::builtin(
+                    0.50,
+                    0.05,
+                    0.50,
+                    3.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    1.0,
+                    0.10,
+                    1.0,
+                    6.0,
+                ),
             ),
             (
                 "gemini-pro-orchestrator-neon",
-                RateCard::builtin(2.50, 0.25, 2.50, 15.0, DEFAULT_CONTEXT_LIMIT, 200_000, 5.0, 0.50, 5.0, 22.5),
+                RateCard::builtin(
+                    2.50,
+                    0.25,
+                    2.50,
+                    15.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    5.0,
+                    0.50,
+                    5.0,
+                    22.5,
+                ),
             ),
             (
                 "gemini-pro-orchestrator",
-                RateCard::builtin(1.50, 0.15, 1.50, 10.0, DEFAULT_CONTEXT_LIMIT, 200_000, 3.0, 0.30, 3.0, 15.0),
+                RateCard::builtin(
+                    1.50,
+                    0.15,
+                    1.50,
+                    10.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    3.0,
+                    0.30,
+                    3.0,
+                    15.0,
+                ),
             ),
             // Gemini 3.x & 2.5 families
             (
                 "gemini-3.8-pro",
-                RateCard::builtin(2.0, 0.20, 2.0, 12.0, DEFAULT_CONTEXT_LIMIT, 200_000, 4.0, 0.40, 4.0, 18.0),
+                RateCard::builtin(
+                    2.0,
+                    0.20,
+                    2.0,
+                    12.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    4.0,
+                    0.40,
+                    4.0,
+                    18.0,
+                ),
             ),
             (
                 "gemini-3.8-flash",
-                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.50,
+                    0.05,
+                    0.50,
+                    3.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gemini-3.5-pro",
-                RateCard::builtin(2.0, 0.20, 2.0, 12.0, DEFAULT_CONTEXT_LIMIT, 200_000, 4.0, 0.40, 4.0, 18.0),
+                RateCard::builtin(
+                    2.0,
+                    0.20,
+                    2.0,
+                    12.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    4.0,
+                    0.40,
+                    4.0,
+                    18.0,
+                ),
             ),
             (
                 "gemini-3.5-flash",
-                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.50,
+                    0.05,
+                    0.50,
+                    3.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gemini-3.1-pro",
-                RateCard::builtin(2.0, 0.20, 2.0, 12.0, DEFAULT_CONTEXT_LIMIT, 200_000, 4.0, 0.40, 4.0, 18.0),
+                RateCard::builtin(
+                    2.0,
+                    0.20,
+                    2.0,
+                    12.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    4.0,
+                    0.40,
+                    4.0,
+                    18.0,
+                ),
             ),
             (
                 "gemini-3.1-flash",
-                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.50,
+                    0.05,
+                    0.50,
+                    3.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gemini-3-pro",
-                RateCard::builtin(2.0, 0.20, 2.0, 12.0, DEFAULT_CONTEXT_LIMIT, 200_000, 4.0, 0.40, 4.0, 18.0),
+                RateCard::builtin(
+                    2.0,
+                    0.20,
+                    2.0,
+                    12.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    4.0,
+                    0.40,
+                    4.0,
+                    18.0,
+                ),
             ),
             (
                 "gemini-3-flash-lite",
-                RateCard::builtin(0.15, 0.015, 0.15, 0.60, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.15,
+                    0.015,
+                    0.15,
+                    0.60,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gemini-3-flash",
-                RateCard::builtin(0.50, 0.05, 0.50, 3.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.50,
+                    0.05,
+                    0.50,
+                    3.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gemini-2.5-pro",
-                RateCard::builtin(1.25, 0.125, 1.25, 10.0, DEFAULT_CONTEXT_LIMIT, 200_000, 2.5, 0.25, 2.5, 15.0),
+                RateCard::builtin(
+                    1.25,
+                    0.125,
+                    1.25,
+                    10.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    200_000,
+                    2.5,
+                    0.25,
+                    2.5,
+                    15.0,
+                ),
             ),
             (
                 "gemini-2.5-flash-lite",
-                RateCard::builtin(0.10, 0.01, 0.10, 0.40, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.10,
+                    0.01,
+                    0.10,
+                    0.40,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gemini-2.5-flash",
-                RateCard::builtin(0.30, 0.03, 0.30, 2.50, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.30,
+                    0.03,
+                    0.30,
+                    2.50,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             // Anthropic Claude 4 / 4.5 / 4.6 / 5.x / 3.7 / 3.5 families
             (
                 "claude-opus-5-5",
-                RateCard::builtin(5.0, 0.50, 6.25, 25.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    5.0,
+                    0.50,
+                    6.25,
+                    25.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-opus-5",
-                RateCard::builtin(5.0, 0.50, 6.25, 25.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    5.0,
+                    0.50,
+                    6.25,
+                    25.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-opus-4-6",
-                RateCard::builtin(5.0, 0.50, 6.25, 25.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    5.0,
+                    0.50,
+                    6.25,
+                    25.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-opus-4-5",
-                RateCard::builtin(5.0, 0.50, 6.25, 25.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    5.0,
+                    0.50,
+                    6.25,
+                    25.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-opus-4",
@@ -173,19 +450,63 @@ fn builtin_rates_table() -> &'static (HashMap<String, RateCard>, Vec<(String, Ra
             ),
             (
                 "claude-sonnet-5-5",
-                RateCard::builtin(3.0, 0.30, 3.75, 15.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    3.0,
+                    0.30,
+                    3.75,
+                    15.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-sonnet-5",
-                RateCard::builtin(3.0, 0.30, 3.75, 15.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    3.0,
+                    0.30,
+                    3.75,
+                    15.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-sonnet-4-6",
-                RateCard::builtin(3.0, 0.30, 3.75, 15.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    3.0,
+                    0.30,
+                    3.75,
+                    15.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-sonnet-4-5",
-                RateCard::builtin(3.0, 0.30, 3.75, 15.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    3.0,
+                    0.30,
+                    3.75,
+                    15.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-sonnet-4",
@@ -201,11 +522,33 @@ fn builtin_rates_table() -> &'static (HashMap<String, RateCard>, Vec<(String, Ra
             ),
             (
                 "claude-haiku-4-6",
-                RateCard::builtin(1.0, 0.10, 1.25, 5.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    1.0,
+                    0.10,
+                    1.25,
+                    5.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-haiku-4-5",
-                RateCard::builtin(1.0, 0.10, 1.25, 5.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    1.0,
+                    0.10,
+                    1.25,
+                    5.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "claude-haiku-4",
@@ -218,31 +561,108 @@ fn builtin_rates_table() -> &'static (HashMap<String, RateCard>, Vec<(String, Ra
             // OpenAI GPT-5 / GPT-OSS / GPT-4.1 / o3 / o4 families
             (
                 "gpt-5-pro",
-                RateCard::builtin(15.0, 1.50, 15.0, 120.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    15.0,
+                    1.50,
+                    15.0,
+                    120.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gpt-5-mini",
-                RateCard::builtin(0.25, 0.025, 0.25, 2.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.25,
+                    0.025,
+                    0.25,
+                    2.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gpt-5-nano",
-                RateCard::builtin(0.05, 0.005, 0.05, 0.40, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.05,
+                    0.005,
+                    0.05,
+                    0.40,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gpt-5",
-                RateCard::builtin(1.25, 0.125, 1.25, 10.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    1.25,
+                    0.125,
+                    1.25,
+                    10.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gpt-oss",
-                RateCard::builtin(0.15, 0.03, 0.15, 0.60, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.15,
+                    0.03,
+                    0.15,
+                    0.60,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gpt-4.1-mini",
-                RateCard::builtin(0.40, 0.10, 0.40, 1.60, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    0.40,
+                    0.10,
+                    0.40,
+                    1.60,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gpt-4.1",
-                RateCard::builtin(2.0, 0.50, 2.0, 8.0, DEFAULT_CONTEXT_LIMIT, 0, 0.0, 0.0, 0.0, 0.0),
+                RateCard::builtin(
+                    2.0,
+                    0.50,
+                    2.0,
+                    8.0,
+                    DEFAULT_CONTEXT_LIMIT,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ),
             ),
             (
                 "gpt-4o",
@@ -284,13 +704,47 @@ fn builtin_rates_table() -> &'static (HashMap<String, RateCard>, Vec<(String, Ra
 fn family_fallback_rate(cands: &[String], default_limit: u64) -> Option<RateCard> {
     for cand in cands {
         if cand.starts_with("gemini-4") {
-            let mut card = if cand.contains("hydrogen") || cand.contains("flash") || cand.contains("lite") {
-                RateCard::builtin(0.50, 0.05, 0.50, 3.0, default_limit, 200_000, 1.0, 0.10, 1.0, 6.0)
-            } else if cand.contains("neon") || cand.contains("pro") || cand.contains("ultra") {
-                RateCard::builtin(2.50, 0.25, 2.50, 15.0, default_limit, 200_000, 5.0, 0.50, 5.0, 22.5)
-            } else {
-                RateCard::builtin(1.50, 0.15, 1.50, 10.0, default_limit, 200_000, 3.0, 0.30, 3.0, 15.0)
-            };
+            let mut card =
+                if cand.contains("hydrogen") || cand.contains("flash") || cand.contains("lite") {
+                    RateCard::builtin(
+                        0.50,
+                        0.05,
+                        0.50,
+                        3.0,
+                        default_limit,
+                        200_000,
+                        1.0,
+                        0.10,
+                        1.0,
+                        6.0,
+                    )
+                } else if cand.contains("neon") || cand.contains("pro") || cand.contains("ultra") {
+                    RateCard::builtin(
+                        2.50,
+                        0.25,
+                        2.50,
+                        15.0,
+                        default_limit,
+                        200_000,
+                        5.0,
+                        0.50,
+                        5.0,
+                        22.5,
+                    )
+                } else {
+                    RateCard::builtin(
+                        1.50,
+                        0.15,
+                        1.50,
+                        10.0,
+                        default_limit,
+                        200_000,
+                        3.0,
+                        0.30,
+                        3.0,
+                        15.0,
+                    )
+                };
             card.source = "builtin-family".to_string();
             return Some(card);
         }
@@ -298,7 +752,18 @@ fn family_fallback_rate(cands: &[String], default_limit: u64) -> Option<RateCard
             let mut card = if cand.contains("flash") || cand.contains("lite") {
                 RateCard::builtin(0.50, 0.05, 0.50, 3.0, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
             } else {
-                RateCard::builtin(2.0, 0.20, 2.0, 12.0, default_limit, 200_000, 4.0, 0.40, 4.0, 18.0)
+                RateCard::builtin(
+                    2.0,
+                    0.20,
+                    2.0,
+                    12.0,
+                    default_limit,
+                    200_000,
+                    4.0,
+                    0.40,
+                    4.0,
+                    18.0,
+                )
             };
             card.source = "builtin-family".to_string();
             return Some(card);
@@ -316,11 +781,33 @@ fn family_fallback_rate(cands: &[String], default_limit: u64) -> Option<RateCard
         }
         if cand.starts_with("gpt-5") {
             let mut card = if cand.contains("nano") {
-                RateCard::builtin(0.05, 0.005, 0.05, 0.40, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
+                RateCard::builtin(
+                    0.05,
+                    0.005,
+                    0.05,
+                    0.40,
+                    default_limit,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
             } else if cand.contains("mini") {
                 RateCard::builtin(0.25, 0.025, 0.25, 2.0, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
             } else {
-                RateCard::builtin(1.25, 0.125, 1.25, 10.0, default_limit, 0, 0.0, 0.0, 0.0, 0.0)
+                RateCard::builtin(
+                    1.25,
+                    0.125,
+                    1.25,
+                    10.0,
+                    default_limit,
+                    0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                )
             };
             card.source = "builtin-family".to_string();
             return Some(card);
@@ -365,10 +852,18 @@ fn match_override(rule: &RateOverrideRule, m: &str, combined: &str) -> bool {
     if rule.match_exact.iter().any(|ex| m == ex) {
         return true;
     }
-    if rule.match_prefix.iter().any(|pre| m.starts_with(pre.as_str())) {
+    if rule
+        .match_prefix
+        .iter()
+        .any(|pre| m.starts_with(pre.as_str()))
+    {
         return true;
     }
-    if rule.match_contains.iter().any(|sub| combined.contains(sub.as_str())) {
+    if rule
+        .match_contains
+        .iter()
+        .any(|sub| combined.contains(sub.as_str()))
+    {
         return true;
     }
     false
@@ -429,8 +924,14 @@ fn parse_external_model_entry(
     let cost = info.get("cost")?.as_object()?;
     let in_p = cost.get("input").and_then(Value::as_f64).unwrap_or(0.0);
     let out_p = cost.get("output").and_then(Value::as_f64).unwrap_or(0.0);
-    let cr_p = cost.get("cache_read").and_then(Value::as_f64).unwrap_or(in_p * 0.1);
-    let cw_p = cost.get("cache_write").and_then(Value::as_f64).unwrap_or(in_p);
+    let cr_p = cost
+        .get("cache_read")
+        .and_then(Value::as_f64)
+        .unwrap_or(in_p * 0.1);
+    let cw_p = cost
+        .get("cache_write")
+        .and_then(Value::as_f64)
+        .unwrap_or(in_p);
     if in_p <= 0.0 && out_p <= 0.0 {
         return None;
     }
@@ -453,8 +954,14 @@ fn parse_external_model_entry(
                     if let Some(sz) = tmeta.get("size").and_then(Value::as_u64) {
                         tier_threshold = sz;
                         t_in = first.get("input").and_then(Value::as_f64).unwrap_or(in_p);
-                        t_cr = first.get("cache_read").and_then(Value::as_f64).unwrap_or(cr_p);
-                        t_cw = first.get("cache_write").and_then(Value::as_f64).unwrap_or(t_in);
+                        t_cr = first
+                            .get("cache_read")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(cr_p);
+                        t_cw = first
+                            .get("cache_write")
+                            .and_then(Value::as_f64)
+                            .unwrap_or(t_in);
                         t_out = first.get("output").and_then(Value::as_f64).unwrap_or(out_p);
                     }
                 }
@@ -695,10 +1202,14 @@ impl RateTable {
                 continue;
             };
             for (mid, minfo) in models {
-                let Some(mo) = minfo.as_object() else { continue };
-                if let Some(card) =
-                    parse_external_model_entry(mo, format!("external:{prov}"), cfg.context.default_limit)
-                {
+                let Some(mo) = minfo.as_object() else {
+                    continue;
+                };
+                if let Some(card) = parse_external_model_entry(
+                    mo,
+                    format!("external:{prov}"),
+                    cfg.context.default_limit,
+                ) {
                     parsed.insert(mid.to_ascii_lowercase(), card);
                 }
             }
@@ -891,9 +1402,19 @@ impl RateTable {
             .saturating_add(cache_read)
             .saturating_add(cache_write);
         let (in_p, cr_p, cw_p, out_p) = if p.tier_threshold > 0 && total_prompt > p.tier_threshold {
-            (p.tier_input, p.tier_cache_read, p.tier_cache_write, p.tier_output)
+            (
+                p.tier_input,
+                p.tier_cache_read,
+                p.tier_cache_write,
+                p.tier_output,
+            )
         } else {
-            (p.input_per_m, p.cache_read_per_m, p.cache_write_per_m, p.output_per_m)
+            (
+                p.input_per_m,
+                p.cache_read_per_m,
+                p.cache_write_per_m,
+                p.output_per_m,
+            )
         };
         ((input_tokens as f64) * in_p
             + (cache_read as f64) * cr_p

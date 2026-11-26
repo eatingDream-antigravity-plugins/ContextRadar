@@ -40,7 +40,7 @@ fn encode_varint(mut val: u64) -> Vec<u8> {
 }
 
 fn pb_varint(field: u32, val: u64) -> Vec<u8> {
-    let mut out = encode_varint(((field as u64) << 3) | 0);
+    let mut out = encode_varint((field as u64) << 3);
     out.extend_from_slice(&encode_varint(val));
     out
 }
@@ -119,11 +119,16 @@ fn make_checkpoint_payload(summary_bytes: usize) -> Vec<u8> {
     pb_bytes(30, &f30)
 }
 
-fn create_rich_conv_db(
-    path: &Path,
-    gens: &[(i64, &str, &str)],
-    steps: &[(i64, i32, i32, Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>)],
-) {
+type RichStep = (
+    i64,
+    i32,
+    i32,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
+fn create_rich_conv_db(path: &Path, gens: &[(i64, &str, &str)], steps: &[RichStep]) {
     if let Some(p) = path.parent() {
         fs::create_dir_all(p).unwrap();
     }
@@ -252,10 +257,22 @@ fn test_pb_rich_step_checkpoint_and_error_decoding() {
     );
     flat_err.extend_from_slice(&pb_bytes(3, b"duplicate message"));
     let summary = extract_error_summary(&flat_err);
-    assert!(summary.contains("HTTP 429 MODEL_CAPACITY_EXHAUSTED"), "got: {summary}");
-    assert!(summary.contains("~/project/src/main.rs"), "path should be redacted: {summary}");
-    assert!(!summary.contains("exampleuser"), "username leaked: {summary}");
-    assert!(!summary.contains("eyJhbGci"), "bearer token leaked: {summary}");
+    assert!(
+        summary.contains("HTTP 429 MODEL_CAPACITY_EXHAUSTED"),
+        "got: {summary}"
+    );
+    assert!(
+        summary.contains("~/project/src/main.rs"),
+        "path should be redacted: {summary}"
+    );
+    assert!(
+        !summary.contains("exampleuser"),
+        "username leaked: {summary}"
+    );
+    assert!(
+        !summary.contains("eyJhbGci"),
+        "bearer token leaked: {summary}"
+    );
     assert!(summary.contains("[REDACTED]"), "got: {summary}");
 
     // Nested protobuf error_details (field 1 -> field 2 -> UTF-8 string)
@@ -269,7 +286,11 @@ fn test_pb_rich_step_checkpoint_and_error_decoding() {
     // Fallback plain UTF-8 multiline + truncation to <= 140 Unicode chars
     let long_utf8 = format!("\n  {}  \nsecond line", "错误详情".repeat(50));
     let trunc = extract_error_summary(long_utf8.as_bytes());
-    assert!(trunc.chars().count() <= 140, "len={}", trunc.chars().count());
+    assert!(
+        trunc.chars().count() <= 140,
+        "len={}",
+        trunc.chars().count()
+    );
     assert!(trunc.ends_with('…'));
 
     // Pure binary garbage returns empty string
@@ -507,16 +528,48 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
     create_summaries_db(
         &td.path().join("conversation_summaries.db"),
         &[
-            (cid_a, "Session A", "file:///ws/app", "CASCADE_RUN_STATUS_RUNNING", 1, iso(now_ts)),
-            (cid_b, "Session B", "file:///ws/app", "CASCADE_RUN_STATUS_RUNNING", 1, iso(now_ts - 5.0)),
-            (cid_c, "Session C", "file:///ws/app", "CASCADE_RUN_STATUS_IDLE", 0, iso(now_ts - 10.0)),
-            (cid_d, "Session D", "file:///ws/app", "CASCADE_RUN_STATUS_IDLE", 0, iso(now_ts - 15.0)),
+            (
+                cid_a,
+                "Session A",
+                "file:///ws/app",
+                "CASCADE_RUN_STATUS_RUNNING",
+                1,
+                iso(now_ts),
+            ),
+            (
+                cid_b,
+                "Session B",
+                "file:///ws/app",
+                "CASCADE_RUN_STATUS_RUNNING",
+                1,
+                iso(now_ts - 5.0),
+            ),
+            (
+                cid_c,
+                "Session C",
+                "file:///ws/app",
+                "CASCADE_RUN_STATUS_IDLE",
+                0,
+                iso(now_ts - 10.0),
+            ),
+            (
+                cid_d,
+                "Session D",
+                "file:///ws/app",
+                "CASCADE_RUN_STATUS_IDLE",
+                0,
+                iso(now_ts - 15.0),
+            ),
         ],
     );
 
     let mut engine = TelemetryEngine::new(
         Some(td.path().to_path_buf()),
-        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some("none".into())),
+            None,
+            None,
+        )),
         Some(None),
     );
     let snap = engine.build_overview_snapshot(25, false, false, "", Some(now_ts));
@@ -578,18 +631,33 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
 
     // Check bilingual summarize_snapshot_text (EN & zh-CN)
     let en_txt = summarize_snapshot_text(&snap);
-    assert!(en_txt.contains("1 compacting") && en_txt.contains("1 error"), "en: {en_txt}");
-    assert!(en_txt.contains("[compacting 10s·cross-model]"), "en: {en_txt}");
-    assert!(en_txt.contains("[error: Rate limit exceeded (429)]"), "en: {en_txt}");
+    assert!(
+        en_txt.contains("1 compacting") && en_txt.contains("1 error"),
+        "en: {en_txt}"
+    );
+    assert!(
+        en_txt.contains("[compacting 10s·cross-model]"),
+        "en: {en_txt}"
+    );
+    assert!(
+        en_txt.contains("[error: Rate limit exceeded (429)]"),
+        "en: {en_txt}"
+    );
     assert!(en_txt.contains("think 70%"), "en: {en_txt}");
     assert!(en_txt.contains("left)"), "en: {en_txt}");
 
     let mut zh_snap = snap.clone();
     zh_snap.lang = "zh-CN".to_string();
     let zh_txt = summarize_snapshot_text(&zh_snap);
-    assert!(zh_txt.contains("压缩中 1 个") && zh_txt.contains("异常 1 个"), "zh: {zh_txt}");
+    assert!(
+        zh_txt.contains("压缩中 1 个") && zh_txt.contains("异常 1 个"),
+        "zh: {zh_txt}"
+    );
     assert!(zh_txt.contains("[压缩中 10s·跨模型]"), "zh: {zh_txt}");
-    assert!(zh_txt.contains("[异常: Rate limit exceeded (429)]"), "zh: {zh_txt}");
+    assert!(
+        zh_txt.contains("[异常: Rate limit exceeded (429)]"),
+        "zh: {zh_txt}"
+    );
     assert!(zh_txt.contains("思考 70%"), "zh: {zh_txt}");
     assert!(zh_txt.contains("余 "), "zh: {zh_txt}");
 
@@ -644,8 +712,8 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
 }
 
 #[test]
-fn test_schema_v1_to_v2_index_cache_migration_and_mcp_json_contract() {
-    assert_eq!(INDEX_SCHEMA_VERSION, 2);
+fn test_old_index_cache_versions_are_rebuilt_and_preserve_mcp_json_contract() {
+    assert_eq!(INDEX_SCHEMA_VERSION, 3);
 
     let td = TempDir::new().unwrap();
     let conv_dir = td.path().join("conversations");
@@ -682,10 +750,17 @@ fn test_schema_v1_to_v2_index_cache_migration_and_mcp_json_contract() {
     );
     create_summaries_db(
         &td.path().join("conversation_summaries.db"),
-        &[(cid, "Migrate Chat", "file:///ws/mig", "CASCADE_RUN_STATUS_IDLE", 0, iso(now_ts))],
+        &[(
+            cid,
+            "Migrate Chat",
+            "file:///ws/mig",
+            "CASCADE_RUN_STATUS_IDLE",
+            0,
+            iso(now_ts),
+        )],
     );
 
-    // Seed a schema v1 cache entry with matching dev/ino/sig but zero thinking_tokens
+    // Seed an older cache entry with a matching stamp and a cursor beyond its cached rows.
     let cache_path = td.path().join("plugin_data").join("index_cache.sqlite");
     fs::create_dir_all(cache_path.parent().unwrap()).unwrap();
     let stamp = stat_db_stamp(&db_path).unwrap();
@@ -714,24 +789,7 @@ fn test_schema_v1_to_v2_index_cache_migration_and_mcp_json_contract() {
             "last_known_model": ["gemini-4-neon-high", "Gemini 4 Neon (High)"],
             "saw_ckpt_boundary": false,
             "saw_turn_start": false,
-            "turns": [{
-                "turn_index": 1,
-                "step_idx": 2,
-                "timestamp": 1750000900.0,
-                "model": "gemini-4-neon-high",
-                "model_display": "Gemini 4 Neon (High)",
-                "input_tokens": 10000,
-                "cache_read": 50000,
-                "cache_write": 0,
-                "output_tokens": 1000,
-                "ttft_ms": 1000,
-                "total_ms": 5000,
-                "response_id": "rmig",
-                "step_type": 15,
-                "is_checkpoint": false,
-                "after_turn_start": true,
-                "after_checkpoint": false
-            }]
+            "turns": []
         });
         let raw = serde_json::to_vec(&stale_payload).unwrap();
         let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
@@ -753,12 +811,21 @@ fn test_schema_v1_to_v2_index_cache_migration_and_mcp_json_contract() {
         .unwrap();
     }
 
-    // Direct v1 load must miss cleanly
     let mut cache_check = IndexDbCache::new(cache_path.clone());
     assert!(cache_check.load(cid, stamp.dev, stamp.ino).is_none());
     cache_check.close();
+    {
+        let conn = Connection::open(&cache_path).unwrap();
+        conn.execute(
+            "UPDATE ledger_index_cache SET schema_ver = 2 WHERE cid = ?1",
+            params![cid],
+        )
+        .unwrap();
+    }
+    assert!(cache_check.load(cid, stamp.dev, stamp.ino).is_none());
+    cache_check.close();
 
-    // LedgerReader re-parses and upgrades cache row to v2 with thinking/response split!
+    // Rebuild even when the old row has a matching stamp and a decodable payload.
     let mut reader = LedgerReader::new(td.path().to_path_buf(), Some(cache_path.clone()));
     let (turns, _) = reader.read_turns_and_probe(cid, Some(&stamp));
     assert_eq!(turns.len(), 1);
@@ -774,7 +841,7 @@ fn test_schema_v1_to_v2_index_cache_migration_and_mcp_json_contract() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(ver, 2);
+    assert_eq!(ver, INDEX_SCHEMA_VERSION);
 
     // Verify full MCP daemon JSON contract for both overview and turns tools
     let cfg_path = td.path().join("settings.json");
@@ -824,7 +891,10 @@ fn test_schema_v1_to_v2_index_cache_migration_and_mcp_json_contract() {
     ] {
         assert!(sess.get(key).is_some(), "missing session JSON field: {key}");
     }
-    assert!(sess.get("live_error").is_none(), "empty live_error should be omitted");
+    assert!(
+        sess.get("live_error").is_none(),
+        "empty live_error should be omitted"
+    );
 
     let turns_resp = daemon
         .handle_request(&json!({
@@ -835,7 +905,10 @@ fn test_schema_v1_to_v2_index_cache_migration_and_mcp_json_contract() {
         }))
         .unwrap();
     let t_text = turns_resp["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(t_text.contains("left") && t_text.contains("think 75%"), "got: {t_text}");
+    assert!(
+        t_text.contains("left") && t_text.contains("think 75%"),
+        "got: {t_text}"
+    );
     let t0 = &turns_resp["result"]["structuredContent"]["turns"][0];
     assert_eq!(t0["thinking_tokens"], 750);
     assert_eq!(t0["response_tokens"], 250);
@@ -868,8 +941,16 @@ fn test_stream_tps_accounts_for_thinking_time_inside_ttft() {
         after_checkpoint: false,
     };
     // Must compute 31 / 0.109 = 284.4 t/s, NOT 226 / 0.109 = 2073.4 t/s
-    assert!((reasoning.stream_tps() - 284.4).abs() < 0.2, "got {}", reasoning.stream_tps());
-    assert!((reasoning.e2e_tps() - 33.86).abs() < 0.1, "got {}", reasoning.e2e_tps());
+    assert!(
+        (reasoning.stream_tps() - 284.4).abs() < 0.2,
+        "got {}",
+        reasoning.stream_tps()
+    );
+    assert!(
+        (reasoning.e2e_tps() - 33.86).abs() < 0.1,
+        "got {}",
+        reasoning.e2e_tps()
+    );
 
     // 2) Pure thinking turn (0 response tokens) falls back to E2E throughput
     let pure_think = TurnSample {
@@ -880,7 +961,11 @@ fn test_stream_tps_accounts_for_thinking_time_inside_ttft() {
         total_ms: 7000,
         ..reasoning.clone()
     };
-    assert!((pure_think.stream_tps() - 100.0).abs() < 0.1, "got {}", pure_think.stream_tps());
+    assert!(
+        (pure_think.stream_tps() - 100.0).abs() < 0.1,
+        "got {}",
+        pure_think.stream_tps()
+    );
 
     // 3) Legacy non-thinking turn uses full output_tokens / (total_ms - ttft_ms)
     let legacy = TurnSample {
@@ -891,5 +976,9 @@ fn test_stream_tps_accounts_for_thinking_time_inside_ttft() {
         total_ms: 4000,
         ..reasoning
     };
-    assert!((legacy.stream_tps() - 200.0).abs() < 0.1, "got {}", legacy.stream_tps());
+    assert!(
+        (legacy.stream_tps() - 200.0).abs() < 0.1,
+        "got {}",
+        legacy.stream_tps()
+    );
 }
