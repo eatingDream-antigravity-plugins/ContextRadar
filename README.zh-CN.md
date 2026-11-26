@@ -1,18 +1,18 @@
 <div align="center">
-<img src="assets/logo.svg" alt="Context Radar MCP" width="76" height="76">
+<img src="assets/logo.svg" alt="ContextRadar" width="76" height="76">
 
-# Context Radar MCP
+# ContextRadar (context-radar-mcp)
 
 **看清 Antigravity 上下文到底占了多少、为什么突然变慢，以及什么时候才真正值得 `/compact` 或开新对话。**
 
-[English](README.md) · 简体中文 · [Releases](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases) · [AI 指南](docs/ai-guide.md) · [llms.txt](llms.txt)
+[主页](https://contextradar.eatingdream.dev) · [English](README.md) · 简体中文 · [Releases](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases) · [AI 指南](docs/ai-guide.md) · [llms.txt](llms.txt)
 
 [![CI](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml)
 [![Release](assets/release-badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-<img src="docs/social-preview.png" alt="Context Radar MCP 面板预览" width="840">
+<img src="docs/social-preview.png" alt="ContextRadar 面板预览" width="840">
 </div>
 
 ## 它是什么
@@ -37,7 +37,7 @@
 curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar-mcp/main/scripts/install.sh | sh
 ```
 
-重载 Antigravity 后在侧边栏打开 **Context Radar**，或直接问 Agent：*"刚才几轮怎么突然变慢了？"*、*"现在适合 `/compact` 吗？"*。
+重载 Antigravity 后在侧边栏打开 **ContextRadar**，或直接问 Agent：*"刚才几轮怎么突然变慢了？"*、*"现在适合 `/compact` 吗？"*。
 
 ## 面向 AI Agent
 
@@ -62,6 +62,10 @@ npx skills add eatingDream-antigravity-plugins/context-radar-mcp
 - [Agent Skill（`SKILL.md`）](skills/context-radar/SKILL.md) — 面向 Agent 的标准工作流说明
 - [LLM 索引（`llms.txt`）](llms.txt) · [协作指南](AGENTS.md) · [配置示例](settings.example.json)
 - [更新日志](CHANGELOG.md) · [安全策略](SECURITY.md) · [贡献指南](CONTRIBUTING.md)
+
+## Antigravity 插件套件
+
+隶属于 [eatingDream Antigravity 插件套件](https://eatingdream.dev)：**ContextRadar**（`context-radar-mcp`）· [ClamGuard](https://github.com/eatingDream-antigravity-plugins/mac-clamshell-mcp)（`mac-clamshell-mcp`）· [RemoteCast](https://github.com/eatingDream-antigravity-plugins/chrome-stream-mcp)（`chrome-stream-mcp`）· [ColabDeck](https://github.com/eatingDream-antigravity-plugins/colab-mcp)（`colab-mcp`），由 [PanelKit](https://github.com/eatingDream-antigravity-plugins/agy-mcp-kit)（`agy-mcp-kit`）统一驱动。
 
 ## 许可证
 
