@@ -723,6 +723,20 @@ impl JournalTailCache {
         }
     }
 
+    /// Return `(dev, ino, mtime_ns, size)` for a conversation's `transcript.jsonl`, or `None` if absent/non-file.
+    pub fn stat_transcript_stamp(data_root: &Path, cid: &str) -> Option<(u64, u64, i128, u64)> {
+        if !is_safe_id(cid) {
+            return None;
+        }
+        let tpath = transcript_path(data_root, cid);
+        let meta = fs::symlink_metadata(&tpath).ok()?;
+        if !meta.file_type().is_file() {
+            return None;
+        }
+        let mtime_ns = (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128);
+        Some((meta.dev(), meta.ino(), mtime_ns, meta.size()))
+    }
+
     /// Return `step_index -> step_type` map using fast header extraction and incremental tailing.
     pub fn get_step_types(&mut self, data_root: &Path, cid: &str) -> HashMap<i64, String> {
         if !is_safe_id(cid) {

@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,12 +13,96 @@ use serde::{Deserialize, Serialize};
 
 use crate::i18n::{parse_lang_tag, resolve_active_lang, Lang};
 use crate::settings::{
-    default_data_root, default_plugin_data_dir, expand_tilde, GRANTS_PATH_ENV,
+    default_data_root, default_plugin_data_dir, expand_tilde, normalize_workspace_uri,
+    ACP_PROXY_ENV, GRANTS_PATH_ENV,
 };
 
 pub const GRANT_TTL_SEC: f64 = 43_200.0;
 pub const GRANT_PRUNE_SEC: f64 = 86_400.0;
 pub const RELAY_DISPLAY_SEC: f64 = 600.0;
+
+#[inline]
+pub fn is_acp_proxy_active() -> bool {
+    env::var(ACP_PROXY_ENV)
+        .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+mod file_lock {
+    use super::*;
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_UN: i32 = 8;
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    const O_NOFOLLOW: i32 = 0x0100;
+    #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "arm")))]
+    const O_NOFOLLOW: i32 = 0o100000;
+    #[cfg(all(
+        target_os = "linux",
+        not(any(target_arch = "aarch64", target_arch = "arm"))
+    ))]
+    const O_NOFOLLOW: i32 = 0o400000;
+
+    extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+
+    pub struct GrantFileLock {
+        file: File,
+    }
+
+    fn lock_path_for(store_path: &Path) -> PathBuf {
+        let mut os = store_path.as_os_str().to_os_string();
+        os.push(".lock");
+        PathBuf::from(os)
+    }
+
+    impl GrantFileLock {
+        pub fn acquire(store_path: &Path) -> io::Result<Self> {
+            if let Some(parent) = store_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                    let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+                }
+            }
+            let lpath = lock_path_for(store_path);
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(O_NOFOLLOW)
+                .open(&lpath)?;
+            loop {
+                let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+                if rc == 0 {
+                    return Ok(Self { file });
+                }
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
+
+    impl Drop for GrantFileLock {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = flock(self.file.as_raw_fd(), LOCK_UN);
+            }
+        }
+    }
+}
 
 pub fn default_grants_path(data_root: Option<&Path>) -> PathBuf {
     default_grants_path_in(None, data_root)
@@ -44,22 +129,9 @@ pub fn default_grants_path_in(
     default_plugin_data_dir(&root).join("relay_grants.json")
 }
 
-fn norm_ws_str(raw: &str) -> String {
-    let t = raw.trim();
-    if t.is_empty() {
-        return String::new();
-    }
-    let stripped = t.strip_prefix("file://").unwrap_or(t);
-    if stripped.len() > 1 {
-        stripped.trim_end_matches('/').to_string()
-    } else {
-        stripped.to_string()
-    }
-}
-
 pub fn paths_overlap(a: &str, b: &str) -> bool {
-    let na = norm_ws_str(a);
-    let nb = norm_ws_str(b);
+    let na = normalize_workspace_uri(a);
+    let nb = normalize_workspace_uri(b);
     if na.is_empty() || nb.is_empty() {
         return false;
     }
@@ -72,7 +144,7 @@ pub fn paths_overlap(a: &str, b: &str) -> bool {
 }
 
 pub fn workspaces_overlap(grant_ws: &str, grant_all: &[String], scope_ws: &str) -> bool {
-    let ns = norm_ws_str(scope_ws);
+    let ns = normalize_workspace_uri(scope_ws);
     if ns.is_empty() {
         return true;
     }
@@ -363,6 +435,8 @@ pub struct RelayGrant {
     pub compact_status: String,
     #[serde(default)]
     pub compact_dispatched_at: f64,
+    #[serde(default)]
+    pub acp_proxy_active: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub running_subagent_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,7 +489,7 @@ pub struct ActionOutcome {
 
 pub struct RelayGrantStore {
     pub path: PathBuf,
-    cache_sig: Option<(i128, u64)>,
+    cache_sig: Option<(u64, u64, i128, u64)>,
     cache_data: Option<StoreFile>,
 }
 
@@ -440,6 +514,8 @@ impl RelayGrantStore {
             return StoreFile::default();
         }
         let sig = (
+            meta.dev(),
+            meta.ino(),
             (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128),
             meta.size(),
         );
@@ -489,6 +565,8 @@ impl RelayGrantStore {
         if write_ok.is_ok() && fs::rename(&tmp_path, &self.path).is_ok() {
             if let Ok(meta) = fs::metadata(&self.path) {
                 let sig = (
+                    meta.dev(),
+                    meta.ino(),
                     (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128),
                     meta.size(),
                 );
@@ -515,6 +593,9 @@ impl RelayGrantStore {
         allow_auto_handoff: Option<bool>,
         lang: Option<&str>,
     ) -> PanelPrefs {
+        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
+            return self.load().settings;
+        };
         let mut data = self.load();
         if let Some(v) = allow_auto_handoff {
             data.settings.allow_auto_handoff = v;
@@ -581,6 +662,7 @@ impl RelayGrantStore {
         lang: Lang,
     ) -> RelayGrant {
         let now = now_sec();
+        let lock = file_lock::GrantFileLock::acquire(&self.path).ok();
         let mut data = self.load();
         data.grants
             .retain(|_, g| (now - g.created_at) <= GRANT_PRUNE_SEC);
@@ -602,10 +684,10 @@ impl RelayGrantStore {
             "handoff".to_string()
         };
 
-        let norm_ws = norm_ws_str(workspace);
+        let norm_ws = normalize_workspace_uri(workspace);
         let norm_all: Vec<String> = workspaces
             .iter()
-            .map(|w| norm_ws_str(w))
+            .map(|w| normalize_workspace_uri(w))
             .filter(|w| !w.is_empty())
             .collect();
 
@@ -633,11 +715,14 @@ impl RelayGrantStore {
             handoff_at: 0.0,
             compact_status: String::new(),
             compact_dispatched_at: 0.0,
+            acp_proxy_active: is_acp_proxy_active(),
             running_subagent_count: None,
             allow_auto_handoff: None,
         };
-        data.grants.insert(grant_id, entry.clone());
-        self.save(&data);
+        if lock.is_some() {
+            data.grants.insert(grant_id, entry.clone());
+            self.save(&data);
+        }
         entry
     }
 
@@ -653,7 +738,9 @@ impl RelayGrantStore {
     ) -> Option<RelayGrant> {
         let ref_now = now_override.unwrap_or_else(now_sec);
         let cid_f = scope_cid.map(str::trim).filter(|s| !s.is_empty());
-        let ws_f = scope_workspace.map(norm_ws_str).filter(|s| !s.is_empty());
+        let ws_f = scope_workspace
+            .map(normalize_workspace_uri)
+            .filter(|s| !s.is_empty());
         let data = self.load();
         let mut cands: Vec<RelayGrant> = data
             .grants
@@ -760,6 +847,19 @@ impl RelayGrantStore {
                 running_subagent_count: None,
             };
         }
+        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
+            return ClaimOutcome {
+                claimed: false,
+                reason: Some("lock_error".into()),
+                grant_id: None,
+                conversation_id: None,
+                workspace: None,
+                compact_command: None,
+                handoff_prompt: None,
+                handoff_conversation_id: None,
+                running_subagent_count: None,
+            };
+        };
         let now = now_sec();
         let mut data = self.load();
         let allow_auto = data.settings.allow_auto_handoff;
@@ -794,7 +894,10 @@ impl RelayGrantStore {
             }
         }
 
-        if let Some(ews) = expected_workspace.map(norm_ws_str).filter(|s| !s.is_empty()) {
+        if let Some(ews) = expected_workspace
+            .map(normalize_workspace_uri)
+            .filter(|s| !s.is_empty())
+        {
             let has_grant_ws = !rec.workspace.is_empty() || !rec.workspaces.is_empty();
             if has_grant_ws && !workspaces_overlap(&rec.workspace, &rec.workspaces, &ews) {
                 return ClaimOutcome {
@@ -931,6 +1034,14 @@ impl RelayGrantStore {
                 handoff_conversation_id: None,
             };
         }
+        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
+            return ActionOutcome {
+                ok: false,
+                reason: Some("lock_error".into()),
+                grant_id: None,
+                handoff_conversation_id: None,
+            };
+        };
         let mut data = self.load();
         let Some(rec) = data.grants.get_mut(grant_id) else {
             return ActionOutcome {
@@ -962,6 +1073,14 @@ impl RelayGrantStore {
                 handoff_conversation_id: None,
             };
         }
+        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
+            return ActionOutcome {
+                ok: false,
+                reason: Some("lock_error".into()),
+                grant_id: None,
+                handoff_conversation_id: None,
+            };
+        };
         let mut data = self.load();
         let Some(rec) = data.grants.get_mut(grant_id) else {
             return ActionOutcome {
@@ -1001,7 +1120,9 @@ impl RelayGrantStore {
             return None;
         }
         let ref_now = now_override.unwrap_or_else(now_sec);
-        let ws_f = workspace.map(norm_ws_str).filter(|s| !s.is_empty());
+        let ws_f = workspace
+            .map(normalize_workspace_uri)
+            .filter(|s| !s.is_empty());
         let data = self.load();
         if require_auto && !data.settings.allow_auto_handoff {
             return None;
@@ -1049,6 +1170,14 @@ impl RelayGrantStore {
                 handoff_conversation_id: None,
             };
         }
+        let Ok(_lock) = file_lock::GrantFileLock::acquire(&self.path) else {
+            return ActionOutcome {
+                ok: false,
+                reason: Some("lock_error".into()),
+                grant_id: None,
+                handoff_conversation_id: None,
+            };
+        };
         let mut data = self.load();
         let Some(rec) = data.grants.get_mut(grant_id) else {
             return ActionOutcome {

@@ -54,6 +54,53 @@ pub fn expand_tilde(raw: &str) -> String {
     trimmed.to_string()
 }
 
+#[inline]
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Canonical workspace URI/path normalizer shared across ledger, grants, and boot guard:
+/// strips `file://`, percent-decodes URI escapes (e.g. `%20`), and trims trailing `/` (preserving `/`).
+pub fn normalize_workspace_uri(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let decoded = if let Some(rest) = trimmed.strip_prefix("file://") {
+        percent_decode(rest)
+    } else {
+        trimmed.to_string()
+    };
+    if decoded.len() > 1 {
+        decoded.trim_end_matches('/').to_string()
+    } else {
+        decoded
+    }
+}
+
 fn candidate_root_activity_ns(root: &Path) -> Option<i128> {
     if !root.is_dir() {
         return None;
