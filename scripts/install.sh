@@ -1,14 +1,14 @@
 #!/bin/sh
 # POSIX installer for Context Radar MCP (Antigravity plugin)
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar-mcp/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/ContextRadar/main/scripts/install.sh | sh
 # Optional env overrides:
 #   CONTEXT_RADAR_VERSION=v1.0.0
 #   ANTIGRAVITY_PLUGINS_DIR=$HOME/.gemini/config/plugins
 
 set -eu
 
-REPO="eatingDream-antigravity-plugins/context-radar-mcp"
+REPO="eatingDream-antigravity-plugins/ContextRadar"
 PLUGIN_NAME="context-radar-mcp"
 PLUGINS_DIR="${ANTIGRAVITY_PLUGINS_DIR:-$HOME/.gemini/config/plugins}"
 INSTALL_DIR="${PLUGINS_DIR}/${PLUGIN_NAME}"

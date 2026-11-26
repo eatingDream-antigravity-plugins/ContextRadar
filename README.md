@@ -5,10 +5,10 @@
 
 **See how full your Antigravity context really is, why a turn got slow, and when it actually pays off to `/compact` or start fresh.**
 
-[Homepage](https://contextradar.eatingdream.dev) · [English](README.md) · [简体中文](README.zh-CN.md) · [Releases](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases) · [AI Guide](docs/ai-guide.md) · [llms.txt](llms.txt)
+[Homepage](https://contextradar.eatingdream.dev) · [English](README.md) · [简体中文](README.zh-CN.md) · [Releases](https://github.com/eatingDream-antigravity-plugins/ContextRadar/releases) · [AI Guide](docs/ai-guide.md) · [llms.txt](llms.txt)
 
-[![CI](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml)
-[![Release](assets/release-badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases)
+[![CI](https://github.com/eatingDream-antigravity-plugins/ContextRadar/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/ContextRadar/actions/workflows/ci.yml)
+[![Release](assets/release-badge.svg)](https://github.com/eatingDream-antigravity-plugins/ContextRadar/releases)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -34,7 +34,7 @@
 Install the SHA-256 verified prebuilt binary (macOS Apple Silicon, macOS Intel, Linux x86_64):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar-mcp/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/ContextRadar/main/scripts/install.sh | sh
 ```
 
 Reload Antigravity, open **ContextRadar** in the side pane, or ask your agent: *"Why did the last few turns get slow?"* or *"Is it worth running `/compact` now?"*.
@@ -44,7 +44,7 @@ Reload Antigravity, open **ContextRadar** in the side pane, or ask your agent: *
 ContextRadar ships machine-readable docs and a portable skill (`agentskills.io` compatible). Point any MCP-capable agent (Antigravity, Claude Code, Codex, Cursor, OpenCode) at:
 
 ```sh
-npx skills add eatingDream-antigravity-plugins/context-radar-mcp
+npx skills add eatingDream-antigravity-plugins/ContextRadar
 ```
 
 > **Agent prompt hint**: Read [`llms.txt`](llms.txt), [`skills/context-radar/SKILL.md`](skills/context-radar/SKILL.md), and [`docs/ai-guide.md`](docs/ai-guide.md) for full MCP tool schemas, ACP proxy/run workflows, settings, and CLI flags.
@@ -65,7 +65,7 @@ npx skills add eatingDream-antigravity-plugins/context-radar-mcp
 
 ## Antigravity Plugin Suite
 
-Part of the [eatingDream Antigravity Plugin Suite](https://eatingdream.dev): **ContextRadar** (`context-radar-mcp`) · [ClamGuard](https://github.com/eatingDream-antigravity-plugins/mac-clamshell-mcp) (`mac-clamshell-mcp`) · [RemoteCast](https://github.com/eatingDream-antigravity-plugins/chrome-stream-mcp) (`chrome-stream-mcp`) · [ColabDeck](https://github.com/eatingDream-antigravity-plugins/colab-mcp) (`colab-mcp`) — powered by [PanelKit](https://github.com/eatingDream-antigravity-plugins/agy-mcp-kit) (`agy-mcp-kit`).
+Part of the [eatingDream Antigravity Plugin Suite](https://eatingdream.dev): **ContextRadar** (`context-radar-mcp`) · [ClamGuard](https://github.com/eatingDream-antigravity-plugins/ClamGuard) (`mac-clamshell-mcp`) · [RemoteCast](https://github.com/eatingDream-antigravity-plugins/RemoteCast) (`chrome-stream-mcp`) · [ColabDeck](https://github.com/eatingDream-antigravity-plugins/ColabDeck) (`colab-mcp`) — powered by [PanelKit](https://github.com/eatingDream-antigravity-plugins/PanelKit) (`agy-mcp-kit`).
 
 ## License
 

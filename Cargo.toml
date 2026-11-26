@@ -3,7 +3,7 @@ name = "context-radar-mcp"
 version = "1.5.1"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/eatingDream-antigravity-plugins/context-radar-mcp"
+repository = "https://github.com/eatingDream-antigravity-plugins/ContextRadar"
 description = "Native Rust context telemetry, 3-way cold-cache attribution, prefix-safe slice distillation, relay handoff MCP server, and execution guards for Antigravity"
 
 [lib]

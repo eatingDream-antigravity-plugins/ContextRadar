@@ -13,7 +13,7 @@
 
 Install the prebuilt binary (macOS / Linux):
 ```sh
-curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar-mcp/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/ContextRadar/main/scripts/install.sh | sh
 ```
 
 Generic stdio MCP configuration (`mcpServers`):

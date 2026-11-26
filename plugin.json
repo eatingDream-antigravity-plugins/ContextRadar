@@ -8,7 +8,7 @@
     "url": "https://github.com/eatingDream"
   },
   "homepage": "https://contextradar.eatingdream.dev",
-  "repository": "https://github.com/eatingDream-antigravity-plugins/context-radar-mcp",
+  "repository": "https://github.com/eatingDream-antigravity-plugins/ContextRadar",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Open ContextRadar to inspect active sessions, subagents, and cold-cache misses",
