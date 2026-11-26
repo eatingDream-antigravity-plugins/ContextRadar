@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for contributing to [Context Radar MCP](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp)!
+Thanks for contributing to [Context Radar MCP](https://github.com/eatingDream-antigravity-plugins/ContextRadar)!
 
 ## Workflow
 

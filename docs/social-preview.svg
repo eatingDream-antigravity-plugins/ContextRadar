@@ -112,7 +112,7 @@
 
   <!-- Footer Divider & Repo URL -->
   <line x1="64" y1="534" x2="564" y2="534" stroke="#2D2A25" stroke-width="1"/>
-  <text x="64" y="566" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="13.5" fill="#A39E93">github.com/<tspan fill="#F4F1EA">eatingDream-antigravity-plugins/context-radar-mcp</tspan></text>
+  <text x="64" y="566" font-family="ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace" font-size="13.5" fill="#A39E93">github.com/<tspan fill="#F4F1EA">eatingDream-antigravity-plugins/ContextRadar</tspan></text>
 
   <!-- ================= RIGHT MCP APP PANEL PREVIEW ================= -->
 

@@ -5,10 +5,10 @@
 
 **看清 Antigravity 上下文到底占了多少、为什么突然变慢，以及什么时候才真正值得 `/compact` 或开新对话。**
 
-[主页](https://contextradar.eatingdream.dev) · [English](README.md) · 简体中文 · [Releases](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases) · [AI 指南](docs/ai-guide.md) · [llms.txt](llms.txt)
+[主页](https://contextradar.eatingdream.dev) · [English](README.md) · 简体中文 · [Releases](https://github.com/eatingDream-antigravity-plugins/ContextRadar/releases) · [AI 指南](docs/ai-guide.md) · [llms.txt](llms.txt)
 
-[![CI](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/actions/workflows/ci.yml)
-[![Release](assets/release-badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/releases)
+[![CI](https://github.com/eatingDream-antigravity-plugins/ContextRadar/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/ContextRadar/actions/workflows/ci.yml)
+[![Release](assets/release-badge.svg)](https://github.com/eatingDream-antigravity-plugins/ContextRadar/releases)
 ![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -34,7 +34,7 @@
 一键安装经 SHA-256 校验的预编译二进制（支持 macOS Apple Silicon、macOS Intel、Linux x86_64）：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar-mcp/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/ContextRadar/main/scripts/install.sh | sh
 ```
 
 重载 Antigravity 后在侧边栏打开 **ContextRadar**，或直接问 Agent：*"刚才几轮怎么突然变慢了？"*、*"现在适合 `/compact` 吗？"*。
@@ -44,7 +44,7 @@ curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/con
 项目内置完整的机器可读文档与通用 Skill（兼容 `agentskills.io`），支持 Antigravity、Claude Code、Codex、Cursor、OpenCode 等任意 MCP 客户端：
 
 ```sh
-npx skills add eatingDream-antigravity-plugins/context-radar-mcp
+npx skills add eatingDream-antigravity-plugins/ContextRadar
 ```
 
 > **给 Agent 的提示**：完整的 MCP 工具参数表、ACP `acp-proxy`/`acp-run` 用法、环境变量与源码构建步骤请直接阅读 [`llms.txt`](llms.txt)、[`skills/context-radar/SKILL.md`](skills/context-radar/SKILL.md) 和 [`docs/ai-guide.md`](docs/ai-guide.md)。
@@ -65,7 +65,7 @@ npx skills add eatingDream-antigravity-plugins/context-radar-mcp
 
 ## Antigravity 插件套件
 
-隶属于 [eatingDream Antigravity 插件套件](https://eatingdream.dev)：**ContextRadar**（`context-radar-mcp`）· [ClamGuard](https://github.com/eatingDream-antigravity-plugins/mac-clamshell-mcp)（`mac-clamshell-mcp`）· [RemoteCast](https://github.com/eatingDream-antigravity-plugins/chrome-stream-mcp)（`chrome-stream-mcp`）· [ColabDeck](https://github.com/eatingDream-antigravity-plugins/colab-mcp)（`colab-mcp`），由 [PanelKit](https://github.com/eatingDream-antigravity-plugins/agy-mcp-kit)（`agy-mcp-kit`）统一驱动。
+隶属于 [eatingDream Antigravity 插件套件](https://eatingdream.dev)：**ContextRadar**（`context-radar-mcp`）· [ClamGuard](https://github.com/eatingDream-antigravity-plugins/ClamGuard)（`mac-clamshell-mcp`）· [RemoteCast](https://github.com/eatingDream-antigravity-plugins/RemoteCast)（`chrome-stream-mcp`）· [ColabDeck](https://github.com/eatingDream-antigravity-plugins/ColabDeck)（`colab-mcp`），由 [PanelKit](https://github.com/eatingDream-antigravity-plugins/PanelKit)（`agy-mcp-kit`）统一驱动。
 
 ## 许可证
 

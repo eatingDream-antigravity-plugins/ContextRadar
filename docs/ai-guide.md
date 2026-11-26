@@ -52,7 +52,7 @@ Optionally pass `--native-auto-compact <val>` (`AGY_CLI_AUTO_COMPACT_OVERRIDE`, 
 
 Add the portable skill (`agentskills.io` compatible):
 ```sh
-npx skills add eatingDream-antigravity-plugins/context-radar-mcp
+npx skills add eatingDream-antigravity-plugins/ContextRadar
 ```
 
 ## CLI Subcommands & Environment Variables
@@ -77,7 +77,7 @@ npx skills add eatingDream-antigravity-plugins/context-radar-mcp
 Requires Rust (`cargo`) and Node.js 20+ (panel pack & tests):
 
 ```sh
-git clone https://github.com/eatingDream-antigravity-plugins/context-radar-mcp.git && cd context-radar-mcp
+git clone https://github.com/eatingDream-antigravity-plugins/ContextRadar.git && cd ContextRadar
 node panel/pack.mjs && node --test panel/panel.test.mjs
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --locked
 cargo build --release --locked
