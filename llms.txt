@@ -1,0 +1,44 @@
+# Context Radar MCP
+
+> Native Rust MCP server, live SEP-1865 side panel, and pure-protocol ACP thin client that monitors Antigravity session/subagent context budgets, attributes 3-way cold-cache misses, distills bloated history slices to `scratch/` without breaking KV prefixes, and runs gated `/compact` or fresh-chat handoffs.
+
+## For AI Agents
+
+- [Agent Skill](skills/context-radar/SKILL.md): Complete MCP tool reference, handoff gates, and workflow rules (`agentskills.io` compatible).
+- [Contributor & Agent Guide](AGENTS.md): Architecture, build/test commands, security boundaries, and plugin packaging rules.
+- [README (English)](README.md) | [README (简体中文)](README.zh-CN.md)
+
+## Quick Connect (Any MCP Client)
+
+Install the prebuilt binary (macOS / Linux):
+```sh
+curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar-mcp/main/scripts/install.sh | sh
+```
+
+Generic stdio MCP configuration (`mcpServers`):
+```json
+{
+  "mcpServers": {
+    "radar": {
+      "command": "~/.gemini/config/plugins/context-radar-mcp/bin/context-radar-mcp",
+      "args": ["daemon", "--data-dir", "~/.gemini/antigravity/plugin_data/context-radar-mcp"]
+    }
+  }
+}
+```
+
+## Public MCP Tools
+
+- `context_radar_overview`: Live status (`ready`/`running`/`waiting`/`error`), headroom, thinking share, Stream/E2E speed, loop rollup, and subagents.
+- `context_radar_turns`: Per-turn tokens, cache hit rate, 3-way cold-cache attribution, TTFT, speed, and cost.
+- `context_radar_hotspots`: Locate context spikes (`hotspots`) or distill a step range into `scratch/` (`distill`, `save_note: true`).
+- `context_radar_prepare_handoff`: Evaluate budget tier, cooldown, subagent drain, and break-even economics.
+- `context_radar_commit_handoff`: Issue a scoped single-use grant for `/compact` (`kind: "compact"`) or fresh chat (`kind: "handoff"`).
+
+## CLI Subcommands
+
+- `context-radar-mcp daemon [--data-dir <path>] [--panel-html <path>]`
+- `context-radar-mcp acp-proxy [options] [-- <agy acp flags...>]`
+- `context-radar-mcp acp-run --prompt <text> [options] [-- <agy acp flags...>]`
+- `context-radar-mcp guard boot | exec`
+- `context-radar-mcp bench [--iterations <n>] [--data-root <path>]`
