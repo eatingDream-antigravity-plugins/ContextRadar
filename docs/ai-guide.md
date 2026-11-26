@@ -1,6 +1,6 @@
-# Context Radar MCP — AI Agent & Operator Guide
+# ContextRadar (context-radar-mcp) — AI Agent & Operator Guide
 
-Complete reference for AI agents, MCP clients, ACP editors, and power users configuring `context-radar-mcp`.
+Complete reference for AI agents, MCP clients, ACP editors, and power users configuring **ContextRadar** (`context-radar-mcp`). Homepage: <https://contextradar.eatingdream.dev>.
 
 ## MCP Tools
 

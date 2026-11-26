@@ -253,7 +253,7 @@ const ensureDashboardMount = (root) => {
   const [emb, dot] = mkEmb(), lg = mkLang(!isZh()), mkG = () => { const gh = hdv("lb"), ls = dv("cd ls"); return [hdv("c g6", gh, ls), gh, ls]; };
   uDot = dot; uSwp = hdv("swp"); uMi = hd0("span", "mi e"); uMt = sp("m s t3 e"); uAb = bt("id ct0", "aut", ""); [uEn, uZh] = lg.children;
   uRi = sv(14, ["M13 8a5 5 0 1 1-1.3-3.4M13 2.5v2.6h-2.6"]); uRb = bt("ib", "ref", uRi, "", al(L(20)));
-  const hdEl = h("header", "hd", 0, emb, h("h1", "wm", 0, "Context Radar"), dv("r f", uMi, uMt), dv("r k", uAb, lg, uRb), uSwp);
+  const hdEl = h("header", "hd", 0, emb, h("h1", "wm", 0, "ContextRadar"), dv("r f", uMi, uMt), dv("r k", uAb, lg, uRb), uSwp);
 
   const bDt = dt0(), bTt = sp("b e"), bId = id0(), bBg = hb("in"), bDs = bt("ib", "dis", "×", "", al(L(21))), bBd = hdv("c g4 t2"), bAc = hdv("ac je");
   const bnr = h("div", "bnr", { "data-k": "in", h: 1 }, dv("jb", dv("r f", bDt, bTt, bId), dv("r k", bBg, bDs)), bBd, bAc);

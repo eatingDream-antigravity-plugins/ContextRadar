@@ -23,8 +23,8 @@ pub fn tools_spec() -> Value {
     json!([
         {
             "name": "context_radar_overview",
-            "title": "Context Radar Monitor",
-            "description": "Open the live Context Radar dashboard and return active session and subagent context telemetry, KV cache hit rates, cold-cache attribution, latency, and estimated cost (supports if_digest deduplication).",
+            "title": "ContextRadar",
+            "description": "Open the live ContextRadar dashboard and return active session and subagent context telemetry, KV cache hit rates, cold-cache attribution, latency, and estimated cost (supports if_digest deduplication).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -79,16 +79,16 @@ pub fn tools_spec() -> Value {
                 "ui": { "resourceUri": PANEL_URI },
                 "com.google.antigravity/ui": {
                     "entrypoints": [
-                        { "type": "aux_pane", "title": "Context Radar" },
-                        { "type": "global", "title": "Context Radar" }
+                        { "type": "aux_pane", "title": "ContextRadar" },
+                        { "type": "global", "title": "ContextRadar" }
                     ]
                 }
             }
         },
         {
             "name": "context_radar_ui_action",
-            "title": "Context Radar Internal UI Action",
-            "description": "Internal app-only state, distillation, and scoped relay grant actions invoked by the Context Radar MCP App panel.",
+            "title": "ContextRadar Internal UI Action",
+            "description": "Internal app-only state, distillation, and scoped relay grant actions invoked by the ContextRadar MCP App panel.",
             "inputSchema": {
                 "type": "object",
                 "required": ["action"],
@@ -329,14 +329,14 @@ pub fn resources_spec() -> Value {
     json!([
         {
             "uri": PANEL_URI,
-            "name": "Context Radar Panel",
+            "name": "ContextRadar Panel",
             "description": "Live Antigravity context gauge, KV cache attribution, hotspot distillation, and scoped handoff dashboard.",
             "mimeType": APP_MIME,
             "_meta": { "ui": { "prefersBorder": false } }
         },
         {
             "uri": HANDOFF_URI,
-            "name": "Context Radar Handoff Card",
+            "name": "ContextRadar Handoff Card",
             "description": "Inline card providing a 1-click /compact command and scoped official target:new session handoff.",
             "mimeType": APP_MIME,
             "_meta": { "ui": { "prefersBorder": false } }
