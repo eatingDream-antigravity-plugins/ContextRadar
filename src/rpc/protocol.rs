@@ -14,7 +14,8 @@ use serde_json::{json, Map, Value};
 
 use crate::engine::budget::{evaluate_handoff_gate, prepare_handoff_plan};
 use crate::engine::grants::{
-    default_grants_path_in, sanitize_scratch_note_path_for_lang, RelayGrantStore,
+    default_grants_path_in, is_acp_proxy_active, sanitize_scratch_note_path_for_lang,
+    RelayGrantStore,
 };
 use crate::engine::pruner::distill_slice_with_lang;
 use crate::engine::telemetry::{compute_snapshot_digest, OverviewSnapshot, TelemetryEngine};
@@ -817,6 +818,10 @@ impl McpDaemon {
             }
         };
 
+        let auto_fire = bool_arg(args, "auto_fire", true);
+        let acp_env_active = is_acp_proxy_active();
+        let acp_strict_error = acp_env_active && kind == "compact" && auto_fire;
+
         let cid_arg = str_arg(args, "conversation_id");
         let target = self.engine.resolve_session_fast(&cid_arg, None);
 
@@ -847,7 +852,7 @@ impl McpDaemon {
                 return json!({
                     "content": [{ "type": "text", "text": reason }],
                     "structuredContent": blocked,
-                    "isError": false
+                    "isError": acp_strict_error
                 });
             }
         }
@@ -881,7 +886,33 @@ impl McpDaemon {
             return json!({
                 "content": [{ "type": "text", "text": msg_txt }],
                 "structuredContent": blocked,
-                "isError": false
+                "isError": acp_strict_error
+            });
+        }
+
+        let settings = self.grants.get_settings();
+        let allow_auto = settings.allow_auto_handoff;
+        if acp_strict_error && !allow_auto {
+            let reason = if zh {
+                "面板「自动接力」开关当前已关闭（allow_auto_handoff=false）；已阻止 ACP 自动触发 `/compact`。"
+            } else {
+                "Auto-handoff is currently disabled in Context Radar preferences (allow_auto_handoff=false); blocking autonomous ACP `/compact`."
+            };
+            let blocked = json!({
+                "mode": "handoff_blocked",
+                "kind": kind,
+                "blocked": true,
+                "allow_auto_handoff": false,
+                "conversation_id": target.as_ref().map(|t| t.id.as_str()).unwrap_or(""),
+                "workspace": target.as_ref().map(|t| t.workspace.as_str()).unwrap_or(""),
+                "current_context_tokens": target.as_ref().map(|t| t.latest_context_tokens).unwrap_or(0),
+                "running_subagent_count": target.as_ref().map(|t| t.running_subagent_count).unwrap_or(0),
+                "reasons": [reason],
+            });
+            return json!({
+                "content": [{ "type": "text", "text": reason }],
+                "structuredContent": blocked,
+                "isError": true
             });
         }
 
@@ -902,7 +933,6 @@ impl McpDaemon {
             .map(|t| t.running_subagent_count)
             .unwrap_or(0);
         let resume_task = str_arg(args, "resume_task");
-        let auto_fire = bool_arg(args, "auto_fire", true);
 
         let grant = self.grants.create_grant_scoped(
             &preserve,
@@ -919,8 +949,6 @@ impl McpDaemon {
             lang,
         );
         self.on_grants_mutated();
-        let settings = self.grants.get_settings();
-        let allow_auto = settings.allow_auto_handoff;
         let acp_proxy_active = grant.acp_proxy_active;
 
         let card = json!({

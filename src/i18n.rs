@@ -1,6 +1,8 @@
 //! Locale auto-detection (`en` / `zh-CN`) and adaptive currency helpers.
 
 use std::env;
+use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::sync::OnceLock;
 
@@ -207,5 +209,151 @@ pub fn carbon_concurrency_warning_text(lang: Lang, active_carbon_count: usize) -
         format!(
             "Concurrency tip: {active_carbon_count} active conversations are running Gemini 4 Carbon simultaneously; cap concurrent Carbon workers <= 2 to avoid per-replica HBM spillover."
         )
+    }
+}
+
+/// Pure, zero-IO validation of an optional `scratch_note_path` to prevent path traversal
+/// or control-character injection into `/compact` and handoff prompts.
+pub fn sanitize_scratch_note_path_pure_for_lang(raw: &str, lang: Lang) -> Result<String, String> {
+    let zh = lang.is_zh();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    if trimmed.len() > 512 {
+        return Err(if zh {
+            "scratch_note_path 过长（上限 512 字节）".into()
+        } else {
+            "scratch_note_path exceeds 512-byte maximum".into()
+        });
+    }
+    if trimmed.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(if zh {
+            "scratch_note_path 包含非法控制字符".into()
+        } else {
+            "scratch_note_path contains disallowed control characters".into()
+        });
+    }
+    let p = Path::new(trimmed);
+    for comp in p.components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return Err(if zh {
+                "scratch_note_path 禁止包含路径穿越段 '..'".into()
+            } else {
+                "scratch_note_path must not contain '..' path traversal segments".into()
+            });
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Validate and sanitize an optional `scratch_note_path` including local symlink rejection.
+pub fn sanitize_scratch_note_path(raw: &str) -> Result<String, String> {
+    sanitize_scratch_note_path_for_lang(raw, resolve_active_lang(""))
+}
+
+pub fn sanitize_scratch_note_path_for_lang(raw: &str, lang: Lang) -> Result<String, String> {
+    let clean = sanitize_scratch_note_path_pure_for_lang(raw, lang)?;
+    if clean.is_empty() {
+        return Ok(clean);
+    }
+    let zh = lang.is_zh();
+    if let Ok(meta) = fs::symlink_metadata(Path::new(&clean)) {
+        if meta.file_type().is_symlink() {
+            return Err(if zh {
+                "scratch_note_path 禁止指向符号链接".into()
+            } else {
+                "scratch_note_path must not point to a symbolic link".into()
+            });
+        }
+    }
+    Ok(clean)
+}
+
+pub fn build_compact_command(preserve_points: &str, resume_task: &str) -> String {
+    build_compact_command_for_lang(preserve_points, resume_task, resolve_active_lang(""))
+}
+
+pub fn build_compact_command_for_lang(
+    preserve_points: &str,
+    resume_task: &str,
+    lang: Lang,
+) -> String {
+    build_compact_command_with_note_for_lang(preserve_points, resume_task, "", lang)
+}
+
+/// Build a single-line directed `/compact` command, optionally referencing a distilled
+/// `scratch_note_path` (`scratch/slice_*.md`) for on-demand reads after compaction.
+pub fn build_compact_command_with_note_for_lang(
+    preserve_points: &str,
+    resume_task: &str,
+    scratch_note_path: &str,
+    lang: Lang,
+) -> String {
+    let zh = lang.is_zh();
+    let pts = preserve_points
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let nxt = resume_task
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let note = scratch_note_path
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    match (!pts.is_empty(), !note.is_empty(), !nxt.is_empty()) {
+        (true, false, true) => {
+            if zh {
+                format!("/compact 保留关键上下文与约束：{pts}。压缩完成后请继续执行：{nxt}")
+            } else {
+                format!("/compact Preserve key context and constraints: {pts}. After compaction, continue with: {nxt}")
+            }
+        }
+        (true, false, false) => {
+            if zh {
+                format!("/compact 保留关键上下文与约束：{pts}。压缩完成后请简要确认已保留要点并等待后续指令。")
+            } else {
+                format!("/compact Preserve key context and constraints: {pts}. After compaction, briefly confirm preserved points and stop to await further instructions.")
+            }
+        }
+        (true, true, true) => {
+            if zh {
+                format!("/compact 保留关键上下文与约束：{pts}。切片摘要备忘（按需读取）：`{note}`。压缩完成后请继续执行：{nxt}")
+            } else {
+                format!("/compact Preserve key context and constraints: {pts}. Distilled slice note (read on demand): `{note}`. After compaction, continue with: {nxt}")
+            }
+        }
+        (true, true, false) => {
+            if zh {
+                format!("/compact 保留关键上下文与约束：{pts}。切片摘要备忘（按需读取）：`{note}`。压缩完成后请简要确认已保留要点并等待后续指令。")
+            } else {
+                format!("/compact Preserve key context and constraints: {pts}. Distilled slice note (read on demand): `{note}`. After compaction, briefly confirm preserved points and stop to await further instructions.")
+            }
+        }
+        (false, true, true) => {
+            if zh {
+                format!("/compact 切片摘要备忘（按需读取）：`{note}`。压缩完成后请继续执行：{nxt}")
+            } else {
+                format!("/compact Distilled slice note (read on demand): `{note}`. After compaction, continue with: {nxt}")
+            }
+        }
+        (false, true, false) => {
+            if zh {
+                format!("/compact 切片摘要备忘（按需读取）：`{note}`。")
+            } else {
+                format!("/compact Distilled slice note (read on demand): `{note}`.")
+            }
+        }
+        (false, false, true) => format!("/compact {nxt}"),
+        (false, false, false) => "/compact".to_string(),
     }
 }

@@ -12,6 +12,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::{parse_lang_tag, resolve_active_lang, Lang};
+pub use crate::i18n::{
+    build_compact_command, build_compact_command_for_lang,
+    build_compact_command_with_note_for_lang, sanitize_scratch_note_path,
+    sanitize_scratch_note_path_for_lang, sanitize_scratch_note_path_pure_for_lang,
+};
 use crate::settings::{
     default_data_root, default_plugin_data_dir, expand_tilde, normalize_workspace_uri,
     ACP_PROXY_ENV, GRANTS_PATH_ENV,
@@ -154,54 +159,6 @@ pub fn workspaces_overlap(grant_ws: &str, grant_all: &[String], scope_ws: &str) 
     grant_all.iter().any(|w| paths_overlap(w, &ns))
 }
 
-/// Validate and sanitize an optional `scratch_note_path` to prevent path traversal,
-/// symlink abuse, or control-character injection into handoff prompts.
-pub fn sanitize_scratch_note_path(raw: &str) -> Result<String, String> {
-    sanitize_scratch_note_path_for_lang(raw, resolve_active_lang(""))
-}
-
-pub fn sanitize_scratch_note_path_for_lang(raw: &str, lang: Lang) -> Result<String, String> {
-    let zh = lang.is_zh();
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Ok(String::new());
-    }
-    if trimmed.len() > 512 {
-        return Err(if zh {
-            "scratch_note_path 过长（上限 512 字节）".into()
-        } else {
-            "scratch_note_path exceeds 512-byte maximum".into()
-        });
-    }
-    if trimmed.bytes().any(|b| b < 0x20 || b == 0x7f) {
-        return Err(if zh {
-            "scratch_note_path 包含非法控制字符".into()
-        } else {
-            "scratch_note_path contains disallowed control characters".into()
-        });
-    }
-    let p = Path::new(trimmed);
-    for comp in p.components() {
-        if matches!(comp, std::path::Component::ParentDir) {
-            return Err(if zh {
-                "scratch_note_path 禁止包含路径穿越段 '..'".into()
-            } else {
-                "scratch_note_path must not contain '..' path traversal segments".into()
-            });
-        }
-    }
-    if let Ok(meta) = fs::symlink_metadata(p) {
-        if meta.file_type().is_symlink() {
-            return Err(if zh {
-                "scratch_note_path 禁止指向符号链接".into()
-            } else {
-                "scratch_note_path must not point to a symbolic link".into()
-            });
-        }
-    }
-    Ok(trimmed.to_string())
-}
-
 #[inline]
 fn now_sec() -> f64 {
     SystemTime::now()
@@ -225,48 +182,6 @@ fn random_hex_16() -> String {
         let _ = write!(&mut out, "{b:02x}");
     }
     out
-}
-
-pub fn build_compact_command(preserve_points: &str, resume_task: &str) -> String {
-    build_compact_command_for_lang(preserve_points, resume_task, resolve_active_lang(""))
-}
-
-pub fn build_compact_command_for_lang(
-    preserve_points: &str,
-    resume_task: &str,
-    lang: Lang,
-) -> String {
-    let zh = lang.is_zh();
-    let pts = preserve_points
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let nxt = resume_task
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-    match (!pts.is_empty(), !nxt.is_empty()) {
-        (true, true) => {
-            if zh {
-                format!("/compact 保留关键上下文与约束：{pts}。压缩完成后请继续执行：{nxt}")
-            } else {
-                format!("/compact Preserve key context and constraints: {pts}. After compaction, continue with: {nxt}")
-            }
-        }
-        (true, false) => {
-            if zh {
-                format!("/compact 保留关键上下文与约束：{pts}。压缩完成后请简要确认已保留要点并等待后续指令。")
-            } else {
-                format!("/compact Preserve key context and constraints: {pts}. After compaction, briefly confirm preserved points and stop to await further instructions.")
-            }
-        }
-        (false, true) => format!("/compact {nxt}"),
-        (false, false) => "/compact".to_string(),
-    }
 }
 
 pub fn build_handoff_prompt(
@@ -668,8 +583,12 @@ impl RelayGrantStore {
             .retain(|_, g| (now - g.created_at) <= GRANT_PRUNE_SEC);
 
         let grant_id = random_hex_16();
-        let compact_command =
-            build_compact_command_for_lang(preserve_points, resume_task, lang);
+        let compact_command = build_compact_command_with_note_for_lang(
+            preserve_points,
+            resume_task,
+            scratch_note_path,
+            lang,
+        );
         let handoff_prompt = build_handoff_prompt_for_lang(
             conversation_id,
             preserve_points,
@@ -1104,61 +1023,6 @@ impl RelayGrantStore {
             grant_id: Some(grant_id.to_string()),
             handoff_conversation_id: None,
         }
-    }
-
-    /// Find the latest unclaimed, non-expired `kind == "compact"` grant scoped to `conversation_id`.
-    /// Used by official ACP orchestrators (`acp-proxy` / `acp-run`) at clean turn boundaries.
-    pub fn find_pending_compact_grant(
-        &mut self,
-        conversation_id: &str,
-        workspace: Option<&str>,
-        require_auto: bool,
-        now_override: Option<f64>,
-    ) -> Option<RelayGrant> {
-        let cid_req = conversation_id.trim();
-        if cid_req.is_empty() {
-            return None;
-        }
-        let ref_now = now_override.unwrap_or_else(now_sec);
-        let ws_f = workspace
-            .map(normalize_workspace_uri)
-            .filter(|s| !s.is_empty());
-        let data = self.load();
-        if require_auto && !data.settings.allow_auto_handoff {
-            return None;
-        }
-        let mut cands: Vec<RelayGrant> = data
-            .grants
-            .values()
-            .filter(|rec| {
-                if rec.dismissed || rec.claimed || rec.kind != "compact" {
-                    return false;
-                }
-                if require_auto && !rec.auto_fire {
-                    return false;
-                }
-                if (ref_now - rec.created_at) > rec.ttl_sec {
-                    return false;
-                }
-                if rec.conversation_id != cid_req {
-                    return false;
-                }
-                if let Some(ref ws_req) = ws_f {
-                    let has_grant_ws = !rec.workspace.is_empty() || !rec.workspaces.is_empty();
-                    if has_grant_ws && !workspaces_overlap(&rec.workspace, &rec.workspaces, ws_req) {
-                        return false;
-                    }
-                }
-                true
-            })
-            .cloned()
-            .collect();
-        cands.sort_by(|a, b| {
-            b.created_at
-                .partial_cmp(&a.created_at)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        cands.into_iter().next()
     }
 
     pub fn dismiss_grant(&mut self, grant_id: &str) -> ActionOutcome {
