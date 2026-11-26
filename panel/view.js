@@ -83,7 +83,7 @@ const fmtMoney = (usd, cny, dec = 2, known = true) => {
   return isZh() ? `¥${fx(cny, dec)}` : `$${fx(usd, dec)}`;
 };
 
-const normWs = (r) => { const s = String(r || "").trim().replace(/^file:\/\//, ""); return s.length > 1 ? s.replace(/\/+$/, "") : s; };
+const normWs = (r) => { let s = String(r || "").trim(); if (s.startsWith("file://")) { s = s.slice(7); try { s = decodeURIComponent(s); } catch {} } return s.length > 1 ? s.replace(/\/+$/, "") : s; };
 const sameWs = (ws, allWs) => {
   const dws = normWs(snapshot?.daemon_workspace);
   return !dws || [ws, ...(Array.isArray(allWs) ? allWs : [])].map(normWs).filter(Boolean).some((w) => w === dws || w.startsWith(`${dws}/`) || dws.startsWith(`${w}/`));
@@ -498,7 +498,7 @@ const extractRelayCid = (res) => { const c = res?._meta?.[AG_M]?.conversationId;
 const recAct = (action, gid, extra) => canCallTools && gid ? uiAct({ action, grant_id: gid, ...extra }).catch(() => {}) : 0;
 async function executeDispatch(p, claimMode, isInline, isCmp = false) {
   cancelAutoCmp();
-  const gid = p.grant_id || "", cmd = p.compact_command || "/compact", cid = p[K_CID] || "", ws = p.workspace || "";
+  const gid = p.grant_id || "", cmd = p.compact_command || "/compact", cid = p[K_CID] || "", ws = p.workspace || "", dws = snapshot?.daemon_workspace;
   const txt = isCmp ? cmd : p.handoff_prompt || "", isMan = claimMode.startsWith("manual");
   if (!txt) return;
   const fail = (msg) => { if (isInline) handoffStatus = "manual"; if (msg) flashMicro(msg); render(); }, ow = tr("Other workspace", "属其他工作区");
@@ -507,7 +507,7 @@ async function executeDispatch(p, claimMode, isInline, isCmp = false) {
   if ((p[K_RSC] || 0) > 0) return fail(isMan ? tr(...T_WS) : "");
   if (canCallTools && gid) {
     try {
-      const sc = await uiSc({ action: "claim_grant", grant_id: gid, [K_CID]: cid, workspace: snapshot?.daemon_workspace || ws, claim_mode: claimMode });
+      const sc = await uiSc({ action: "claim_grant", grant_id: gid, [K_CID]: cid, workspace: isInline ? ws || dws : dws || ws, claim_mode: claimMode });
       if (!sc?.claimed) {
         if (isInline) {
           if (sc?.[K_HCID] && handoffCard) { handoffCard[K_HCID] = sc[K_HCID]; handoffStatus = "sent"; }
@@ -602,8 +602,8 @@ async function refreshSnapshot(force = false, showSynced = false) {
     serverMs = srvMs; ewmaRttMs = ewmaRttMs === null ? netRtt : M.round(ewmaRttMs * 0.65 + netRtt * 0.35);
     pollErrors = 0; lastSyncTs = now(); ct(spinTimer); showSpinner = false;
 
-    const finish = () => { refreshing = false; showSynced ? flashMicro(tr("✓ Synced", "✓ 已同步")) : render(); };
-    if (res?.isError) { errorText = tr("Sync error", "刷新失败"); refreshing = false; render(); }
+    const finish = () => { refreshing = false; showSynced ? flashMicro(tr("✓ Synced|✓ 已同步")) : render(); };
+    if (res?.isError) { errorText = tr("Sync error|刷新失败"); refreshing = false; render(); }
     else if (sc?.unchanged || (sc?.digest && sc.digest === lastDigest && snapshot)) {
       const hadErr = !!errorText;
       unchangedHits += 1; errorText = "";
@@ -613,7 +613,7 @@ async function refreshSnapshot(force = false, showSynced = false) {
       applySnapshot(sc); loadingInitial = false; errorText = ""; finish();
     }
   } catch (err) {
-    pollErrors += 1; errorText = `${tr("Sync:", "同步：")} ${err?.message || err}`;
+    pollErrors += 1; errorText = `${tr("Sync:|同步：")} ${err?.message || err}`;
     ct(spinTimer); showSpinner = false; refreshing = false; render();
   } finally {
     inFlightPoll = false;

@@ -9,7 +9,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{json, Value};
 
 use crate::guard::stdin_json::{read_stdin_json_fast, truncate_utf8};
-use crate::settings::{expand_tilde, load_settings_once};
+use crate::settings::{expand_tilde, load_settings_once, normalize_workspace_uri};
 
 const DEFAULT_MAX_BYTES: usize = 800;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 3200;
@@ -33,34 +33,6 @@ fn read_bounded_safe(path: &Path, ws_root: Option<&Path>) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-fn clean_ws_item(raw: &str) -> String {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return String::new();
-    }
-    if let Some(rest) = trimmed.strip_prefix("file://") {
-        // Percent-decode basic %20 etc. if URI-formatted
-        let bytes = rest.as_bytes();
-        let mut out = Vec::with_capacity(bytes.len());
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && i + 2 < bytes.len() {
-                let hi = (bytes[i + 1] as char).to_digit(16);
-                let lo = (bytes[i + 2] as char).to_digit(16);
-                if let (Some(h), Some(l)) = (hi, lo) {
-                    out.push(((h << 4) | l) as u8);
-                    i += 3;
-                    continue;
-                }
-            }
-            out.push(bytes[i]);
-            i += 1;
-        }
-        return String::from_utf8_lossy(&out).into_owned();
-    }
-    trimmed.to_string()
-}
-
 pub fn extract_workspace_candidates(payload: &Value) -> Vec<String> {
     let Some(obj) = payload.as_object() else {
         return Vec::new();
@@ -68,7 +40,7 @@ pub fn extract_workspace_candidates(payload: &Value) -> Vec<String> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     let mut push = |raw: &str| {
-        let cleaned = clean_ws_item(raw);
+        let cleaned = normalize_workspace_uri(raw);
         if !cleaned.is_empty() && seen.insert(cleaned.clone()) {
             out.push(cleaned);
         }

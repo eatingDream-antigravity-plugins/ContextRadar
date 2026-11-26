@@ -310,6 +310,12 @@ test("auto_compact gating enforces inline ownership, side-pane canDirectCid, sub
   // Allowed when ownerCid matches cid even with >1 main
   sandbox.ownerCid = "c1";
   assert.equal(sandbox.canAutoRelay(mkGrant(), false), "auto_compact");
+  // Side-pane pending_grant with persisted acp_proxy_active=true MUST suppress UI auto_compact
+  assert.equal(sandbox.canAutoRelay(mkGrant({ acp_proxy_active: true }), false), "");
+  // Percent-decoded file:// URI matching works identically to Rust normalize_workspace_uri
+  sandbox.snapshot.daemon_workspace = "/ws/My Project";
+  assert.equal(sandbox.canAutoRelay(mkGrant({ workspace: "file:///ws/My%20Project/" }), false), "auto_compact");
+  sandbox.snapshot.daemon_workspace = "/ws/a";
   // Blocked when ownerCid mismatches
   sandbox.ownerCid = "c-other";
   assert.equal(sandbox.canAutoRelay(mkGrant(), false), "");
@@ -323,8 +329,8 @@ test("auto_compact gating enforces inline ownership, side-pane canDirectCid, sub
   assert.equal(sandbox.canAutoRelay(mkGrant(), false), "");
   sandbox.allowAutoHandoff = true;
 
-  // 3. Inline maybeAutoRelay waits 1500ms settle window, claims auto_compact, sends ui/message without target:new, records sent
-  const gInline = mkGrant({ grant_id: "g-inline" });
+  // 3. Inline maybeAutoRelay waits 1500ms settle window, claims auto_compact with inline ws || daemon_workspace, sends ui/message without target:new, records sent
+  const gInline = mkGrant({ grant_id: "g-inline", workspace: "/ws/inline-card" });
   sandbox.handoffCard = gInline;
   sandbox.handoffStatus = "pending";
   sandbox.maybeAutoRelay(gInline, true);
@@ -335,6 +341,7 @@ test("auto_compact gating enforces inline ownership, side-pane canDirectCid, sub
   timers[0].fn();
   await flush();
   assert.equal(uiActions[0].action, "claim_grant");
+  assert.equal(uiActions[0].workspace, "/ws/inline-card", "inline card claim must prefer card workspace over side-pane daemon_workspace");
   assert.equal(uiActions[0].claim_mode, "auto_compact");
   assert.deepEqual(sentMessages[0], { text: "/compact preserve X", meta: 0 });
   assert.deepEqual(uiActions[1], { action: "record_compact", grant_id: "g-inline", status: "sent" });

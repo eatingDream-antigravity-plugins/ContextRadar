@@ -6,7 +6,7 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -18,12 +18,12 @@ use crate::engine::grants::{
 };
 use crate::engine::pruner::distill_slice_with_lang;
 use crate::engine::telemetry::{compute_snapshot_digest, OverviewSnapshot, TelemetryEngine};
-use crate::i18n::select_display_cost;
+use crate::i18n::{parse_lang_tag, select_display_cost};
 use crate::rpc::tools::{
     fmt_k, format_live_status_tag, resources_spec, summarize_snapshot_text, tools_spec, APP_MIME,
     HANDOFF_URI, PANEL_URI,
 };
-use crate::settings::{expand_tilde, ACP_PROXY_ENV, PANEL_HTML_ENV};
+use crate::settings::{expand_tilde, PANEL_HTML_ENV};
 
 pub const SERVER_NAME: &str = "context-radar-mcp";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -147,19 +147,11 @@ struct CachedDefaultSnap {
     disk_sig: DiskActivitySig,
 }
 
-#[derive(Default)]
-struct RefreshSignal {
-    requested: bool,
-    in_flight: bool,
-    shutdown: bool,
-}
-
 struct SwrHub {
     cached: RwLock<Option<CachedDefaultSnap>>,
     html: RwLock<Option<HtmlCache>>,
     rendered_panel: RwLock<Option<RenderedPanelCache>>,
     grants_rev: AtomicU64,
-    signal: (Mutex<RefreshSignal>, Condvar),
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -170,7 +162,6 @@ impl SwrHub {
             html: RwLock::new(None),
             rendered_panel: RwLock::new(None),
             grants_rev: AtomicU64::new(0),
-            signal: (Mutex::new(RefreshSignal::default()), Condvar::new()),
             worker: Mutex::new(None),
         }
     }
@@ -276,18 +267,6 @@ impl SwrHub {
         Ok((html, mtime_ns, size))
     }
 
-    #[allow(dead_code)]
-    fn trigger_refresh(&self) {
-        let (lock, cvar) = &self.signal;
-        if let Ok(mut sig) = lock.lock() {
-            if sig.shutdown || sig.requested || sig.in_flight {
-                return;
-            }
-            sig.requested = true;
-            cvar.notify_one();
-        }
-    }
-
     fn backdate_cached(&self, age: Duration) {
         if let Ok(mut g) = self.cached.write() {
             if let Some(ref mut c) = *g {
@@ -302,11 +281,6 @@ impl SwrHub {
     }
 
     fn shutdown(&self) {
-        let (lock, cvar) = &self.signal;
-        if let Ok(mut sig) = lock.lock() {
-            sig.shutdown = true;
-            cvar.notify_all();
-        }
         if let Ok(mut w) = self.worker.lock() {
             if let Some(handle) = w.take() {
                 let _ = handle.join();
@@ -399,15 +373,17 @@ impl McpDaemon {
         plugin_data_dir: Option<PathBuf>,
         panel_html_override: Option<PathBuf>,
     ) -> Self {
-        let eng = engine.unwrap_or_else(|| {
+        let mut eng = engine.unwrap_or_else(|| {
             TelemetryEngine::new_with_plugin_data(None, plugin_data_dir.clone(), None, None)
         });
-        let gstore = grants.unwrap_or_else(|| {
+        let mut gstore = grants.unwrap_or_else(|| {
             RelayGrantStore::new(default_grants_path_in(
                 plugin_data_dir.as_deref(),
                 Some(&eng.ledger.data_root),
             ))
         });
+        eng.rates
+            .set_lang_override(parse_lang_tag(&gstore.get_settings().lang));
         Self {
             engine: eng,
             grants: gstore,
@@ -417,6 +393,13 @@ impl McpDaemon {
         }
     }
 
+    fn sync_panel_lang(&mut self) {
+        let lang_pref = self.grants.get_settings().lang;
+        self.engine.rates.set_lang_override(parse_lang_tag(&lang_pref));
+    }
+
+    /// Run a one-shot background startup pre-warm so initial panel opens hit RAM immediately,
+    /// then immediately close and drop the temporary `bg_engine`/`bg_grants` handles.
     pub fn start_prewarm(&self) {
         let Ok(mut slot) = self.swr.worker.lock() else {
             return;
@@ -430,10 +413,6 @@ impl McpDaemon {
         let grants_path = self.grants.path.clone();
         let panel_override = self.panel_html_override.clone();
 
-        if let Ok(mut sig) = hub.signal.0.lock() {
-            sig.in_flight = true;
-        }
-
         let handle = thread::Builder::new()
             .name("context-radar-swr".to_string())
             .spawn(move || {
@@ -444,75 +423,54 @@ impl McpDaemon {
                     None,
                 );
                 let mut bg_grants = RelayGrantStore::new(grants_path);
+                bg_engine
+                    .rates
+                    .set_lang_override(parse_lang_tag(&bg_grants.get_settings().lang));
 
-                let run_refresh = |bg_engine: &mut TelemetryEngine,
-                                   bg_grants: &mut RelayGrantStore,
-                                   hub: &SwrHub,
-                                   panel_override: &Option<PathBuf>| {
-                    let panel_path = panel_override
-                        .clone()
-                        .unwrap_or_else(default_panel_html_path);
-                    let html_loaded = hub.load_html(&panel_path).ok();
+                let panel_path = panel_override
+                    .clone()
+                    .unwrap_or_else(default_panel_html_path);
+                let html_loaded = hub.load_html(&panel_path).ok();
 
-                    let disk_sig = quick_disk_activity_sig(&bg_engine.ledger.data_root);
-                    let rev_before = hub.grants_rev();
-                    let mut snap = bg_engine.build_overview_snapshot(25, false, false, "", None);
-                    attach_grant_and_rehash_inner(bg_engine, bg_grants, &mut snap, None, None);
-                    let rev_after = hub.grants_rev();
-                    if rev_after != rev_before {
-                        attach_grant_and_rehash_inner(bg_engine, bg_grants, &mut snap, None, None);
-                    }
-                    let final_rev = hub.grants_rev();
-                    snap.stale = false;
-
-                    if let Some((template, mtime_ns, size)) = html_loaded {
-                        if let Ok(val) = serde_json::to_value(&snap) {
-                            let rendered = inject_boot_html(&template, &val);
-                            hub.put_rendered_panel(
-                                panel_path,
-                                mtime_ns,
-                                size,
-                                snap.digest.clone(),
-                                false,
-                                rendered,
-                            );
-                        }
-                    }
-                    hub.put_cached(snap, final_rev, disk_sig);
-                };
-
-                run_refresh(&mut bg_engine, &mut bg_grants, &hub, &panel_override);
-
-                let (lock, cvar) = &hub.signal;
-                loop {
-                    let mut sig = match lock.lock() {
-                        Ok(g) => g,
-                        Err(_) => break,
-                    };
-                    sig.in_flight = false;
-                    while !sig.requested && !sig.shutdown {
-                        sig = match cvar.wait(sig) {
-                            Ok(g) => g,
-                            Err(_) => return,
-                        };
-                    }
-                    if sig.shutdown {
-                        break;
-                    }
-                    sig.requested = false;
-                    sig.in_flight = true;
-                    drop(sig);
-
-                    run_refresh(&mut bg_engine, &mut bg_grants, &hub, &panel_override);
+                let disk_sig = quick_disk_activity_sig(&bg_engine.ledger.data_root);
+                let rev_before = hub.grants_rev();
+                let mut snap = bg_engine.build_overview_snapshot(25, false, false, "", None);
+                attach_grant_and_rehash_inner(&mut bg_engine, &mut bg_grants, &mut snap, None, None);
+                let rev_after = hub.grants_rev();
+                if rev_after != rev_before {
+                    attach_grant_and_rehash_inner(
+                        &mut bg_engine,
+                        &mut bg_grants,
+                        &mut snap,
+                        None,
+                        None,
+                    );
                 }
+                let final_rev = hub.grants_rev();
+                snap.stale = false;
+
+                if let Some((template, mtime_ns, size)) = html_loaded {
+                    if let Ok(val) = serde_json::to_value(&snap) {
+                        let rendered = inject_boot_html(&template, &val);
+                        hub.put_rendered_panel(
+                            panel_path,
+                            mtime_ns,
+                            size,
+                            snap.digest.clone(),
+                            false,
+                            rendered,
+                        );
+                    }
+                }
+                hub.put_cached(snap, final_rev, disk_sig);
 
                 bg_engine.close();
+                drop(bg_grants);
+                drop(bg_engine);
             });
 
         if let Ok(h) = handle {
             *slot = Some(h);
-        } else if let Ok(mut sig) = self.swr.signal.0.lock() {
-            sig.in_flight = false;
         }
     }
 
@@ -682,7 +640,11 @@ impl McpDaemon {
                 let allow = args.get("allow_auto_handoff").and_then(Value::as_bool);
                 let lang_pref = args.get("lang").and_then(Value::as_str);
                 let updated = self.grants.update_settings_with_lang(allow, lang_pref);
+                self.engine
+                    .rates
+                    .set_lang_override(parse_lang_tag(&updated.lang));
                 self.on_grants_mutated();
+                let zh = self.engine.rates.get_lang().is_zh();
                 let msg = if zh {
                     format!(
                         "已更新面板偏好：allow_auto_handoff={}",
@@ -959,9 +921,7 @@ impl McpDaemon {
         self.on_grants_mutated();
         let settings = self.grants.get_settings();
         let allow_auto = settings.allow_auto_handoff;
-        let acp_proxy_active = env::var(ACP_PROXY_ENV)
-            .map(|v| matches!(v.trim(), "1" | "true" | "TRUE" | "yes"))
-            .unwrap_or(false);
+        let acp_proxy_active = grant.acp_proxy_active;
 
         let card = json!({
             "mode": "handoff_card",
@@ -1071,6 +1031,7 @@ impl McpDaemon {
     }
 
     fn call_tool(&mut self, params: &Map<String, Value>) -> Result<Value, (i64, String)> {
+        self.sync_panel_lang();
         let name = params.get("name").and_then(Value::as_str).unwrap_or("");
         let args_val = params
             .get("arguments")
@@ -1088,10 +1049,6 @@ impl McpDaemon {
             "context_radar_overview" => {
                 let act = str_arg_or(args, "action", "snapshot");
                 match act.as_str() {
-                    "set_prefs" | "record_relay" | "record_compact" | "dismiss_grant"
-                    | "claim_grant" | "distill_slice" | "create_handoff" => {
-                        Ok(self.handle_ui_action(&act, args))
-                    }
                     "turns" => Ok(self.handle_turns_tool(args)),
                     _ => {
                         let t0 = Instant::now();
@@ -1427,15 +1384,6 @@ impl McpDaemon {
                 }))
             }
             "context_radar_commit_handoff" => {
-                let act = str_arg_or(args, "action", "create");
-                if act == "claim" {
-                    return Ok(self.claim_with_live_check(
-                        &str_arg(args, "grant_id"),
-                        &str_arg(args, "conversation_id"),
-                        &str_arg(args, "workspace"),
-                        &str_arg_or(args, "claim_mode", "manual"),
-                    ));
-                }
                 let kind = str_arg_or(args, "kind", "handoff");
                 Ok(self.prepare_commit_handoff(args, &kind))
             }
@@ -1529,6 +1477,7 @@ impl McpDaemon {
     }
 
     fn read_resource(&mut self, params: &Map<String, Value>) -> Result<Value, (i64, String)> {
+        self.sync_panel_lang();
         let uri = params.get("uri").and_then(Value::as_str).unwrap_or("");
         if uri != PANEL_URI && uri != HANDOFF_URI {
             return Err((-32602, format!("Unknown resource URI: {uri}")));

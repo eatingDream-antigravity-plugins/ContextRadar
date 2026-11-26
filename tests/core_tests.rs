@@ -1603,3 +1603,310 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
     assert_eq!(turns_payload.mid_loop_breakdown.unwrap().replica_spillover, 1);
     assert_eq!(turns_payload.turns[0].cold_cache_sub_reason, "replica_spillover");
 }
+
+#[test]
+fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
+    use context_radar_mcp::engine::grants::workspaces_overlap;
+    use context_radar_mcp::engine::tiers;
+    use context_radar_mcp::guard::boot::extract_workspace_candidates;
+    use context_radar_mcp::ledger::sqlite_ro::extract_workspaces;
+    use context_radar_mcp::settings::{normalize_workspace_uri, ACP_PROXY_ENV};
+    use std::env;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::sync::{Arc, Barrier};
+
+    // 1. tiers.rs isolation & budget.rs re-export parity
+    let cfg = SettingsWatcher::new(Some("none".into())).current();
+    let t_direct = tiers::resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Neon (High)", &cfg);
+    let t_reexp = resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Neon (High)", &cfg);
+    assert_eq!(t_direct.profile_id, t_reexp.profile_id);
+    assert_eq!(tiers::model_cache_ttl_sec("gemini-4-carbon-high", ""), 180.0);
+    assert!(tiers::is_gemini_4_carbon("gemini-4-carbon-high", ""));
+    assert!(tiers::is_gemini_4_model("gemini-4-hydrogen-high", ""));
+
+    // 2. Unified percent-decoded workspace URI normalization across ledger, grants, and boot guard
+    let uri = "file:///Users/demo/My%20Project%20Alpha/";
+    assert_eq!(normalize_workspace_uri(uri), "/Users/demo/My Project Alpha");
+    let (primary_ws, all_ws) = extract_workspaces(&format!(r#"["{uri}"]"#));
+    assert_eq!(primary_ws, "/Users/demo/My Project Alpha");
+    assert_eq!(all_ws, vec!["/Users/demo/My Project Alpha"]);
+    let boot_cands = extract_workspace_candidates(&json!({ "workspaceRoots": [uri] }));
+    assert_eq!(boot_cands, vec!["/Users/demo/My Project Alpha"]);
+    assert!(workspaces_overlap(uri, &[], "/Users/demo/My Project Alpha/sub"));
+    assert!(workspaces_overlap("/Users/demo/My Project Alpha", &[], uri));
+
+    // 3. Concurrent RelayGrantStore advisory flock: zero lost updates & single-winner atomic claim
+    let td = TempDir::new().unwrap();
+    let grants_path = td.path().join("relay_grants.json");
+    let threads = 6usize;
+    let barrier = Arc::new(Barrier::new(threads));
+    let mut handles = Vec::new();
+    for i in 0..threads {
+        let gp = grants_path.clone();
+        let b = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let mut store = RelayGrantStore::new(gp);
+            b.wait();
+            store
+                .create_grant_scoped(
+                    &format!("p-{i}"),
+                    &format!("r-{i}"),
+                    true,
+                    &format!("cid-{i}"),
+                    "file:///Users/demo/My%20Project%20Alpha/",
+                    &[],
+                    10,
+                    0,
+                    "compact",
+                    "",
+                    &format!("T-{i}"),
+                    Lang::En,
+                )
+                .grant_id
+        }));
+    }
+    let created_ids: Vec<String> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+    let mut verifier = RelayGrantStore::new(grants_path.clone());
+    for gid in &created_ids {
+        let g = verifier.find_grant(gid).expect("locked concurrent create must not lose any grant");
+        assert_eq!(g.workspace, "/Users/demo/My Project Alpha");
+    }
+    // Lock file must exist with 0600 permissions
+    let lock_path = td.path().join("relay_grants.json.lock");
+    let lock_meta = fs::symlink_metadata(&lock_path).unwrap();
+    assert_eq!(lock_meta.permissions().mode() & 0o777, 0o600);
+
+    // Concurrent claim on a single grant: strictly 1 winner
+    let target_gid = created_ids[0].clone();
+    let claim_barrier = Arc::new(Barrier::new(threads));
+    let mut claim_handles = Vec::new();
+    for _ in 0..threads {
+        let gp = grants_path.clone();
+        let gid = target_gid.clone();
+        let b = Arc::clone(&claim_barrier);
+        claim_handles.push(thread::spawn(move || {
+            let mut store = RelayGrantStore::new(gp);
+            b.wait();
+            store
+                .claim_grant_scoped(
+                    &gid,
+                    Some("cid-0"),
+                    Some("file:///Users/demo/My%20Project%20Alpha/sub"),
+                    Some(10),
+                    Some(0),
+                    Some(0),
+                    true,
+                )
+                .claimed
+        }));
+    }
+    let winners = claim_handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .filter(|&ok| ok)
+        .count();
+    assert_eq!(winners, 1, "flock must guarantee strictly one winner under concurrent claims");
+
+    // Symlinked .lock file must fail closed (O_NOFOLLOW)
+    let sym_dir = TempDir::new().unwrap();
+    let sym_grants = sym_dir.path().join("relay_grants.json");
+    let decoy = sym_dir.path().join("decoy");
+    fs::write(&decoy, "decoy").unwrap();
+    symlink(&decoy, sym_dir.path().join("relay_grants.json.lock")).unwrap();
+    let mut sym_store = RelayGrantStore::new(sym_grants.clone());
+    let claim_err = sym_store.claim_grant(&target_gid, None, None, None, false);
+    assert!(!claim_err.claimed);
+    assert_eq!(claim_err.reason.as_deref(), Some("lock_error"));
+
+    // 4. Persisted acp_proxy_active on RelayGrant surfaces on side-pane pending_grant,
+    //    unified PanelPrefs.lang syncs to RateTable::get_lang(), and legacy overview ui_action alias is removed
+    let td_mcp = TempDir::new().unwrap();
+    let conv_dir = td_mcp.path().join("conversations");
+    fs::create_dir_all(&conv_dir).unwrap();
+    let cid = "d5000000-0000-0000-0000-000000000001";
+    let now = 1_795_500_000.0;
+    let mut rows: Vec<(i64, i32, Option<Vec<u8>>)> = Vec::new();
+    for i in 0..20 {
+        rows.push((
+            i * 2,
+            15,
+            Some(make_step_meta(
+                (now - 300.0 + (i as f64) * 5.0) as u64,
+                10_000,
+                320_000,
+                400,
+                &format!("acpr{i}"),
+                0,
+                0,
+            )),
+        ));
+    }
+    create_conv_db(
+        &conv_dir.join(format!("{cid}.db")),
+        &rows,
+        "gemini-4-neon-high",
+        "Gemini 4 Neon (High)",
+    );
+    create_summaries_db(
+        &td_mcp.path().join("conversation_summaries.db"),
+        &[(
+            cid,
+            "ACP & Lang Test",
+            "",
+            r#"["file:///Users/demo/My%20Project%20Alpha"]"#,
+            "CASCADE_RUN_STATUS_RUNNING",
+            "",
+            "",
+            0,
+            1,
+            0,
+            iso(now - 5.0),
+            0,
+        )],
+    );
+    let eng = TelemetryEngine::new(
+        Some(td_mcp.path().to_path_buf()),
+        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(None),
+    );
+    let gstore = RelayGrantStore::new(td_mcp.path().join("relay_grants.json"));
+    let mut daemon = McpDaemon::new(Some(eng), Some(gstore), None);
+    daemon
+        .engine
+        .set_preferred_workspace(Some("/Users/demo/My Project Alpha".into()), true);
+
+    // Unified PanelPrefs.lang via context_radar_ui_action updates RateTable::get_lang()
+    let set_zh = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+            "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "lang": "zh-CN" } }
+        }))
+        .unwrap();
+    assert_eq!(set_zh["result"]["structuredContent"]["settings"]["lang"], json!("zh-CN"));
+    assert_eq!(daemon.engine.rates.get_lang(), Lang::ZhCn);
+
+    // Legacy hidden alias on context_radar_overview(action="set_prefs") is gone (returns snapshot instead of mutating prefs)
+    let legacy = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+            "params": { "name": "context_radar_overview", "arguments": { "action": "set_prefs", "allow_auto_handoff": false } }
+        }))
+        .unwrap();
+    assert_eq!(legacy["result"]["structuredContent"]["mode"], json!("snapshot"));
+    assert_eq!(daemon.grants.get_settings().allow_auto_handoff, true);
+
+    // Create compact grant with CONTEXT_RADAR_ACP_PROXY=1 -> persisted acp_proxy_active=true on pending_grant
+    let prev_acp = env::var(ACP_PROXY_ENV).ok();
+    env::set_var(ACP_PROXY_ENV, "1");
+    let commit = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+            "params": {
+                "name": "context_radar_commit_handoff",
+                "arguments": {
+                    "kind": "compact",
+                    "conversation_id": cid,
+                    "preserve_points": "Keep locks",
+                    "estimated_remaining_turns": 20
+                }
+            }
+        }))
+        .unwrap();
+    match prev_acp {
+        Some(v) => env::set_var(ACP_PROXY_ENV, v),
+        None => env::remove_var(ACP_PROXY_ENV),
+    }
+    assert_eq!(commit["result"]["structuredContent"]["acp_proxy_active"], json!(true));
+    assert_eq!(commit["result"]["structuredContent"]["lang"], json!("zh-CN"));
+
+    let ov = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 13, "method": "tools/call",
+            "params": { "name": "context_radar_overview", "arguments": { "fresh": true } }
+        }))
+        .unwrap();
+    assert_eq!(ov["result"]["structuredContent"]["lang"], json!("zh-CN"));
+    assert_eq!(
+        ov["result"]["structuredContent"]["pending_grant"]["acp_proxy_active"],
+        json!(true),
+        "side-pane pending_grant must carry persisted acp_proxy_active=true"
+    );
+
+    // 5. MetricsCacheKey invalidates when transcript.jsonl changes for legacy DBs (after_turn_start == None)
+    let td_tr = TempDir::new().unwrap();
+    let tr_conv = td_tr.path().join("conversations");
+    fs::create_dir_all(&tr_conv).unwrap();
+    let lcid = "d6000000-0000-0000-0000-000000000001";
+    let ldb = tr_conv.join(format!("{lcid}.db"));
+    {
+        let conn = Connection::open(&ldb).unwrap();
+        conn.execute(
+            "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, metadata BLOB)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO gen_metadata (idx, metadata) VALUES (0, ?1)",
+            params![make_gen_blob("gemini-4-neon-high", "Gemini 4 Neon (High)", 0)],
+        )
+        .unwrap();
+        // Legacy steps table WITHOUT step_type column -> after_turn_start is None
+        conn.execute("CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, metadata) VALUES (1, ?1)",
+            params![make_step_meta((now - 100.0) as u64, 30_000, 0, 300, "lr1", 0, 0)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, metadata) VALUES (3, ?1)",
+            params![make_step_meta((now - 80.0) as u64, 35_000, 0, 300, "lr2", 0, 0)],
+        )
+        .unwrap();
+    }
+    create_summaries_db(
+        &td_tr.path().join("conversation_summaries.db"),
+        &[(
+            lcid,
+            "Legacy Transcript Cache",
+            "",
+            r#"["file:///ws/legacy"]"#,
+            "CASCADE_RUN_STATUS_IDLE",
+            "",
+            "",
+            0,
+            0,
+            0,
+            iso(now - 10.0),
+            0,
+        )],
+    );
+    let mut eng_tr = TelemetryEngine::new(
+        Some(td_tr.path().to_path_buf()),
+        Some(RateTable::new(SettingsWatcher::new(Some("none".into())), None, None)),
+        Some(None),
+    );
+    // Before transcript.jsonl exists: step 1 is initial turn_start_cold, step 3 cold miss is mid_loop_cold
+    let snap_before = eng_tr.build_overview_snapshot(10, false, false, "", Some(now));
+    let s_before = snap_before.sessions.iter().find(|s| s.id == lcid).unwrap();
+    assert_eq!(s_before.cold_cache_breakdown.mid_loop_cold, 1);
+    assert_eq!(s_before.cold_cache_breakdown.turn_start_cold, 1);
+
+    // Now write transcript.jsonl with USER_INPUT at step 2 WITHOUT modifying ldb
+    let tdir = td_tr.path().join("brain").join(lcid).join(".system_generated").join("logs");
+    fs::create_dir_all(&tdir).unwrap();
+    fs::write(
+        tdir.join("transcript.jsonl"),
+        "{\"step_index\":0,\"type\":\"USER_INPUT\"}\n{\"step_index\":2,\"type\":\"USER_INPUT\"}\n",
+    )
+    .unwrap();
+
+    // MetricsCacheKey must invalidate on transcript_stamp change and reclassify step 3 as turn_start_cold!
+    let snap_after = eng_tr.build_overview_snapshot(10, false, false, "", Some(now));
+    let s_after = snap_after.sessions.iter().find(|s| s.id == lcid).unwrap();
+    assert_eq!(
+        s_after.cold_cache_breakdown.turn_start_cold, 2,
+        "MetricsCacheKey must invalidate when transcript.jsonl changes for legacy DBs"
+    );
+    assert_eq!(s_after.cold_cache_breakdown.mid_loop_cold, 0);
+}
