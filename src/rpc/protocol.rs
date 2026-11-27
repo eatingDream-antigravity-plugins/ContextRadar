@@ -15,18 +15,20 @@ use crate::engine::budget::{evaluate_handoff_gate, prepare_handoff_plan};
 use crate::engine::grants::{
     default_grants_path_in, is_acp_proxy_active, paths_overlap,
     sanitize_scratch_note_path_for_lang, workspaces_overlap, ClaimOutcome, GrantFileSignature,
-    RelayGrantStore,
+    PanelPrefs, RelayGrantStore,
 };
 use crate::engine::pruner::distill_slice_with_lang;
 use crate::engine::telemetry::{
-    compute_snapshot_digest, now_epoch_sec, OverviewSnapshot, TelemetryEngine,
+    compute_snapshot_digest, now_epoch_sec, OverviewSnapshot, TelemetryEngine, UiSettingsSnapshot,
 };
 use crate::i18n::{parse_lang_tag, select_display_cost};
 use crate::rpc::tools::{
     fmt_k, format_live_status_tag, resources_spec, summarize_snapshot_text, tools_spec, APP_MIME,
     HANDOFF_URI, PANEL_URI,
 };
-use crate::settings::{expand_tilde, PANEL_HTML_ENV};
+use crate::settings::{
+    abbreviate_home_path, expand_tilde, update_settings_file_atomic, SettingsPatch, PANEL_HTML_ENV,
+};
 
 pub const SERVER_NAME: &str = "context-radar-mcp";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -328,6 +330,62 @@ impl SwrHub {
     }
 }
 
+fn build_ui_settings_view(
+    engine: &mut TelemetryEngine,
+    grants: &mut RelayGrantStore,
+) -> (
+    PanelPrefs,
+    UiSettingsSnapshot,
+    Option<String>,
+    Option<String>,
+) {
+    let cfg = engine.rates.current_settings();
+    let grant_prefs = grants.get_settings();
+    let eff_allow = cfg
+        .ui
+        .allow_auto_handoff
+        .unwrap_or(grant_prefs.allow_auto_handoff);
+    let eff_lang = if !cfg.lang.is_empty() {
+        cfg.lang.clone()
+    } else {
+        grant_prefs.lang.clone()
+    };
+    let currency_code = if cfg.pricing.currency_configured && !cfg.pricing.currency_code.is_empty()
+    {
+        cfg.pricing.currency_code.clone()
+    } else {
+        "auto".to_string()
+    };
+    let (fx_rate, _) = engine.rates.get_fx_rate();
+    let prefs = PanelPrefs {
+        allow_auto_handoff: eff_allow,
+        lang: eff_lang.clone(),
+    };
+    let ui_snap = UiSettingsSnapshot {
+        lang: if eff_lang.is_empty() {
+            "auto".to_string()
+        } else {
+            eff_lang
+        },
+        currency_code,
+        fx_rate: (fx_rate * 10000.0).round() / 10000.0,
+        poll_interval_sec: cfg.ui.poll_interval_sec,
+        bg_poll_interval_sec: cfg.ui.bg_poll_interval_sec,
+        allow_auto_handoff: eff_allow,
+        compact_threshold: cfg.context.compact_threshold,
+    };
+    let path_str = if !cfg.source_path.is_empty() {
+        Some(abbreviate_home_path(Path::new(&cfg.source_path)))
+    } else {
+        engine
+            .rates
+            .watcher
+            .target_path()
+            .map(|p| abbreviate_home_path(&p))
+    };
+    (prefs, ui_snap, path_str, cfg.settings_error.clone())
+}
+
 fn attach_grant_and_rehash_inner(
     engine: &mut TelemetryEngine,
     grants: &mut RelayGrantStore,
@@ -335,8 +393,12 @@ fn attach_grant_and_rehash_inner(
     scope_cid: Option<&str>,
     scope_ws_override: Option<&str>,
 ) {
-    let settings = grants.get_settings();
+    let (settings, ui_settings, settings_path, settings_error) =
+        build_ui_settings_view(engine, grants);
     snap.settings = Some(settings.clone());
+    snap.ui_settings = Some(ui_settings);
+    snap.settings_path = settings_path;
+    snap.settings_error = settings_error;
     snap.pending_grant = None;
 
     let daemon_ws = engine.effective_daemon_workspace();
@@ -646,27 +708,101 @@ impl McpDaemon {
             "set_prefs" => {
                 let allow = args.get("allow_auto_handoff").and_then(Value::as_bool);
                 let lang_pref = args.get("lang").and_then(Value::as_str);
-                let Ok(updated) = self.grants.update_settings_with_lang(allow, lang_pref) else {
+                let currency_code = args
+                    .get("currency_code")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string());
+                let fx_rate = args
+                    .get("fx_rate")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)));
+                let poll_interval_sec = args.get("poll_interval_sec").and_then(Value::as_u64);
+                let bg_poll_interval_sec = args.get("bg_poll_interval_sec").and_then(Value::as_i64);
+                let compact_threshold = args.get("compact_threshold").and_then(Value::as_u64);
+
+                if (allow.is_some() || lang_pref.is_some())
+                    && self
+                        .grants
+                        .update_settings_with_lang(allow, lang_pref)
+                        .is_err()
+                {
                     return grant_storage_error(zh);
+                }
+
+                let patch = SettingsPatch {
+                    lang: lang_pref.map(|s| s.to_string()),
+                    currency_code,
+                    fx_rate,
+                    poll_interval_sec,
+                    bg_poll_interval_sec,
+                    allow_auto_handoff: allow,
+                    compact_threshold,
                 };
+                let has_settings_patch = patch.lang.is_some()
+                    || patch.currency_code.is_some()
+                    || patch.fx_rate.is_some()
+                    || patch.poll_interval_sec.is_some()
+                    || patch.bg_poll_interval_sec.is_some()
+                    || patch.allow_auto_handoff.is_some()
+                    || patch.compact_threshold.is_some();
+
+                if has_settings_patch {
+                    if let Some(target_path) = self.engine.rates.watcher.target_path() {
+                        if let Err(err) = update_settings_file_atomic(&target_path, &patch) {
+                            let err_msg = if err == "invalid_json" {
+                                if zh {
+                                    "配置文件有误，暂时沿用上次的有效设置。".to_string()
+                                } else {
+                                    "settings.json has an error. Using your last good settings."
+                                        .to_string()
+                                }
+                            } else if zh {
+                                format!("保存失败：{err}")
+                            } else {
+                                format!("Couldn't save: {err}")
+                            };
+                            return json!({
+                                "content": [{ "type": "text", "text": err_msg }],
+                                "structuredContent": { "mode": "prefs", "error": err },
+                                "isError": true
+                            });
+                        }
+                    }
+                }
+
+                let (updated, ui_settings, settings_path, settings_error) =
+                    build_ui_settings_view(&mut self.engine, &mut self.grants);
                 self.engine
                     .rates
                     .set_lang_override(parse_lang_tag(&updated.lang));
                 let zh = self.engine.rates.get_lang().is_zh();
                 let msg = if zh {
                     format!(
-                        "已更新面板偏好：allow_auto_handoff={}",
-                        updated.allow_auto_handoff
+                        "设置已保存。自动接续：{}。",
+                        if updated.allow_auto_handoff {
+                            "已开启"
+                        } else {
+                            "已关闭"
+                        }
                     )
                 } else {
                     format!(
-                        "Updated panel preferences: allow_auto_handoff={}",
-                        updated.allow_auto_handoff
+                        "Settings saved. Auto handoff: {}.",
+                        if updated.allow_auto_handoff {
+                            "on"
+                        } else {
+                            "off"
+                        }
                     )
                 };
                 json!({
                     "content": [{ "type": "text", "text": msg }],
-                    "structuredContent": { "mode": "prefs", "settings": updated },
+                    "structuredContent": {
+                        "mode": "prefs",
+                        "settings": updated,
+                        "ui_settings": ui_settings,
+                        "settings_path": settings_path,
+                        "settings_error": settings_error
+                    },
                     "isError": false
                 })
             }
@@ -778,9 +914,13 @@ impl McpDaemon {
                         .as_ref()
                         .map(|t| t.title.as_str())
                         .filter(|s| !s.is_empty())
-                        .unwrap_or("current session");
+                        .unwrap_or(if zh {
+                            "当前会话"
+                        } else {
+                            "current session"
+                        });
                     let default_pts = if zh {
-                        format!("保留会话《{title}》当前进展、已修改文件、验证结果与工程约束")
+                        format!("保留会话「{title}」当前进展、已修改文件、验证结果与约束")
                     } else {
                         format!("Preserve progress, modified files, verification state, and constraints from '{title}'")
                     };
@@ -805,7 +945,7 @@ impl McpDaemon {
         let preserve = str_arg(args, "preserve_points");
         if preserve.is_empty() {
             return json!({
-                "content": [{ "type": "text", "text": if zh { "preserve_points 不能为空" } else { "preserve_points must not be empty" } }],
+                "content": [{ "type": "text", "text": if zh { "请至少写一条要保留的内容。" } else { "Add at least one thing to keep." } }],
                 "isError": true
             });
         }
@@ -876,12 +1016,12 @@ impl McpDaemon {
             });
             let msg_txt = if zh {
                 format!(
-                    "【服务端校验拦截：暂不执行全量压缩/接力】\n- {}\n请继续复用当前热前缀执行任务，或调用 context_radar_hotspots 将早期片段旁路提炼到 scratch/。",
+                    "暂不能接续：\n- {}\n请先继续当前会话，或先把要点存进笔记文件。",
                     gate.reasons.join("\n- ")
                 )
             } else {
                 format!(
-                    "[Handoff Gate Blocked]\n- {}\nKeep using the warm KV prefix, or call context_radar_hotspots to distill older slices to scratch/.",
+                    "Can't hand off yet:\n- {}\nKeep going, or save key points to a notes file first.",
                     gate.reasons.join("\n- ")
                 )
             };
@@ -895,12 +1035,13 @@ impl McpDaemon {
         let Ok(settings) = self.grants.try_get_settings() else {
             return grant_storage_error(zh);
         };
-        let allow_auto = settings.allow_auto_handoff;
+        let cfg_ui_allow = self.engine.rates.current_settings().ui.allow_auto_handoff;
+        let allow_auto = cfg_ui_allow.unwrap_or(settings.allow_auto_handoff);
         if acp_strict_error && !allow_auto {
             let reason = if zh {
-                "面板「自动接力」开关当前已关闭（allow_auto_handoff=false）；已阻止 ACP 自动触发 `/compact`。"
+                "「自动接续」已关闭，暂不自动执行 /compact。"
             } else {
-                "Auto-handoff is currently disabled in Context Radar preferences (allow_auto_handoff=false); blocking autonomous ACP `/compact`."
+                "Auto handoff is turned off; skipping automatic /compact."
             };
             let blocked = json!({
                 "mode": "handoff_blocked",
@@ -984,14 +1125,14 @@ impl McpDaemon {
                 && allow_auto
                 && grant.auto_fire
             {
-                "检测到官方 ACP 自动压缩代理（acp-proxy / acp-run）已挂载且 running_subagent_count == 0：请立即结束本轮回复（不要再调用额外工具），代理将在本轮结束后通过官方 ACP `session/prompt` 原地执行下方 `/compact` 指令并无缝续跑。"
+                "检测到 ACP 自动压缩代理已开启且无运行中的子代理：请直接结束本轮回复，代理会自动原地执行下方 `/compact` 指令并继续。"
             } else if allow_auto && grant.auto_fire {
-                "面板「自动接力」已开启且 running_subagent_count == 0：当本工具内联卡片或同工作区 Context Radar 侧边栏处于可见挂载状态时，前端会自动核销票据并触发官方接力/压缩流程；若当前在无界面的 agy CLI、折叠卡片或后台标签页中运行，请使用 `context-radar-mcp acp-proxy` / `acp-run`，或展开面板点击/复制下方 `/compact` 指令。"
+                "自动接续已开启且无运行中的子代理：面板处于可见状态时会自动继续；在命令行环境中可使用 `context-radar-mcp acp-proxy` / `acp-run`，或直接复制下方 `/compact` 指令。"
             } else {
-                "本次未启用自动触发（auto_fire=false 或面板开关已关闭）：已保留当前会话窗口，可在卡片或侧边栏一键执行/复制 `/compact` 指令，或手动点击拉起新会话。"
+                "自动接续未开启：保留当前会话窗口，可在面板中点击执行/复制 `/compact`，或手动开新会话。"
             };
             format!(
-                "已通过模型档位、冷却、回本轮数与 running_subagent_count == 0 校验，票据已绑定至当前会话与工作区。\n- `/compact` 指令：`{}`\n- 官方执行说明：{auto_line}",
+                "检查通过，已生成接续。\n- `/compact` 指令：`{}`\n- 执行说明：{auto_line}",
                 grant.compact_command
             )
         } else {
@@ -1000,14 +1141,14 @@ impl McpDaemon {
                 && allow_auto
                 && grant.auto_fire
             {
-                "Official ACP auto-compact proxy (`acp-proxy` / `acp-run`) is active and running_subagent_count == 0: end this turn cleanly now (avoid further tool calls) so the proxy can execute native ACP `session/prompt` `/compact` in-place on the same session and resume automatically."
+                "ACP auto-compact proxy is active with no running subagents: end this turn cleanly now so the proxy can run `/compact` in-place and resume."
             } else if allow_auto && grant.auto_fire {
-                "Auto-handoff is enabled and running_subagent_count == 0: when the inline card or matching-workspace Context Radar side pane is mounted and visible, the webview will claim this single-use grant automatically; in headless `agy` CLI or ACP editors, run via `context-radar-mcp acp-proxy` / `acp-run`, or copy the `/compact` command below."
+                "Auto handoff is on with no running subagents: an open visible panel will dispatch it automatically; in headless CLI use `context-radar-mcp acp-proxy` / `acp-run`, or copy the `/compact` command below."
             } else {
-                "Auto-launch is off for this grant (`auto_fire=false` or paused in panel): the current window stays active; run or copy the `/compact` command or click 'Launch New Chat' in the panel when ready."
+                "Auto handoff is off for this request: the current window stays open; run or copy `/compact`, or click 'New chat' in the panel when ready."
             };
             format!(
-                "Passed all model-tier, cooldown, break-even, and running_subagent_count == 0 gates (grant scoped to this conversation and workspace).\n- Ready `/compact` command: `{}`\n- Dispatch status: {auto_line}",
+                "Checks passed. Handoff created.\n- Ready `/compact` command: `{}`\n- Status: {auto_line}",
                 grant.compact_command
             )
         };

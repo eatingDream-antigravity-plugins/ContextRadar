@@ -8,13 +8,13 @@ Guidance for AI coding agents working in `context-radar-mcp`. For agent usage in
 - `src/rpc/` — MCP stdio JSON-RPC server (`protocol.rs`), 5 public tools, SEP-1865 App-only tools, and scoped single-use handoff grants.
 - `src/acp/` — Pure-protocol ACP thin client (`acp-proxy`, `acp-run`) forwarding `agy acp` stdio cleanly with zero telemetry/grant coupling.
 - `src/guard/` — Fail-open `SessionStart` (`boot.rs`) and `PreToolUse` (`exec_gate.rs`) hooks.
-- `panel/` — Zero-dependency dark-first SEP-1865 UI (`pack.mjs` -> `panel/dist/panel.html`, kept `<45 KiB`).
+- `panel/` — Zero-dependency dark-first SEP-1865 TypeScript UI (`pack.ts` -> `panel/dist/panel.html`, kept `<=64 KiB`).
 - `plugin.json`, `mcp_config.json`, `hooks.json`, `rules/AGENTS.md`, `skills/context-radar/SKILL.md` — Official Antigravity plugin & portable Agent Skill bundle.
 
 ## Build, Test & Security Gates (run before every PR)
 
 ```sh
-node panel/pack.mjs && node --test panel/panel.test.mjs
+npm --prefix panel run typecheck && npm --prefix panel run build && npm --prefix panel test
 cargo test --locked
 ./scripts/check_sanitized.sh
 ```

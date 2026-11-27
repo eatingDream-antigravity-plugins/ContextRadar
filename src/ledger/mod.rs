@@ -50,6 +50,8 @@ pub struct LiveStepProbe {
     pub live_error_step_idx: i64,
     #[serde(default)]
     pub compact_summary_bytes: usize,
+    #[serde(default)]
+    pub is_side_question: bool,
 }
 
 impl Default for LiveStepProbe {
@@ -63,6 +65,7 @@ impl Default for LiveStepProbe {
             live_error: String::new(),
             live_error_step_idx: -1,
             compact_summary_bytes: 0,
+            is_side_question: false,
         }
     }
 }
@@ -184,12 +187,14 @@ pub struct SummaryRecord {
     pub last_user_input_step_index: i64,
     pub archived: bool,
     pub pinned: bool,
+    pub is_side_question: bool,
 }
 
 impl SummaryRecord {
     #[inline]
     pub fn is_subagent(&self) -> bool {
-        self.nesting_depth > 0
+        self.is_side_question
+            || self.nesting_depth > 0
             || !self.parent_conversation_id.is_empty()
             || (!self.agent_name.is_empty() && self.last_user_input_step_index < 0)
     }

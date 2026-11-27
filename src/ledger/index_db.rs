@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ledger::{LiveStepProbe, TurnSample};
 
-// Older versions can contain cursors saved after incomplete host reads.
-pub const INDEX_SCHEMA_VERSION: i64 = 3;
+// Older versions can contain cursors saved after incomplete host reads or lack trajectory_type metadata.
+pub const INDEX_SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbVersionSig {

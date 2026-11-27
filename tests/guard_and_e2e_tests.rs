@@ -673,7 +673,7 @@ fn test_full_stdio_mcp_daemon_e2e_with_synthetic_fixture() {
     assert!(!html.contains("innerHTML"));
     assert!(html.contains("role:\"switch\"") && html.contains("\"aho\""));
     assert!(html.contains("\"ci\""));
-    assert!(html.contains("Copy baton"));
+    assert!(html.contains("Copy handoff note"));
 
     drop(stdin);
     assert!(proc.wait().unwrap().success());

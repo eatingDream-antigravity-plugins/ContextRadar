@@ -71,57 +71,50 @@ impl MidLoopSubReason {
             Self::None => ("", ""),
             Self::SlowTurnSelfExpiry => match (zh, ttl_sec) {
                 (true, 180) => (
-                    "慢轮自过期",
-                    "单轮生成耗时 >=3 分钟（空闲 <60s），prefill 起的 180s 缓存 TTL 在流式中途过期",
+                    "缓存过期",
+                    "这一轮超过了缓存有效期（约 3 分钟），只能重算。",
                 ),
                 (false, 180) => (
-                    "Slow-turn TTL",
-                    "Turn took >=3m from prefill start (idle <60s), expiring its 180s KV cache mid-stream",
+                    "Cache expired",
+                    "This turn ran past the cache lifetime (~3 min), so it was rebuilt.",
                 ),
                 (true, 240) => (
-                    "慢轮自过期",
-                    "单轮生成耗时 >=4 分钟（空闲 <60s），prefill 起的 240s 缓存 TTL 在流式中途过期",
+                    "缓存过期",
+                    "这一轮超过了缓存有效期（约 4 分钟），只能重算。",
                 ),
                 (false, 240) => (
-                    "Slow-turn TTL",
-                    "Turn took >=4m from prefill start (idle <60s), expiring its 240s KV cache mid-stream",
+                    "Cache expired",
+                    "This turn ran past the cache lifetime (~4 min), so it was rebuilt.",
                 ),
                 (true, _) => (
-                    "慢轮自过期",
-                    "单轮生成耗时 >=5 分钟（空闲 <60s），prefill 起的缓存 TTL 在流式中途过期",
+                    "缓存过期",
+                    "这一轮超过了缓存有效期（约 5 分钟），只能重算。",
                 ),
                 (false, _) => (
-                    "Slow-turn TTL",
-                    "Turn took >=5m from prefill start (idle <60s), expiring its KV cache mid-stream",
+                    "Cache expired",
+                    "This turn ran past the cache lifetime (~5 min), so it was rebuilt.",
                 ),
             },
             Self::ReplicaSpillover => {
                 if zh {
-                    (
-                        "副本溢出",
-                        "请求路由到其他缓存副本（回退早期前缀，或 >=3 个同模型活跃会话并发挤占）",
-                    )
+                    ("缓存被清", "服务端繁忙，缓存被清掉了。")
                 } else {
-                    (
-                        "Replica spillover",
-                        "Routed to an alternate replica (earlier-prefix rollback or >=3 overlapping same-model sessions)",
-                    )
+                    ("Cache dropped", "The server cleared the cache under load.")
                 }
             }
             Self::ModelSwitchCold => {
                 if zh {
-                    (
-                        "切换模型",
-                        "相邻步骤切换了模型或推理档位，导致前缀缓存失效",
-                    )
+                    ("换了模型", "换模型后用不上之前的缓存。")
                 } else {
                     (
-                        "Model switch",
-                        "Model or reasoning-effort changed between consecutive steps",
+                        "Model switched",
+                        "A different model can't reuse the old cache.",
                     )
                 }
             }
-            Self::Other => ColdCacheKind::MidLoop.label_and_reason_for_lang_with_ttl(lang, partial, ttl_sec),
+            Self::Other => {
+                ColdCacheKind::MidLoop.label_and_reason_for_lang_with_ttl(lang, partial, ttl_sec)
+            }
         }
     }
 }
@@ -168,28 +161,28 @@ impl ColdCacheKind {
             Self::TurnStart => {
                 if zh {
                     (
-                        "新轮次未命中",
+                        "新一轮未命中",
                         if partial {
-                            "跨轮次唤醒缓存部分失效并触发重写入"
+                            "只用上了开头一部分缓存。"
                         } else if ttl_sec == 180 {
-                            "跨轮次首步缓存未命中（>3 分钟 prefill TTL 过期或副本切换）"
+                            "新一轮超过了约 3 分钟的缓存有效期，没有用上缓存。"
                         } else if ttl_sec == 240 {
-                            "跨轮次首步缓存未命中（>4 分钟 prefill TTL 过期或副本切换）"
+                            "新一轮超过了约 4 分钟的缓存有效期，没有用上缓存。"
                         } else {
-                            "跨轮次首步缓存未命中（>5 分钟 TTL 过期或副本切换）"
+                            "新一轮没有用上缓存。"
                         },
                     )
                 } else {
                     (
                         "New-turn miss",
                         if partial {
-                            "Partial prefix miss across user turns with cache rebuild"
+                            "Only the start of the context was reused."
                         } else if ttl_sec == 180 {
-                            "First step of a new turn missed cache (>3m prefill-anchored TTL expiry or replica shift)"
+                            "The new turn ran past the ~3 min cache lifetime."
                         } else if ttl_sec == 240 {
-                            "First step of a new turn missed cache (>4m prefill-anchored TTL expiry or replica shift)"
+                            "The new turn ran past the ~4 min cache lifetime."
                         } else {
-                            "First step of a new turn missed cache (>5m TTL expiry or replica shift)"
+                            "The new turn didn't hit the cache."
                         },
                     )
                 }
@@ -197,36 +190,21 @@ impl ColdCacheKind {
             Self::MidLoop => {
                 if partial {
                     if zh {
-                        (
-                            "中途前缀跌落",
-                            "同轮中途 cache_read 相比上步缓存前缀骤降并伴随大额重写入",
-                        )
+                        ("部分复用", "只用上了开头一部分缓存。")
                     } else {
-                        (
-                            "Partial prefix drop",
-                            "Mid-turn sharp drop in cache_read vs prior cached prefix with large cache rebuild",
-                        )
+                        ("Partly reused", "Only the start of the context was reused.")
                     }
                 } else if zh {
-                    (
-                        "中途断缓存",
-                        "同轮工具链中途缓存归零（中途规则注入改变前缀或副本漂移）",
-                    )
+                    ("中途失效", "这一轮中途缓存失效了。")
                 } else {
-                    (
-                        "Mid-turn break",
-                        "Mid-loop cache miss (rule/tool injection mutated prefix or replica shifted)",
-                    )
+                    ("Lost mid-turn", "The cache broke during the turn.")
                 }
             }
             Self::PostCompact => {
                 if zh {
-                    ("压缩后重建", "CHECKPOINT 压缩后首步重建缓存前缀")
+                    ("压缩后重建", "/compact 之后需要重建，属正常。")
                 } else {
-                    (
-                        "Post-compact",
-                        "Expected cache rebuild on first turn after CHECKPOINT",
-                    )
+                    ("After compact", "Expected rebuild after /compact.")
                 }
             }
         }
@@ -295,7 +273,43 @@ pub fn parse_iso_ts(raw: &str) -> f64 {
         let dt = ndt.and_utc();
         return (dt.timestamp() as f64) + (dt.timestamp_subsec_nanos() as f64) * 1e-9;
     }
+    if let Ok(raw) = text.parse::<i64>() {
+        let ts = if raw >= 100_000_000_000_000_000 {
+            (raw as f64) * 1e-9
+        } else if raw >= 100_000_000_000_000 {
+            (raw as f64) * 1e-6
+        } else if raw >= 100_000_000_000 {
+            (raw as f64) * 1e-3
+        } else if raw >= 946_684_800 {
+            raw as f64
+        } else {
+            0.0
+        };
+        if ts >= 946_684_800.0 {
+            return ts;
+        }
+    }
     0.0
+}
+
+const SIDE_QUESTION_RECENT_PROBE_SEC: f64 = 60.0;
+
+#[inline]
+fn is_side_question_active(
+    killed: bool,
+    eff_mtime: f64,
+    now_ts: f64,
+    probe: Option<&LiveStepProbe>,
+    latest_turn_step_idx: i64,
+) -> bool {
+    if killed {
+        return false;
+    }
+    let Some(p) = probe else { return false };
+    if p.live_phase.is_empty() || p.live_active_step_idx < latest_turn_step_idx {
+        return false;
+    }
+    eff_mtime > 0.0 && (now_ts - eff_mtime).max(0.0) <= SIDE_QUESTION_RECENT_PROBE_SEC
 }
 
 pub fn format_utc_iso(ts_sec: f64) -> String {
@@ -581,6 +595,7 @@ fn canonical_model_key(model: &str, model_display: &str) -> String {
 fn compute_live_state(
     probe: Option<&LiveStepProbe>,
     is_active: bool,
+    has_summary: bool,
     killed: bool,
     cross_model_compact: bool,
     now_ts: f64,
@@ -595,7 +610,14 @@ fn compute_live_state(
         return (live_status.to_string(), String::new(), 0, live_error);
     }
 
-    let live_phase = probe.map(|p| p.live_phase.clone()).unwrap_or_default();
+    let raw_phase = probe.map(|p| p.live_phase.clone()).unwrap_or_default();
+    // Suppress lingering non-compacting background steps on sessions whose summary explicitly
+    // says idle/parked (e.g., parked swarm monitors or idle sessions with background commands).
+    let live_phase = if has_summary && !is_active && raw_phase != "compacting" {
+        String::new()
+    } else {
+        raw_phase
+    };
     let raw_elapsed = if !live_phase.is_empty() {
         probe
             .filter(|p| p.live_started_ts > 0.0)
@@ -645,6 +667,7 @@ pub struct SessionTelemetry {
     pub agent_name: String,
     pub parent_id: String,
     pub is_subagent: bool,
+    pub is_side_question: bool,
     pub is_running: bool,
     pub not_fully_idle: bool,
     pub is_active: bool,
@@ -1001,7 +1024,9 @@ pub fn build_session_telemetry_with_probe(
     let not_fully_idle = summary
         .map(|s| s.not_fully_idle && !s.killed)
         .unwrap_or(false);
-    let is_subagent = summary.map(|s| s.is_subagent()).unwrap_or(false);
+    let is_side_question = summary.map(|s| s.is_side_question).unwrap_or(false)
+        || live_probe.map(|p| p.is_side_question).unwrap_or(false);
+    let is_subagent = is_side_question || summary.map(|s| s.is_subagent()).unwrap_or(false);
     let agent_name = summary.map(|s| s.agent_name.clone()).unwrap_or_default();
     let parent_id = summary
         .map(|s| s.parent_conversation_id.clone())
@@ -1052,7 +1077,10 @@ pub fn build_session_telemetry_with_probe(
     };
     let last_iso = format_utc_iso(last_ts);
 
-    let is_active = if is_subagent {
+    let latest_turn_step_idx = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
+    let is_active = if is_side_question {
+        is_side_question_active(killed, eff_mtime, now_ts, live_probe, latest_turn_step_idx)
+    } else if is_subagent {
         is_subagent_active(
             summary,
             last_ts,
@@ -1130,8 +1158,19 @@ pub fn build_session_telemetry_with_probe(
         false
     };
 
-    let (live_status, live_phase, live_elapsed_sec, live_error) =
-        compute_live_state(live_probe, is_active, killed, cross_model_compact, now_ts);
+    let effective_probe = if is_side_question && !is_active {
+        None
+    } else {
+        live_probe
+    };
+    let (live_status, live_phase, live_elapsed_sec, live_error) = compute_live_state(
+        effective_probe,
+        is_active,
+        summary.is_some(),
+        killed,
+        cross_model_compact,
+        now_ts,
+    );
 
     let compact_summary_bytes = live_probe.map(|p| p.compact_summary_bytes).unwrap_or(0);
     let compact_summary_kb = if compact_summary_bytes > 0 {
@@ -1148,6 +1187,7 @@ pub fn build_session_telemetry_with_probe(
         agent_name,
         parent_id,
         is_subagent,
+        is_side_question,
         is_running,
         not_fully_idle,
         is_active,
@@ -1375,6 +1415,9 @@ pub struct SnapshotThresholds {
 #[derive(Debug, Clone, Serialize)]
 pub struct SnapshotSummary {
     pub total_db_files: usize,
+    pub total_main_count: usize,
+    pub total_subagent_count: usize,
+    pub total_archived_count: usize,
     pub archived_hidden_count: usize,
     pub history_subagents_hidden_count: usize,
     pub shown_main_count: usize,
@@ -1389,6 +1432,17 @@ pub struct SnapshotSummary {
     pub error_session_count: usize,
     pub total_cost_usd: f64,
     pub total_cost_cny: f64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct UiSettingsSnapshot {
+    pub lang: String,
+    pub currency_code: String,
+    pub fx_rate: f64,
+    pub poll_interval_sec: u64,
+    pub bg_poll_interval_sec: i64,
+    pub allow_auto_handoff: bool,
+    pub compact_threshold: u64,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -1432,6 +1486,12 @@ pub struct OverviewSnapshot {
     pub orphan_subagents: Vec<SessionTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings: Option<PanelPrefs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_settings: Option<UiSettingsSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_grant: Option<RelayGrant>,
 }
@@ -1489,6 +1549,9 @@ pub fn compute_snapshot_digest(snap: &OverviewSnapshot) -> String {
         sessions: &'a [SessionTelemetry],
         orphan_subagents: &'a [SessionTelemetry],
         settings: &'a Option<PanelPrefs>,
+        ui_settings: &'a Option<UiSettingsSnapshot>,
+        settings_path: &'a Option<String>,
+        settings_error: &'a Option<String>,
         pending_grant: &'a Option<RelayGrant>,
     }
 
@@ -1505,6 +1568,9 @@ pub fn compute_snapshot_digest(snap: &OverviewSnapshot) -> String {
         sessions: &snap.sessions,
         orphan_subagents: &snap.orphan_subagents,
         settings: &snap.settings,
+        ui_settings: &snap.ui_settings,
+        settings_path: &snap.settings_path,
+        settings_error: &snap.settings_error,
         pending_grant: &snap.pending_grant,
     };
     let bytes = serde_json::to_vec(&stable).unwrap_or_default();
@@ -1587,8 +1653,13 @@ impl TelemetryEngine {
     ) -> Self {
         let root = data_root
             .unwrap_or_else(|| default_data_root_for_plugin_data(plugin_data_dir.as_deref()));
-        let mut rate_table =
-            rates.unwrap_or_else(|| RateTable::new(SettingsWatcher::new(None), None, None));
+        let mut rate_table = rates.unwrap_or_else(|| {
+            RateTable::new(
+                SettingsWatcher::new_with_plugin_data(None, plugin_data_dir.clone()),
+                None,
+                None,
+            )
+        });
         let disk_path = resolve_disk_cache_path(
             &root,
             plugin_data_dir.as_deref(),
@@ -1699,13 +1770,25 @@ impl TelemetryEngine {
         if let Some((prev_key, prev_probe, prev_tel)) = self.metrics_cache.get(cid) {
             if *prev_key == cache_key && *prev_probe == owned_probe {
                 let mut out = prev_tel.clone();
+                let eff_mtime = stamp.map(|s| s.eff_mtime).unwrap_or(out.last_active_ts);
+                let latest_turn_step_idx = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
                 if out.is_subagent {
-                    let is_act = is_subagent_active(
-                        summary,
-                        out.last_active_ts,
-                        ref_now,
-                        cfg.context.subagent_silent_timeout_sec,
-                    );
+                    let is_act = if out.is_side_question {
+                        is_side_question_active(
+                            out.killed,
+                            eff_mtime,
+                            ref_now,
+                            Some(prev_probe),
+                            latest_turn_step_idx,
+                        )
+                    } else {
+                        is_subagent_active(
+                            summary,
+                            out.last_active_ts,
+                            ref_now,
+                            cfg.context.subagent_silent_timeout_sec,
+                        )
+                    };
                     out.is_active = is_act;
                     out.run_state = if out.killed {
                         "killed"
@@ -1718,9 +1801,15 @@ impl TelemetryEngine {
                     }
                     .to_string();
                 }
+                let eff_probe = if out.is_side_question && !out.is_active {
+                    None
+                } else {
+                    Some(prev_probe)
+                };
                 let (ls, lp, le, lerr) = compute_live_state(
-                    Some(prev_probe),
+                    eff_probe,
                     out.is_active,
+                    summary.is_some(),
                     out.killed,
                     out.cross_model_compact,
                     ref_now,
@@ -1833,6 +1922,25 @@ impl TelemetryEngine {
             let Some(stamp) = stat_db_stamp(&self.ledger.db_path(&cid)) else {
                 continue;
             };
+            if s.is_side_question {
+                if !s.killed
+                    && (ref_now - stamp.eff_mtime).max(0.0) <= SIDE_QUESTION_RECENT_PROBE_SEC
+                {
+                    let (turns, probe) =
+                        self.ledger.try_read_turns_and_probe(&cid, Some(&stamp))?;
+                    let latest_step = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
+                    if is_side_question_active(
+                        s.killed,
+                        stamp.eff_mtime,
+                        ref_now,
+                        Some(&probe),
+                        latest_step,
+                    ) {
+                        count += 1;
+                    }
+                }
+                continue;
+            }
             let eff_ts = parse_iso_ts(&s.last_modified_time).max(stamp.eff_mtime);
             if is_subagent_active(Some(&s), eff_ts, ref_now, silent_sec) {
                 count += 1;
@@ -1868,6 +1976,24 @@ impl TelemetryEngine {
             let Some(stamp) = stat_db_stamp(&self.ledger.db_path(&cid)) else {
                 continue;
             };
+            if s.is_side_question {
+                if !s.killed
+                    && (ref_now - stamp.eff_mtime).max(0.0) <= SIDE_QUESTION_RECENT_PROBE_SEC
+                {
+                    let (turns, probe) = self.ledger.read_turns_and_probe(&cid, Some(&stamp));
+                    let latest_step = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
+                    if is_side_question_active(
+                        s.killed,
+                        stamp.eff_mtime,
+                        ref_now,
+                        Some(&probe),
+                        latest_step,
+                    ) {
+                        count += 1;
+                    }
+                }
+                continue;
+            }
             let eff_ts = parse_iso_ts(&s.last_modified_time).max(stamp.eff_mtime);
             if is_subagent_active(Some(&s), eff_ts, ref_now, silent_sec) {
                 count += 1;
@@ -1997,6 +2123,9 @@ impl TelemetryEngine {
 
                 for (scid, mtime) in &file_mtimes {
                     let s = summaries.get(scid);
+                    if s.is_some_and(|r| r.is_side_question) {
+                        continue;
+                    }
                     let is_sub = s.map(|r| r.is_subagent()).unwrap_or(false);
                     let strictly_running = s
                         .map(|r| !r.killed && r.status == "CASCADE_RUN_STATUS_RUNNING")
@@ -2069,8 +2198,19 @@ impl TelemetryEngine {
                             })
                             .then_with(|| b.3.cmp(&a.3))
                     });
-                    resolved_cid = pool[0].3.clone();
-                    prefetched = file_stamps.get(&resolved_cid).cloned();
+                    for (_, _, _, cand_cid) in pool.iter() {
+                        let cand_st = file_stamps.get(cand_cid).cloned();
+                        if summaries.get(cand_cid).is_none() {
+                            let (_, probe) =
+                                self.ledger.read_turns_and_probe(cand_cid, cand_st.as_ref());
+                            if probe.is_side_question {
+                                continue;
+                            }
+                        }
+                        resolved_cid = cand_cid.clone();
+                        prefetched = cand_st;
+                        break;
+                    }
                 }
             }
         }
@@ -2130,17 +2270,56 @@ impl TelemetryEngine {
         let summaries = self.ledger.read_summaries();
         let (file_mtimes, file_stamps) = self.ledger.scan_dir();
 
-        let archived_hidden_count = summaries
-            .iter()
-            .filter(|(cid, s)| s.archived && file_mtimes.contains_key(*cid) && !s.is_subagent())
-            .count();
+        let mut total_main_count = 0usize;
+        let mut total_subagent_count = 0usize;
+        let mut total_archived_count = 0usize;
+        for cid in file_mtimes.keys() {
+            let s = summaries.get(cid);
+            if !ws_filter.is_empty() {
+                let matched = s
+                    .map(|r| r.matches_workspace_filter(&ws_filter))
+                    .unwrap_or(false);
+                if !matched {
+                    continue;
+                }
+            }
+            if s.is_some_and(|r| r.is_subagent()) {
+                total_subagent_count += 1;
+            } else if s.is_some_and(|r| r.archived) {
+                total_archived_count += 1;
+            } else {
+                total_main_count += 1;
+            }
+        }
 
         let mut running_ids: HashSet<String> = HashSet::new();
         for (cid, s) in summaries.iter() {
             let Some(&mtime) = file_mtimes.get(cid) else {
                 continue;
             };
-            if s.is_subagent() {
+            if s.is_side_question {
+                if !s.killed && (ref_now - mtime).max(0.0) <= SIDE_QUESTION_RECENT_PROBE_SEC {
+                    let stamp = file_stamps.get(cid);
+                    match self.ledger.try_read_turns_and_probe(cid, stamp) {
+                        Ok((turns, probe)) => {
+                            let latest_step = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
+                            if is_side_question_active(
+                                s.killed,
+                                mtime,
+                                ref_now,
+                                Some(&probe),
+                                latest_step,
+                            ) {
+                                running_ids.insert(cid.clone());
+                                refresh_at = refresh_at.min(mtime + SIDE_QUESTION_RECENT_PROBE_SEC);
+                            }
+                        }
+                        Err(_) => {
+                            refresh_at = ref_now;
+                        }
+                    }
+                }
+            } else if s.is_subagent() {
                 let eff_ts = parse_iso_ts(&s.last_modified_time).max(mtime);
                 if is_subagent_active(
                     Some(s),
@@ -2159,16 +2338,6 @@ impl TelemetryEngine {
                 running_ids.insert(cid.clone());
             }
         }
-
-        let hidden_history_subagent_count = summaries
-            .iter()
-            .filter(|(cid, s)| {
-                file_mtimes.contains_key(*cid)
-                    && s.is_subagent()
-                    && !running_ids.contains(*cid)
-                    && s.matches_workspace_filter(&ws_filter)
-            })
-            .count();
 
         let mut priority_ids: HashSet<String> = running_ids.clone();
         for cid in &running_ids {
@@ -2201,6 +2370,8 @@ impl TelemetryEngine {
         }
 
         let mut selected_mains: Vec<String> = Vec::new();
+        let mut selected_unarchived_mains = 0usize;
+        let mut selected_archived_mains = 0usize;
         let mut selected_subs: Vec<String> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
@@ -2227,18 +2398,28 @@ impl TelemetryEngine {
                     seen.insert(cid);
                 }
             } else {
-                if s.map(|r| r.archived).unwrap_or(false)
-                    && !include_archived
-                    && !running_ids.contains(&cid)
-                {
+                let is_arch = s.map(|r| r.archived).unwrap_or(false);
+                if is_arch && !include_archived && !running_ids.contains(&cid) {
                     continue;
                 }
-                if selected_mains.len() < limit || priority_ids.contains(&cid) {
+                if is_arch {
+                    if selected_archived_mains < limit || priority_ids.contains(&cid) {
+                        selected_mains.push(cid.clone());
+                        selected_archived_mains += 1;
+                        seen.insert(cid);
+                    }
+                } else if selected_unarchived_mains < limit || priority_ids.contains(&cid) {
                     selected_mains.push(cid.clone());
+                    selected_unarchived_mains += 1;
                     seen.insert(cid);
                 }
             }
-            if selected_mains.len() >= limit && selected_subs.len() >= limit * 3 {
+            let mains_done = if include_archived {
+                selected_unarchived_mains >= limit && selected_archived_mains >= limit
+            } else {
+                selected_unarchived_mains >= limit
+            };
+            if mains_done && selected_subs.len() >= limit * 3 {
                 break;
             }
         }
@@ -2284,7 +2465,7 @@ impl TelemetryEngine {
             }
             turns_by_cid.insert(cid.clone(), (turns, probe));
         }
-        // Include any active conversations outside a workspace filter for global replica-pool/Carbon contention accuracy.
+        // Include any active conversations outside a workspace filter for global replica-pool/flagship contention accuracy.
         for cid in &running_ids {
             if turns_by_cid.contains_key(cid) {
                 continue;
@@ -2357,7 +2538,30 @@ impl TelemetryEngine {
 
         let mut children_map: HashMap<String, Vec<SessionTelemetry>> = HashMap::new();
         let mut orphans: Vec<SessionTelemetry> = Vec::new();
-        for cid in &selected_subs {
+        let mut discovered_subs: Vec<String> = Vec::new();
+        for cid in &selected_mains {
+            if metrics_by_id.get(cid).is_some_and(|m| m.is_subagent) {
+                discovered_subs.push(cid.clone());
+                if !summaries.get(cid).is_some_and(|s| s.is_subagent()) {
+                    total_subagent_count += 1;
+                    total_main_count = total_main_count.saturating_sub(1);
+                }
+            }
+        }
+        // Adjust totals for empty-turn DBs that were skipped when reading selected_mains/subs.
+        for cid in selected_mains.iter().chain(selected_subs.iter()) {
+            if !metrics_by_id.contains_key(cid) {
+                let s = summaries.get(cid);
+                if s.is_some_and(|r| r.is_subagent()) {
+                    total_subagent_count = total_subagent_count.saturating_sub(1);
+                } else if s.is_some_and(|r| r.archived) {
+                    total_archived_count = total_archived_count.saturating_sub(1);
+                } else {
+                    total_main_count = total_main_count.saturating_sub(1);
+                }
+            }
+        }
+        for cid in selected_subs.iter().chain(discovered_subs.iter()) {
             let Some(m) = metrics_by_id.get(cid).cloned() else {
                 continue;
             };
@@ -2381,6 +2585,9 @@ impl TelemetryEngine {
             let Some(mut m) = metrics_by_id.get(cid).cloned() else {
                 continue;
             };
+            if m.is_subagent {
+                continue;
+            }
             let mut subs = children_map.remove(cid).unwrap_or_default();
             subs.sort_by(|a, b| {
                 b.is_active
@@ -2441,6 +2648,14 @@ impl TelemetryEngine {
 
         let shown_subagent_count: usize =
             sessions.iter().map(|s| s.subagents.len()).sum::<usize>() + orphans.len();
+        let shown_archived_count = sessions.iter().filter(|s| s.archived).count();
+        let shown_unarchived_main_count = sessions.len().saturating_sub(shown_archived_count);
+        let total_main_count = total_main_count.max(shown_unarchived_main_count);
+        let total_subagent_count = total_subagent_count.max(shown_subagent_count);
+        let total_archived_count = total_archived_count.max(shown_archived_count);
+        let archived_hidden_count = total_archived_count.saturating_sub(shown_archived_count);
+        let history_subagents_hidden_count =
+            total_subagent_count.saturating_sub(shown_subagent_count);
         let running_main_count = sessions.iter().filter(|s| s.is_active).count();
         let mut running_subagent_count = 0usize;
         let mut compact_needed_count = 0usize;
@@ -2504,16 +2719,11 @@ impl TelemetryEngine {
             },
             summary: SnapshotSummary {
                 total_db_files: file_mtimes.len(),
-                archived_hidden_count: if include_archived {
-                    0
-                } else {
-                    archived_hidden_count
-                },
-                history_subagents_hidden_count: if show_history {
-                    0
-                } else {
-                    hidden_history_subagent_count
-                },
+                total_main_count,
+                total_subagent_count,
+                total_archived_count,
+                archived_hidden_count,
+                history_subagents_hidden_count,
                 shown_main_count: sessions.len(),
                 shown_subagent_count,
                 running_main_count,
@@ -2533,6 +2743,9 @@ impl TelemetryEngine {
             sessions,
             orphan_subagents: orphans,
             settings: None,
+            ui_settings: None,
+            settings_path: None,
+            settings_error: cfg.settings_error.clone(),
             pending_grant: None,
         };
         snap.digest = compute_snapshot_digest(&snap);
@@ -2597,7 +2810,15 @@ impl TelemetryEngine {
             let Some(&mtime) = file_mtimes.get(cid) else {
                 continue;
             };
-            let is_act = if s.is_subagent() {
+            let is_act = if s.is_side_question {
+                if !s.killed && (ref_now - mtime).max(0.0) <= SIDE_QUESTION_RECENT_PROBE_SEC {
+                    let (ct, p) = self.ledger.read_turns_and_probe(cid, file_stamps.get(cid));
+                    let latest_step = ct.iter().map(|t| t.step_idx).max().unwrap_or(-1);
+                    is_side_question_active(s.killed, mtime, ref_now, Some(&p), latest_step)
+                } else {
+                    false
+                }
+            } else if s.is_subagent() {
                 let eff_ts = parse_iso_ts(&s.last_modified_time).max(mtime);
                 is_subagent_active(
                     Some(s),

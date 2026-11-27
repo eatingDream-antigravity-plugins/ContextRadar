@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::os::unix::fs::MetadataExt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 pub const CONFIG_ENV: &str = "CONTEXT_RADAR_CONFIG";
 pub const DATA_ROOT_ENV: &str = "CONTEXT_RADAR_DATA_ROOT";
@@ -245,7 +248,27 @@ pub fn is_disable_token(val: &str) -> bool {
     DISABLE_TOKENS.iter().any(|t| *t == lower)
 }
 
+pub fn abbreviate_home_path(path: &Path) -> String {
+    let home = user_home_dir();
+    if let Ok(rel) = path.strip_prefix(&home) {
+        if rel.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rel.to_string_lossy())
+        }
+    } else {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 pub fn resolve_settings_path(explicit: Option<&str>) -> Option<PathBuf> {
+    resolve_settings_path_with_plugin_data(explicit, None)
+}
+
+pub fn resolve_settings_path_with_plugin_data(
+    explicit: Option<&str>,
+    plugin_data_dir: Option<&Path>,
+) -> Option<PathBuf> {
     if let Some(raw) = explicit {
         let trimmed = raw.trim();
         if trimmed.is_empty() || is_disable_token(trimmed) {
@@ -264,6 +287,15 @@ pub fn resolve_settings_path(explicit: Option<&str>) -> Option<PathBuf> {
         }
     }
 
+    let plugin_cand = plugin_data_dir
+        .filter(|d| !d.as_os_str().is_empty())
+        .map(|d| d.join("settings.json"));
+    if let Some(ref p) = plugin_cand {
+        if p.is_file() {
+            return Some(p.clone());
+        }
+    }
+
     if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
         let trimmed = xdg.trim();
         if !trimmed.is_empty() {
@@ -276,12 +308,15 @@ pub fn resolve_settings_path(explicit: Option<&str>) -> Option<PathBuf> {
         }
     }
 
-    Some(
-        user_home_dir()
-            .join(".config")
-            .join("context-radar-mcp")
-            .join("settings.json"),
-    )
+    let legacy_path = user_home_dir()
+        .join(".config")
+        .join("context-radar-mcp")
+        .join("settings.json");
+    if legacy_path.is_file() {
+        return Some(legacy_path);
+    }
+
+    Some(plugin_cand.unwrap_or(legacy_path))
 }
 
 #[derive(Debug, Clone)]
@@ -417,15 +452,35 @@ pub struct GuardsConfig {
     pub exec_gate: Value,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiConfig {
+    pub poll_interval_sec: u64,
+    pub bg_poll_interval_sec: i64,
+    pub allow_auto_handoff: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Settings {
     pub generation: u64,
     pub source_path: String,
+    pub settings_error: Option<String>,
     pub lang: String,
     pub context: ContextConfig,
     pub pricing: PricingConfig,
     pub budgets: BudgetsConfig,
     pub guards: GuardsConfig,
+    pub ui: UiConfig,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SettingsPatch {
+    pub lang: Option<String>,
+    pub currency_code: Option<String>,
+    pub fx_rate: Option<f64>,
+    pub poll_interval_sec: Option<u64>,
+    pub bg_poll_interval_sec: Option<i64>,
+    pub allow_auto_handoff: Option<bool>,
+    pub compact_threshold: Option<u64>,
 }
 
 fn val_u64(v: Option<&Value>, default: u64, min: u64) -> u64 {
@@ -647,8 +702,22 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
     }
 
     let lang = val_str(obj.get("lang").or_else(|| obj.get("locale")));
-    let c_code = val_str(pr_obj.and_then(|o| o.get("currency_code")));
-    let c_sym = val_str(pr_obj.and_then(|o| o.get("currency_symbol")));
+    let raw_c_code = val_str(pr_obj.and_then(|o| o.get("currency_code")));
+    let c_code = if raw_c_code.eq_ignore_ascii_case("auto") {
+        String::new()
+    } else {
+        raw_c_code
+    };
+    let c_sym = if c_code.is_empty()
+        && pr_obj
+            .and_then(|o| o.get("currency_code"))
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("auto"))
+    {
+        String::new()
+    } else {
+        val_str(pr_obj.and_then(|o| o.get("currency_symbol")))
+    };
     let currency_configured = !c_code.is_empty() || !c_sym.is_empty();
     let pricing = PricingConfig {
         currency_code: c_code,
@@ -747,14 +816,34 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
         .cloned()
         .unwrap_or_else(|| Value::Object(Default::default()));
 
+    let ui_obj = obj.get("ui").and_then(Value::as_object);
+    let poll_interval_sec = val_u64(ui_obj.and_then(|o| o.get("poll_interval_sec")), 0, 0).min(300);
+    let bg_poll_interval_sec = ui_obj
+        .and_then(|o| o.get("bg_poll_interval_sec"))
+        .and_then(|v| {
+            v.as_i64()
+                .or_else(|| v.as_f64().filter(|f| f.is_finite()).map(|f| f as i64))
+        })
+        .map(|v| if v < 0 { -1 } else { v.min(3600) })
+        .unwrap_or(0);
+    let allow_auto_handoff = ui_obj
+        .and_then(|o| o.get("allow_auto_handoff"))
+        .and_then(Value::as_bool);
+
     Settings {
         generation,
         source_path: source_path.to_string(),
+        settings_error: None,
         lang,
         context,
         pricing,
         budgets,
         guards: GuardsConfig { boot, exec_gate },
+        ui: UiConfig {
+            poll_interval_sec,
+            bg_poll_interval_sec,
+            allow_auto_handoff,
+        },
     }
 }
 
@@ -771,19 +860,216 @@ pub fn load_settings_once(explicit: Option<&str>) -> Settings {
     parse_settings_value(&raw_val, &path.to_string_lossy(), 1)
 }
 
+#[cfg(unix)]
+struct SettingsFileLock {
+    file: File,
+}
+
+#[cfg(unix)]
+impl SettingsFileLock {
+    fn acquire(target: &Path) -> io::Result<Self> {
+        const LOCK_EX: i32 = 2;
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        let parent = target.parent().unwrap_or_else(|| Path::new("."));
+        if !parent.as_os_str().is_empty() {
+            if let Ok(meta) = fs::symlink_metadata(parent) {
+                if meta.file_type().is_symlink() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "settings directory must not be a symlink",
+                    ));
+                }
+            }
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        let lock_path = parent.join("settings.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(UNIX_O_NOFOLLOW)
+            .open(&lock_path)?;
+        loop {
+            let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+            if rc == 0 {
+                return Ok(Self { file });
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SettingsFileLock {
+    fn drop(&mut self) {
+        const LOCK_UN: i32 = 8;
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        unsafe {
+            let _ = flock(self.file.as_raw_fd(), LOCK_UN);
+        }
+    }
+}
+
+/// Atomically merge a partial UI patch into `settings.json` (`0600` + `flock`),
+/// preserving all untouched advanced keys (`pricing.models`, `budgets`, `guards`, etc.).
+/// Refuses symlinks and refuses to overwrite a syntactically corrupt `settings.json`.
+pub fn update_settings_file_atomic(target: &Path, patch: &SettingsPatch) -> Result<(), String> {
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    if target.as_os_str().is_empty() {
+        return Err("missing settings path".into());
+    }
+    if let Ok(meta) = fs::symlink_metadata(target) {
+        if meta.file_type().is_symlink() {
+            return Err("settings file must not be a symlink".into());
+        }
+    }
+    let _lock = SettingsFileLock::acquire(target).map_err(|e| format!("lock failed: {e}"))?;
+
+    let mut root_obj: Map<String, Value> = match fs::read_to_string(target) {
+        Ok(raw) if !raw.trim().is_empty() => match serde_json::from_str::<Value>(&raw) {
+            Ok(Value::Object(m)) => m,
+            _ => return Err("invalid_json".into()),
+        },
+        Ok(_) => Map::new(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Map::new(),
+        Err(e) => return Err(format!("read failed: {e}")),
+    };
+
+    if let Some(ref raw_lang) = patch.lang {
+        let trimmed = raw_lang.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+            root_obj.remove("lang");
+        } else {
+            root_obj.insert("lang".into(), Value::String(trimmed.to_string()));
+        }
+    }
+
+    if patch.currency_code.is_some() || patch.fx_rate.is_some() {
+        let pricing = root_obj
+            .entry("pricing".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !pricing.is_object() {
+            *pricing = Value::Object(Map::new());
+        }
+        let pobj = pricing.as_object_mut().unwrap();
+        if let Some(ref raw_cc) = patch.currency_code {
+            let up = raw_cc.trim().to_ascii_uppercase();
+            if up.is_empty() || up == "AUTO" {
+                pobj.remove("currency_code");
+                pobj.remove("currency_symbol");
+            } else {
+                let sym = crate::i18n::infer_currency_symbol(&up);
+                pobj.insert("currency_code".into(), Value::String(up));
+                pobj.insert("currency_symbol".into(), Value::String(sym.to_string()));
+            }
+        }
+        if let Some(fx) = patch.fx_rate {
+            if !fx.is_finite() || !(0.01..=1000.0).contains(&fx) {
+                return Err("fx_rate out of range".into());
+            }
+            pobj.insert(
+                "fx_rate".into(),
+                serde_json::json!((fx * 10000.0).round() / 10000.0),
+            );
+        }
+    }
+
+    if patch.poll_interval_sec.is_some()
+        || patch.bg_poll_interval_sec.is_some()
+        || patch.allow_auto_handoff.is_some()
+    {
+        let ui = root_obj
+            .entry("ui".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !ui.is_object() {
+            *ui = Value::Object(Map::new());
+        }
+        let uobj = ui.as_object_mut().unwrap();
+        if let Some(p) = patch.poll_interval_sec {
+            uobj.insert("poll_interval_sec".into(), serde_json::json!(p.min(300)));
+        }
+        if let Some(bg) = patch.bg_poll_interval_sec {
+            let clamped = if bg < 0 { -1 } else { bg.min(3600) };
+            uobj.insert("bg_poll_interval_sec".into(), serde_json::json!(clamped));
+        }
+        if let Some(allow) = patch.allow_auto_handoff {
+            uobj.insert("allow_auto_handoff".into(), Value::Bool(allow));
+        }
+    }
+
+    if let Some(ct) = patch.compact_threshold {
+        if !(10_000..=2_000_000).contains(&ct) {
+            return Err("compact_threshold out of range".into());
+        }
+        let ctx = root_obj
+            .entry("context".to_string())
+            .or_insert_with(|| Value::Object(Map::new()));
+        if !ctx.is_object() {
+            *ctx = Value::Object(Map::new());
+        }
+        ctx.as_object_mut()
+            .unwrap()
+            .insert("compact_threshold".into(), serde_json::json!(ct));
+    }
+
+    let mut payload =
+        serde_json::to_string_pretty(&Value::Object(root_obj)).map_err(|e| e.to_string())?;
+    payload.push('\n');
+
+    let parent = target.parent().unwrap_or_else(|| Path::new("."));
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".settings.json.tmp.{}.{seq}", std::process::id()));
+    let mut f = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(UNIX_O_NOFOLLOW)
+        .open(&tmp_path)
+        .map_err(|e| format!("create tmp failed: {e}"))?;
+    if let Err(e) = f.write_all(payload.as_bytes()).and_then(|_| f.sync_all()) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("write failed: {e}"));
+    }
+    drop(f);
+    if let Err(e) = fs::rename(&tmp_path, target) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(format!("rename failed: {e}"));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub struct SettingsWatcher {
     explicit_path: Option<String>,
+    plugin_data_dir: Option<PathBuf>,
     last_path: Option<PathBuf>,
-    last_sig: Option<(i128, u64)>,
+    last_sig: Option<(i128, u64, u64)>,
     generation: u64,
     cached: Arc<Settings>,
 }
 
 impl SettingsWatcher {
     pub fn new(explicit_path: Option<String>) -> Self {
+        Self::new_with_plugin_data(explicit_path, None)
+    }
+
+    pub fn new_with_plugin_data(
+        explicit_path: Option<String>,
+        plugin_data_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             explicit_path,
+            plugin_data_dir,
             last_path: None,
             last_sig: None,
             generation: 0,
@@ -791,8 +1077,15 @@ impl SettingsWatcher {
         }
     }
 
+    pub fn target_path(&self) -> Option<PathBuf> {
+        resolve_settings_path_with_plugin_data(
+            self.explicit_path.as_deref(),
+            self.plugin_data_dir.as_deref(),
+        )
+    }
+
     pub fn current(&mut self) -> Arc<Settings> {
-        let resolved = resolve_settings_path(self.explicit_path.as_deref());
+        let resolved = self.target_path();
         let Some(path) = resolved else {
             if self.last_path.is_some() || self.last_sig.is_some() {
                 self.generation += 1;
@@ -809,15 +1102,16 @@ impl SettingsWatcher {
         let sig = match fs::metadata(&path) {
             Ok(meta) => {
                 let mtime_ns = (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128);
-                (mtime_ns, meta.size())
+                (mtime_ns, meta.size(), meta.ino())
             }
             Err(_) => {
                 if self.last_path.as_ref() != Some(&path) || self.last_sig.is_some() {
                     self.generation += 1;
-                    self.last_path = Some(path);
+                    self.last_path = Some(path.clone());
                     self.last_sig = None;
                     self.cached = Arc::new(Settings {
                         generation: self.generation,
+                        source_path: path.to_string_lossy().into_owned(),
                         ..Settings::default()
                     });
                 }
@@ -830,17 +1124,41 @@ impl SettingsWatcher {
         }
 
         self.generation += 1;
+        let path_changed = self.last_path.as_ref() != Some(&path);
+        let had_good = self.last_sig.is_some() && !path_changed;
         self.last_path = Some(path.clone());
         self.last_sig = Some(sig);
 
-        let parsed = fs::read_to_string(&path)
-            .ok()
-            .and_then(|txt| serde_json::from_str::<Value>(&txt).ok())
-            .map(|val| parse_settings_value(&val, &path.to_string_lossy(), self.generation))
-            .unwrap_or_else(|| Settings {
-                generation: self.generation,
-                ..Settings::default()
-            });
+        let parsed = match fs::read_to_string(&path) {
+            Ok(txt) => match serde_json::from_str::<Value>(&txt) {
+                Ok(val) if val.is_object() => {
+                    parse_settings_value(&val, &path.to_string_lossy(), self.generation)
+                }
+                _ => {
+                    // Fail-closed: preserve last-known-good settings and surface non-destructive error.
+                    let mut kept = if had_good {
+                        (*self.cached).clone()
+                    } else {
+                        Settings::default()
+                    };
+                    kept.generation = self.generation;
+                    kept.source_path = path.to_string_lossy().into_owned();
+                    kept.settings_error = Some("invalid_json".to_string());
+                    kept
+                }
+            },
+            Err(_) => {
+                let mut kept = if had_good {
+                    (*self.cached).clone()
+                } else {
+                    Settings::default()
+                };
+                kept.generation = self.generation;
+                kept.source_path = path.to_string_lossy().into_owned();
+                kept.settings_error = Some("read_error".to_string());
+                kept
+            }
+        };
         self.cached = Arc::new(parsed);
         Arc::clone(&self.cached)
     }

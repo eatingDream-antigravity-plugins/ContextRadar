@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use chrono::{DateTime, Datelike, Utc};
 use regex::bytes::Regex as BytesRegex;
+use rusqlite::types::ValueRef;
 use rusqlite::{params, CachedStatement, Connection, OpenFlags, OptionalExtension};
 use serde_json::Value;
 
@@ -338,6 +340,70 @@ struct RawSummaryTuple {
     killed: bool,
     last_modified_time: String,
     last_user_input_step_index: i64,
+    is_side_question: bool,
+}
+
+#[derive(Debug, Default)]
+struct FtsMeta {
+    title: String,
+    workspace: String,
+    archived: bool,
+    last_modified_time: String,
+}
+
+const TRAJECTORY_TYPE_SIDE_QUESTION: i32 = 22;
+
+fn format_numeric_epoch_iso(raw: i64) -> String {
+    if raw <= 0 {
+        return String::new();
+    }
+    let (secs, nanos) = if raw >= 100_000_000_000_000_000 {
+        // Unix nanoseconds
+        (raw / 1_000_000_000, (raw % 1_000_000_000) as u32)
+    } else if raw >= 100_000_000_000_000 {
+        // Unix microseconds
+        (raw / 1_000_000, ((raw % 1_000_000) * 1_000) as u32)
+    } else if raw >= 100_000_000_000 {
+        // Unix milliseconds
+        (raw / 1_000, ((raw % 1_000) * 1_000_000) as u32)
+    } else if raw >= 946_684_800 {
+        // Unix seconds (>= 2000-01-01T00:00:00Z)
+        (raw, 0)
+    } else {
+        return String::new();
+    };
+    DateTime::<Utc>::from_timestamp(secs, nanos)
+        .filter(|dt| dt.year() >= 2000)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
+}
+
+fn decode_fts_modified_time(val: ValueRef<'_>) -> String {
+    match val {
+        ValueRef::Integer(n) => format_numeric_epoch_iso(n),
+        ValueRef::Real(f) if f.is_finite() && f > 0.0 => format_numeric_epoch_iso(f.round() as i64),
+        ValueRef::Text(b) => {
+            let s = String::from_utf8_lossy(b).trim().to_string();
+            if let Ok(n) = s.parse::<i64>() {
+                format_numeric_epoch_iso(n)
+            } else {
+                s
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn decode_fts_bool(val: ValueRef<'_>) -> bool {
+    match val {
+        ValueRef::Integer(n) => n != 0,
+        ValueRef::Real(f) => f != 0.0,
+        ValueRef::Text(b) => {
+            let s = String::from_utf8_lossy(b);
+            matches!(s.trim(), "1" | "true" | "TRUE")
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -469,6 +535,55 @@ impl LedgerReader {
                 }
             }
 
+            let mut fts_meta: HashMap<String, FtsMeta> = HashMap::new();
+            if let Some(mut stmt) = prepare_optional(
+                &tx,
+                "SELECT conversation_id, title, workspace, archived, last_modified_time
+                 FROM conversations_fts
+                 WHERE chunk_index = -1",
+                &[
+                    "no such table: conversations_fts",
+                    "no such column: conversation_id",
+                    "no such column: chunk_index",
+                    "no such column: title",
+                    "no such column: workspace",
+                    "no such column: archived",
+                    "no such column: last_modified_time",
+                ],
+            )? {
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    let cid = row.get::<_, Option<String>>(0)?.unwrap_or_default();
+                    if cid.is_empty() {
+                        continue;
+                    }
+                    let title = row
+                        .get::<_, Option<String>>(1)?
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let workspace = row
+                        .get::<_, Option<String>>(2)?
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    let archived = decode_fts_bool(row.get_ref(3)?);
+                    let last_modified_time = decode_fts_modified_time(row.get_ref(4)?);
+                    if archived {
+                        fts_archived.insert(cid.clone());
+                    }
+                    fts_meta.insert(
+                        cid,
+                        FtsMeta {
+                            title,
+                            workspace,
+                            archived,
+                            last_modified_time,
+                        },
+                    );
+                }
+            }
+
             let mut raw_rows: HashMap<String, RawSummaryTuple> = HashMap::new();
             let query = "SELECT conversation_id, title, preview, workspace_uris, status,
                          agent_name, parent_conversation_id, nesting_depth,
@@ -515,9 +630,60 @@ impl LedgerReader {
                             killed,
                             last_modified_time,
                             last_user_input_step_index,
+                            is_side_question: false,
                         },
                     );
                 }
+            }
+
+            // Synthesize Antigravity /btw Side Question rows present in conversation_parents
+            // (and optionally titled in conversations_fts WHERE chunk_index = -1) but absent
+            // from conversation_summaries.
+            let side_entries: Vec<(String, String)> = parents
+                .iter()
+                .filter(|(cid, _)| !raw_rows.contains_key(*cid))
+                .map(|(cid, pid)| (cid.clone(), pid.clone()))
+                .collect();
+            for (cid, parent_id) in side_entries {
+                let meta = fts_meta.get(&cid);
+                let title = meta.map(|m| m.title.clone()).unwrap_or_default();
+                let last_modified_time = meta
+                    .map(|m| m.last_modified_time.clone())
+                    .unwrap_or_default();
+                if meta.is_some_and(|m| m.archived) {
+                    fts_archived.insert(cid.clone());
+                }
+                let (mut ws_primary, mut ws_all) = meta
+                    .map(|m| extract_workspaces(&m.workspace))
+                    .unwrap_or_else(|| (String::new(), Vec::new()));
+                if ws_primary.is_empty() && ws_all.is_empty() {
+                    if let Some(parent_row) = raw_rows.get(&parent_id) {
+                        ws_primary = parent_row.workspace.clone();
+                        ws_all = parent_row.workspaces.clone();
+                    }
+                }
+                let nesting_depth = raw_rows
+                    .get(&parent_id)
+                    .map(|p| p.nesting_depth.saturating_add(1).max(1))
+                    .unwrap_or(1);
+                raw_rows.insert(
+                    cid,
+                    RawSummaryTuple {
+                        title,
+                        preview: String::new(),
+                        workspace: ws_primary,
+                        workspaces: ws_all,
+                        status: String::new(),
+                        agent_name: String::new(),
+                        parent_conversation_id: parent_id,
+                        nesting_depth,
+                        not_fully_idle: false,
+                        killed: false,
+                        last_modified_time,
+                        last_user_input_step_index: -1,
+                        is_side_question: true,
+                    },
+                );
             }
             tx.commit()?;
 
@@ -556,6 +722,7 @@ impl LedgerReader {
                     last_user_input_step_index: r.last_user_input_step_index,
                     archived,
                     pinned,
+                    is_side_question: r.is_side_question,
                 },
             );
         }
@@ -732,6 +899,42 @@ fn lookup_gen_model(conn: &Connection, idx: i64) -> rusqlite::Result<Option<(Str
         return Ok(None);
     };
     Ok(row.get_ref(0)?.as_bytes().ok().map(extract_gen_model))
+}
+
+fn read_is_side_question_from_meta(conn: &Connection) -> rusqlite::Result<bool> {
+    let Some(mut stmt) = prepare_optional(
+        conn,
+        "SELECT trajectory_type FROM trajectory_meta LIMIT 1",
+        &[
+            "no such table: trajectory_meta",
+            "no such column: trajectory_type",
+        ],
+    )?
+    else {
+        return Ok(false);
+    };
+    let ttype = stmt
+        .query_row([], |r| r.get::<_, Option<i32>>(0))
+        .optional()?
+        .flatten();
+    Ok(ttype == Some(TRAJECTORY_TYPE_SIDE_QUESTION))
+}
+
+/// Antigravity creates `/btw` side questions by snapshotting the parent trajectory mid-turn,
+/// which can leave an earlier cloned tool step stuck at `status = 2` even after the side
+/// question itself finishes at a higher `step_idx`. Clear any superseded in-flight probe.
+fn sanitize_side_question_probe(probe: &mut LiveStepProbe, turns: &[TurnSample]) {
+    if !probe.is_side_question || probe.live_phase.is_empty() {
+        return;
+    }
+    let latest_turn_step_idx = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
+    if probe.live_active_step_idx < latest_turn_step_idx {
+        probe.live_phase.clear();
+        probe.live_started_ts = 0.0;
+        probe.live_active_step_idx = -1;
+        probe.live_step_waiting = false;
+        probe.live_model.clear();
+    }
 }
 
 fn parse_db_incremental(
@@ -942,13 +1145,16 @@ fn parse_db_incremental(
         turns_mut.push(new_turn);
     }
 
-    let live_probe = probe_live_step_state(
+    let prev_side = prev.live_probe.is_side_question;
+    let mut live_probe = probe_live_step_state(
         conn,
         prev.has_step_type,
         &prev.turns,
         &prev.models,
         prev.max_gen_idx,
     )?;
+    live_probe.is_side_question = prev_side || read_is_side_question_from_meta(conn)?;
+    sanitize_side_question_probe(&mut live_probe, &prev.turns);
     prev.dev = stamp.dev;
     prev.ino = stamp.ino;
     prev.sig = stamp.sig.clone();
@@ -1111,7 +1317,9 @@ fn parse_db_full(conn: &Connection, stamp: &FileStamp) -> rusqlite::Result<Parse
     })?;
     max_step_idx = max_step_idx.max(exact_max.unwrap_or(-1));
 
-    let live_probe = probe_live_step_state(conn, has_step_type, &turns, &models, max_gen_idx)?;
+    let mut live_probe = probe_live_step_state(conn, has_step_type, &turns, &models, max_gen_idx)?;
+    live_probe.is_side_question = read_is_side_question_from_meta(conn)?;
+    sanitize_side_question_probe(&mut live_probe, &turns);
 
     Ok(ParsedLedgerState {
         dev: stamp.dev,
@@ -1244,7 +1452,7 @@ fn probe_live_step_state(
                     .map(extract_error_summary)
                     .unwrap_or_default();
                 probe.live_error = if summary.is_empty() {
-                    "Step error".to_string()
+                    "A step failed.".to_string()
                 } else {
                     summary
                 };

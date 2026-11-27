@@ -11,8 +11,10 @@ Thanks for contributing to [Context Radar (context-radar-mcp)](https://github.co
 ## Local checks before pushing
 
 ```bash
-node panel/pack.mjs
-node --test panel/panel.test.mjs
+npm --prefix panel ci --ignore-scripts
+npm --prefix panel run typecheck
+npm --prefix panel run build
+npm --prefix panel test
 cargo test --locked
 bash scripts/check_sanitized.sh
 ```

@@ -204,11 +204,11 @@ pub fn ttl_window_label(lang: Lang, ttl_sec: u64) -> &'static str {
 pub fn carbon_concurrency_warning_text(lang: Lang, active_carbon_count: usize) -> String {
     if lang.is_zh() {
         format!(
-            "并发提示：当前 {active_carbon_count} 个活跃会话同时运行 Gemini 4 Carbon，建议将并发 Carbon 控制在 <= 2，避免单副本 HBM 缓存溢出。"
+            "提示：现在有 {active_carbon_count} 个大模型代理同时运行，建议不超过 2 个，以免互相拖慢。"
         )
     } else {
         format!(
-            "Concurrency tip: {active_carbon_count} active conversations are running Gemini 4 Carbon simultaneously; cap concurrent Carbon workers <= 2 to avoid per-replica HBM spillover."
+            "Tip: {active_carbon_count} large-model agents are running at once. Keep it to 2 or fewer so they don't slow each other down."
         )
     }
 }
