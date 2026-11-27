@@ -17,9 +17,9 @@ Context Radar 在 Antigravity 侧边栏实时显示每个会话、子代理和�
 <br>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/images/contextradar-overview-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="docs/images/contextradar-overview-light.png">
-  <img src="docs/images/contextradar-overview-dark.png" alt="Context Radar 实时侧边栏面板截图，展示当前会话余量、KV 缓存命中率、子代理停靠条与会话列表" width="640">
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/contextradar-overview-dark-zh.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/contextradar-overview-light-zh.png">
+  <img src="docs/images/contextradar-overview-dark-zh.png" alt="Context Radar 实时侧边栏面板截图，展示当前会话余量、KV 缓存命中率、子代理停靠条与会话列表" width="640">
 </picture>
 
 </div>
