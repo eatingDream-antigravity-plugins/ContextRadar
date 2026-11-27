@@ -236,7 +236,7 @@ async function main() {
   }
 
   const cssCode = minifyCss(rawCss).replace(/<\/style/gi, "<\\/style");
-  const html = `<!doctype html><html lang="en" style="background:#141311;color-scheme:dark"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${CSP}"><meta name="color-scheme" content="dark"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ContextRadar</title><style>${cssCode}</style></head><body style="background:#141311"><div id="root"></div><script>/*__CONTEXT_RADAR_BOOT__*/${jsCode}</script></body></html>`;
+  const html = `<!doctype html><html lang="en" style="background:#141311;color-scheme:dark"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${CSP}"><meta name="color-scheme" content="dark"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Context Radar</title><style>${cssCode}</style></head><body style="background:#141311"><div id="root"></div><script>/*__CONTEXT_RADAR_BOOT__*/${jsCode}</script></body></html>`;
 
   // Validate syntax and hard size cap BEFORE touching dist/panel.html
   new vm.Script(jsCode);

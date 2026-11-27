@@ -1,6 +1,6 @@
 {
   "name": "context-radar-mcp",
-  "displayName": "ContextRadar",
+  "displayName": "Context Radar",
   "version": "1.5.2",
   "description": "Native Rust Antigravity context telemetry, 3-way cold-cache attribution, prefix-safe slice distillation, gated /compact & target:new relay handoff MCP server, and execution guards.",
   "author": {
@@ -8,10 +8,10 @@
     "url": "https://github.com/eatingDream"
   },
   "homepage": "https://contextradar.eatingdream.dev",
-  "repository": "https://github.com/eatingDream-antigravity-plugins/ContextRadar",
+  "repository": "https://github.com/eatingDream-antigravity-plugins/context-radar",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
-    "Open ContextRadar to inspect active sessions, subagents, and cold-cache misses",
+    "Open Context Radar to inspect active sessions, subagents, and cold-cache misses",
     "Evaluate the current model budget tier and check if slice distillation or target:new handoff is worthwhile",
     "Locate context-growth hotspots and distill bloated history to scratch/ without breaking KV cache"
   ]

@@ -3,7 +3,9 @@
 use std::env;
 use std::fs;
 use std::path::Path;
+#[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};

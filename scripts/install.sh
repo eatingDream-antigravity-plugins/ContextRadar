@@ -1,17 +1,37 @@
 #!/bin/sh
-# POSIX installer for Context Radar MCP (Antigravity plugin)
+# POSIX installer for Context Radar (context-radar-mcp, Antigravity plugin)
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/ContextRadar/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar/main/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar/main/scripts/install.sh | sh -s -- --uninstall
 # Optional env overrides:
 #   CONTEXT_RADAR_VERSION=v1.0.0
 #   ANTIGRAVITY_PLUGINS_DIR=$HOME/.gemini/config/plugins
 
 set -eu
 
-REPO="eatingDream-antigravity-plugins/ContextRadar"
+REPO="eatingDream-antigravity-plugins/context-radar"
 PLUGIN_NAME="context-radar-mcp"
 PLUGINS_DIR="${ANTIGRAVITY_PLUGINS_DIR:-$HOME/.gemini/config/plugins}"
 INSTALL_DIR="${PLUGINS_DIR}/${PLUGIN_NAME}"
+UNINSTALL=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --uninstall)
+      UNINSTALL=1
+      shift
+      ;;
+    -h|--help)
+      printf 'Usage: %s [--uninstall]\n' "$0"
+      printf 'Env:   CONTEXT_RADAR_VERSION, ANTIGRAVITY_PLUGINS_DIR\n'
+      exit 0
+      ;;
+    *)
+      printf 'error: unknown argument: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
 
 die() {
   printf 'error: %s\n' "$1" >&2
@@ -83,7 +103,26 @@ verify_sha256() {
   fi
 }
 
+uninstall_plugin() {
+  case "$INSTALL_DIR" in
+    ""|"/"|"$HOME"|"$HOME/")
+      die "refusing to remove unsafe install path: ${INSTALL_DIR}"
+      ;;
+  esac
+  if [ -d "$INSTALL_DIR" ]; then
+    rm -rf "$INSTALL_DIR"
+    printf 'Uninstalled %s from %s\n' "$PLUGIN_NAME" "$INSTALL_DIR"
+  else
+    printf '%s is not installed at %s\n' "$PLUGIN_NAME" "$INSTALL_DIR"
+  fi
+}
+
 main() {
+  if [ "$UNINSTALL" -eq 1 ]; then
+    uninstall_plugin
+    return 0
+  fi
+
   need_cmd curl
   need_cmd tar
   need_cmd mktemp

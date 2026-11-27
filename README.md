@@ -1,71 +1,80 @@
 <div align="center">
-<img src="assets/logo.svg" alt="ContextRadar" width="76" height="76">
+<img src="assets/logo.svg" alt="Context Radar" width="76" height="76">
 
-# ContextRadar (context-radar-mcp)
+# Context Radar (`context-radar-mcp`)
 
-**See how full your Antigravity context really is, why a turn got slow, and when it actually pays off to `/compact` or start fresh.**
+**See how full your Antigravity context really is, why a turn slowed down, and whether `/compact` actually saves tokens.**
 
-[Homepage](https://contextradar.eatingdream.dev) · [English](README.md) · [简体中文](README.zh-CN.md) · [Releases](https://github.com/eatingDream-antigravity-plugins/ContextRadar/releases) · [AI Guide](docs/ai-guide.md) · [llms.txt](llms.txt)
+[Homepage](https://contextradar.eatingdream.dev) · **English** | [简体中文](README.zh-CN.md) · [Releases](https://github.com/eatingDream-antigravity-plugins/context-radar/releases) · [AI Guide](docs/ai-guide.md) · [`llms.txt`](llms.txt)
 
-[![CI](https://github.com/eatingDream-antigravity-plugins/ContextRadar/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/ContextRadar/actions/workflows/ci.yml)
-[![Release](assets/release-badge.svg)](https://github.com/eatingDream-antigravity-plugins/ContextRadar/releases)
-![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![CI](https://github.com/eatingDream-antigravity-plugins/context-radar/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar/actions/workflows/ci.yml)
+[![Release](assets/release-badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar/releases)
+![Built with Rust](https://img.shields.io/badge/built%20with-Rust-1A1916?logo=rust&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/license-MIT-1A1916)](LICENSE)
 
-<img src="docs/social-preview.png" alt="ContextRadar panel preview" width="840">
+<br>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/contextradar-overview-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="docs/images/contextradar-overview-light.png">
+  <img src="docs/images/contextradar-overview-dark.png" alt="Context Radar live side panel showing active session headroom, KV cache hit rate, subagent dock, and session list" width="640">
+</picture>
+
 </div>
 
-## What It Is
+## Is It For You?
 
-- **What it is**: A local native Rust MCP server, live Antigravity side panel, and pure-protocol ACP thin client that tracks context budgets, attributes prompt-cache misses, distills history slices safely, and runs gated `/compact` or fresh-chat handoffs.
-- **What it is not**: A cloud proxy, history mutator, or telemetry service — it never sends data off your machine and never rewrites live conversation logs.
+- **Yes, if** you run long multi-turn or multi-subagent sessions in Antigravity and want to spot sudden latency spikes, cache misses, and token bloat before hitting the context wall.
+- **No, if** you mostly ask short one-off questions that finish well under half the context window—Antigravity's defaults already cover that without an extra side panel.
 
-## Features
+## What You Get
 
-- **Live 4-state telemetry & headroom**: Tracks main sessions and subagents (`ready`, `running`, `waiting`, `error`), remaining context tokens, KV cache hit rate, thinking vs. response share, Stream/E2E speed, and estimated cost.
-- **Editorial-Warm side panel**: Dark-first zero-flash UI with a single focus hero, horizontal subagent dock, mini-bar turn hotspots, and clear **Pinned vs. Recent** session grouping.
-- **3-way cache miss diagnostics**: Separates normal new-turn misses, mid-loop cache breaks (slow-turn TTL, spillover, model switch), and post-compact rebuilds, plus cross-model `/compact` warnings.
-- **Prefix-safe `scratch/` distillation**: Saves concise digests of bloated turn ranges out-of-band so your live prompt KV prefix stays hot.
-- **Gated `/compact` & fresh-chat handoffs**: Evaluates budget tiers, active subagents, and break-even turns before dispatching via official SEP-1865 `ui/message` or ACP v1 (`acp-proxy` / `acp-run`).
-- **Optional session guardrails**: Prevents short shell commands from being backgrounded prematurely and injects optional workspace startup notes.
+| | |
+| :--- | :--- |
+| **Live headroom & subagent view** | Track remaining context tokens, running/waiting/error states, thinking-to-reply ratio, streaming speed, and estimated cost across main sessions and docked subagents. |
+| **Clear answers when turns slow down** | Pinpoint whether a slow turn came from normal growth, a mid-loop cache drop (TTL expiry, replica spillover, or model switch), or a post-compact rebuild—and catch cross-model `/compact` cache resets. |
+| **Trim bloat without breaking cache** | Spot which exact turns spiked your context and save a concise digest to `scratch/` out-of-band so your active prompt cache stays hot. |
+| **Compaction only when it pays off** | Check budget thresholds, active subagents, and break-even turns before running `/compact` or handing off to a fresh chat, with automatic CLI support for unattended runs. |
+| **100% local & read-only** | Runs as a single native Rust binary with zero outbound network calls, zero telemetry, and read-only access to Antigravity's local session logs. |
 
 ## Quick Start
 
-Install the SHA-256 verified prebuilt binary (macOS Apple Silicon, macOS Intel, Linux x86_64):
-
 ```sh
-curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/ContextRadar/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar/main/scripts/install.sh | sh
 ```
 
-Reload Antigravity, open **ContextRadar** in the side pane, or ask your agent: *"Why did the last few turns get slow?"* or *"Is it worth running `/compact` now?"*.
+<sub>Verifies the release archive SHA-256 automatically · Supports macOS (Apple Silicon & Intel) and Linux `x86_64` · Pin a tag with `CONTEXT_RADAR_VERSION=vX.Y.Z` · Remove cleanly anytime with `curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar/main/scripts/install.sh | sh -s -- --uninstall`.</sub>
+
+Reload Antigravity, open **Context Radar** in the side pane, or ask your agent:
+
+- *"Why did the last few turns get slow?"*
+- *"Which turns bloated this session, and is it worth running `/compact` now?"*
 
 ## For AI Agents
 
-ContextRadar ships machine-readable docs and a portable skill (`agentskills.io` compatible). Point any MCP-capable agent (Antigravity, Claude Code, Codex, Cursor, OpenCode) at:
+Context Radar ships machine-readable docs and a portable skill (`agentskills.io` compatible) for Antigravity, Claude Code, Codex, Cursor, and OpenCode:
 
 ```sh
-npx skills add eatingDream-antigravity-plugins/ContextRadar
+npx skills add eatingDream-antigravity-plugins/context-radar
 ```
 
-> **Agent prompt hint**: Read [`llms.txt`](llms.txt), [`skills/context-radar/SKILL.md`](skills/context-radar/SKILL.md), and [`docs/ai-guide.md`](docs/ai-guide.md) for full MCP tool schemas, ACP proxy/run workflows, settings, and CLI flags.
+> **Agent hint**: Read [`llms.txt`](llms.txt), [`skills/context-radar/SKILL.md`](skills/context-radar/SKILL.md), and [`docs/ai-guide.md`](docs/ai-guide.md) for MCP tool schemas, headless ACP workflows, settings, and source builds.
 
 ## Safety & Privacy
 
-- **100% local & read-only**: Zero outbound network calls or telemetry; reads Antigravity SQLite ledgers with `SQLITE_OPEN_READ_ONLY` plus incremental WAL/JSONL tailing.
-- **Atomic symlink-safe writes**: `scratch/` digests traverse directories via `O_NOFOLLOW` dirfd checks and atomic `0600` temp-file renames.
-- **Fail-closed grants & ACP auth**: One-time handoff grants bind to `conversation_id` + `workspace` in `0600` files and never claim on persistence failure; headless `acp-run` cancels allow-only prompts unless `--auto-approve` is set.
-- **Strict panel CSP**: Single self-contained HTML bundle (`default-src 'none'`), zero external assets, and zero `innerHTML` writes.
+- **Zero network & zero telemetry**: Reads local Antigravity ledgers in read-only mode and never transmits prompts, paths, or metrics off your machine.
+- **Symlink-safe local writes**: Out-of-band `scratch/` digests and single-use handoff grants are scoped to the active conversation and workspace with owner-only (`0600`) atomic writes.
+- **Self-contained panel UI**: Single offline HTML bundle with strict `default-src 'none'` CSP, zero external requests, and zero `innerHTML` writes.
 
 ## Documentation
 
-- [AI Agent & Operator Guide](docs/ai-guide.md) — MCP tools, ACP `acp-proxy`/`acp-run`, config & env vars, source build
-- [Agent Skill (`SKILL.md`)](skills/context-radar/SKILL.md) — Portable workflow instructions for agents
-- [LLM Index (`llms.txt`)](llms.txt) · [Contributor Guide](AGENTS.md) · [Settings Example](settings.example.json)
-- [Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md)
+- [AI Agent & Operator Guide](docs/ai-guide.md) — Full MCP tool schemas, ACP `acp-proxy` / `acp-run`, settings & env vars, source build
+- [Portable Agent Skill (`SKILL.md`)](skills/context-radar/SKILL.md) · [LLM Index (`llms.txt`)](llms.txt)
+- [Settings Example](settings.example.json) · [Contributor Guide](AGENTS.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md)
 
 ## Antigravity Plugin Suite
 
-Part of the [eatingDream Antigravity Plugin Suite](https://eatingdream.dev): **ContextRadar** (`context-radar-mcp`) · [ClamGuard](https://github.com/eatingDream-antigravity-plugins/ClamGuard) (`mac-clamshell-mcp`) · [RemoteCast](https://github.com/eatingDream-antigravity-plugins/RemoteCast) (`chrome-stream-mcp`) · [ColabDeck](https://github.com/eatingDream-antigravity-plugins/ColabDeck) (`colab-mcp`) — powered by [PanelKit](https://github.com/eatingDream-antigravity-plugins/PanelKit) (`agy-mcp-kit`).
+Part of the [eatingDream Antigravity Plugin Suite](https://eatingdream.dev): **Context Radar** (`context-radar-mcp`) · [Clam Guard](https://github.com/eatingDream-antigravity-plugins/clam-guard) (`mac-clamshell-mcp`) · [Remote Cast](https://github.com/eatingDream-antigravity-plugins/remote-cast) (`chrome-stream-mcp`) · [Colab Deck](https://github.com/eatingDream-antigravity-plugins/colab-deck) (`colab-mcp`) — powered by [Panel Kit](https://github.com/eatingDream-antigravity-plugins/panel-kit) (`agy-mcp-kit`).
 
 ## License
 
