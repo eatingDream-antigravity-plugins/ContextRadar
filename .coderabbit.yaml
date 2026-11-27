@@ -1,0 +1,37 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+language: "en-US"
+
+reviews:
+  profile: "assertive"
+  high_level_summary: true
+  poem: false
+  collapse_walkthrough: true
+  request_changes_workflow: false
+  auto_review:
+    enabled: true
+    drafts: false
+    ignore_title_keywords:
+      - "chore(main): release"
+  path_filters:
+    - "!CHANGELOG.md"
+    - "!**/package-lock.json"
+    - "!Cargo.lock"
+    - "!**/panel/dist/panel.html"
+    - "!docs/screenshots/**"
+    - "!assets/*.png"
+  path_instructions:
+    - path: "src/**/*.rs"
+      instructions: |
+        - Enforce `clippy` (`-D warnings`) cleanliness, fail-closed state and grant validation, and compile-time test guards preventing live IDE or OS side effects.
+        - Verify external SQLite/state files open strictly read-only (`SQLITE_OPEN_READ_ONLY`), plugin state uses `0600`/`0700` permissions under `--data-dir`, and `src/acp/` stays decoupled from `engine::telemetry` and `rpc::grants`.
+        - Check that MCP tool IDs stay <= 64 characters and zero local paths, real conversation IDs, or tokens are logged or committed.
+    - path: "tests/**/*.rs"
+      instructions: |
+        - Verify tests stay offline and deterministic with compile-time test guards and synthetic fixtures only.
+    - path: "panel/**/*.{ts,css}"
+      instructions: |
+        - Enforce strict erasable TypeScript, `default-src 'none'` CSP compliance, no `innerHTML` or untrusted DOM injection, and `panel/dist/panel.html` staying <= 64 KiB with EN+ZH i18n parity.
+    - path: "{plugin.json,hooks.json,rules/**,skills/**}"
+      instructions: |
+        - Verify `rules/AGENTS.md` stays plain markdown <= 400 B, hooks fail open cleanly, and shipped `panel/kit/*` files match Panel Kit sync checksums.
