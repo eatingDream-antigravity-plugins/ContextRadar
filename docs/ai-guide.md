@@ -9,8 +9,8 @@ Complete reference for AI agents, MCP clients, ACP editors, and power users conf
 | `context_radar_overview` | model + app | Opens the live panel and returns 4-state status (`ready`, `running`, `waiting`, `error`), headroom, thinking share, Stream/E2E speed, loop rollups, cold-cache counts, and subagents. Args: `action?`, `if_digest?`, `fresh?`, `conversation_id?`, `limit?`, `show_history?`, `include_archived?`, `workspace_filter?`. Pass `conversation_id` to bind direct `ui/message` actions to the owning session. |
 | `context_radar_turns` | model + app | Per-turn token breakdown, thinking vs. response share, KV cache hit rate, 3-way cold-cache attribution (`turn_start_cold`, `mid_loop_cold` [`slow_turn_self_expiry` / `replica_spillover` / `model_switch_cold`], `post_compact_cold`), TTFT, Stream/E2E speed, and estimated cost. Args: `conversation_id?`, `limit?`. |
 | `context_radar_hotspots` | model + app | Locates largest context growth steps since the last checkpoint (`mode: "hotspots"`, `top_k?`), or distills a step range into a `<600`-token digest (`mode: "distill"`, `start_step?`, `end_step?`, `save_note: true` writes atomically to `scratch/` with `O_NOFOLLOW` symlink guards without breaking the live KV prefix). |
-| `context_radar_prepare_handoff` | model + app | Evaluates model budget tier, checkpoint cooldown, cold-rebuild protection, `running_subagent_count == 0`, and break-even turns. Args: `conversation_id?`, `estimated_remaining_turns?`, `upcoming_noisy_tokens?`. |
-| `context_radar_commit_handoff` | model + app | Runs hard gates and issues a scoped single-use grant (`0600` local file) for `/compact` (`kind: "compact"`) or a fresh chat (`kind: "handoff"`). Args: `preserve_points`, `resume_task?`, `scratch_note_path?`, `conversation_id?`, `estimated_remaining_turns?`, `auto_fire?`, `kind?`. |
+| `radar_prepare_handoff` | model + app | Evaluates model budget tier, checkpoint cooldown, cold-rebuild protection, `running_subagent_count == 0`, and break-even turns. Args: `conversation_id?`, `estimated_remaining_turns?`, `upcoming_noisy_tokens?`. |
+| `radar_commit_handoff` | model + app | Runs hard gates and issues a scoped single-use grant (`0600` local file) for `/compact` (`kind: "compact"`) or a fresh chat (`kind: "handoff"`). Args: `preserve_points`, `resume_task?`, `scratch_note_path?`, `conversation_id?`, `estimated_remaining_turns?`, `auto_fire?`, `kind?`. |
 | `context_radar_ui_action` | app-only (SEP-1865) | Internal panel action dispatcher (`claim_grant`, `record_compact`, `record_relay`, `dismiss_grant`, `distill_slice`, `create_handoff`, `set_prefs`). Exposed in `tools/list` only when the client advertises MCP Apps (SEP-1865) capability. |
 
 ## Compaction & Handoff Protocols (Official Only)
@@ -21,7 +21,7 @@ Once all hard gates pass (`running_subagent_count == 0`, budget & break-even sat
 ### `agy` CLI & ACP Editors (ACP v1 `session/prompt`)
 `acp-proxy` and `acp-run` are pure-protocol ACP v1 thin clients (zero local SQLite or grant-file coupling, compatible with `--remote-agent`, SSH, and ACP editors such as Zed, JetBrains, Android Studio, Xcode, and VS Code ACP).
 
-Point your custom ACP agent at `acp-proxy` (instead of `agy acp`) so completed `auto_fire` `context_radar_commit_handoff(kind: "compact")` calls inject native `/compact` in-place at `end_turn` (blocked gates return `isError: true` so the proxy never fires):
+Point your custom ACP agent at `acp-proxy` (instead of `agy acp`) so completed `auto_fire` `radar_commit_handoff(kind: "compact")` calls inject native `/compact` in-place at `end_turn` (blocked gates return `isError: true` so the proxy never fires):
 
 ```json
 {

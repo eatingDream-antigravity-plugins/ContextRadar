@@ -42,9 +42,9 @@ pub(crate) const UNIX_O_NOFOLLOW: i32 = 0o100000;
 pub(crate) const UNIX_O_NOFOLLOW: i32 = 0o400000;
 
 pub const DEFAULT_CONTEXT_LIMIT: u64 = 512_000;
-pub const DEFAULT_WARN_THRESHOLD: u64 = 220_000;
-pub const DEFAULT_COMPACT_THRESHOLD: u64 = 270_000;
-pub const DEFAULT_CRITICAL_THRESHOLD: u64 = 350_000;
+pub const DEFAULT_WARN_THRESHOLD: u64 = 300_000;
+pub const DEFAULT_COMPACT_THRESHOLD: u64 = 360_000;
+pub const DEFAULT_CRITICAL_THRESHOLD: u64 = 430_000;
 pub const DEFAULT_POST_COMPACT_BASE: u64 = 20_500;
 pub const DEFAULT_SUBAGENT_SILENT_TIMEOUT_SEC: f64 = 3600.0;
 pub const DEFAULT_FX_RATE: f64 = 7.2;
@@ -688,9 +688,13 @@ pub fn parse_settings_value(raw: &Value, source_path: &str, generation: u64) -> 
                 BudgetTierSpec {
                     profile_id: key.to_string(),
                     label: if lbl.is_empty() { key.to_string() } else { lbl },
-                    min_ctx: val_u64(po.get("min_ctx"), 270_000, 1000),
-                    recommend_ctx: val_u64(po.get("recommend_ctx"), 310_000, 1000),
-                    urgent_ctx: val_u64(po.get("urgent_ctx"), 420_000, 1000),
+                    min_ctx: val_u64(po.get("min_ctx"), DEFAULT_WARN_THRESHOLD, 1000),
+                    recommend_ctx: val_u64(
+                        po.get("recommend_ctx"),
+                        DEFAULT_COMPACT_THRESHOLD,
+                        1000,
+                    ),
+                    urgent_ctx: val_u64(po.get("urgent_ctx"), DEFAULT_CRITICAL_THRESHOLD, 1000),
                     min_turns_since_ckpt: val_u64(po.get("min_turns_since_ckpt"), 18, 1) as usize,
                     min_remaining_turns: val_u64(po.get("min_remaining_turns"), 8, 1) as usize,
                 },

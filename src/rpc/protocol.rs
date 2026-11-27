@@ -1027,10 +1027,19 @@ impl McpDaemon {
         tools
     }
 
+    fn canonical_tool_name(name: &str) -> &str {
+        match name {
+            "context_radar_prepare_handoff" => "radar_prepare_handoff",
+            "context_radar_commit_handoff" => "radar_commit_handoff",
+            other => other,
+        }
+    }
+
     fn is_tool_available(&self, name: &str) -> bool {
+        let canonical = Self::canonical_tool_name(name);
         self.available_tools()
             .iter()
-            .any(|tool| tool["name"].as_str() == Some(name))
+            .any(|tool| tool["name"].as_str() == Some(canonical))
     }
 
     pub fn handle_message(&mut self, msg: &Value) -> Option<Value> {
@@ -1186,7 +1195,7 @@ impl McpDaemon {
             .as_object()
             .ok_or_else(|| (-32602, "arguments must be an object".to_string()))?;
 
-        match name {
+        match Self::canonical_tool_name(name) {
             "context_radar_ui_action" => {
                 let act = str_arg(args, "action");
                 Ok(self.handle_ui_action(&act, args))
@@ -1406,7 +1415,7 @@ impl McpDaemon {
                     "isError": false
                 }))
             }
-            "context_radar_prepare_handoff" => {
+            "radar_prepare_handoff" | "context_radar_prepare_handoff" => {
                 let cid_arg = str_arg(args, "conversation_id");
                 let rem_turns = u64_arg(args, "estimated_remaining_turns", 12) as usize;
                 let noisy = u64_arg(args, "upcoming_noisy_tokens", 0);
@@ -1507,7 +1516,7 @@ impl McpDaemon {
                     "isError": false
                 }))
             }
-            "context_radar_commit_handoff" => {
+            "radar_commit_handoff" | "context_radar_commit_handoff" => {
                 let kind = str_arg_or(args, "kind", "handoff");
                 Ok(self.prepare_commit_handoff(args, &kind))
             }
@@ -1860,11 +1869,59 @@ mod tests {
                     "context_radar_overview",
                     "context_radar_turns",
                     "context_radar_hotspots",
-                    "context_radar_prepare_handoff",
-                    "context_radar_commit_handoff"
+                    "radar_prepare_handoff",
+                    "radar_commit_handoff"
                 ]
             );
         }
+    }
+
+    #[test]
+    fn tools_list_respects_antigravity_64_char_namespace_limit_and_keeps_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let mut server = daemon(root.path());
+        initialize(
+            &mut server,
+            "2025-11-25",
+            json!({ "extensions": { APPS_EXTENSION: { "mimeTypes": [APP_MIME] } } }),
+        );
+        let tools = list_tools(&mut server);
+        assert_eq!(tools.len(), 6);
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap();
+            let full = format!("mcp_context-radar-mcp_context-radar-mcp_{name}");
+            assert!(
+                full.len() <= 64,
+                "namespaced tool '{full}' exceeds 64-char Antigravity limit ({} chars)",
+                full.len()
+            );
+            assert!(
+                full.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "namespaced tool '{full}' violates ^[a-zA-Z0-9_-]{{1,64}}$"
+            );
+        }
+
+        // Silent backwards-compatible dispatch aliases still resolve cleanly without being advertised
+        let alias_prep = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 91, "method": "tools/call",
+                "params": { "name": "context_radar_prepare_handoff", "arguments": {} }
+            }))
+            .unwrap();
+        assert!(alias_prep.get("error").is_none(), "{alias_prep}");
+        assert_eq!(alias_prep["result"]["isError"], json!(false));
+
+        let alias_commit = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 92, "method": "tools/call",
+                "params": {
+                    "name": "context_radar_commit_handoff",
+                    "arguments": { "preserve_points": "alias check" }
+                }
+            }))
+            .unwrap();
+        assert!(alias_commit.get("error").is_none(), "{alias_commit}");
     }
 
     #[test]

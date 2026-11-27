@@ -11,7 +11,9 @@ use serde::Serialize;
 
 use crate::engine::grants::{workspaces_overlap, PanelPrefs, RelayGrant};
 use crate::engine::rates::RateTable;
-use crate::engine::tiers::{is_gemini_4_carbon, model_cache_ttl_sec, resolve_budget_tier};
+use crate::engine::tiers::{
+    effective_critical_threshold, is_gemini_4_carbon, model_cache_ttl_sec, resolve_budget_tier,
+};
 use crate::i18n::{carbon_concurrency_warning_text, resolve_active_lang, Lang};
 use crate::ledger::index_db::DbVersionSig;
 use crate::ledger::journal_tail::JournalTailCache;
@@ -75,6 +77,14 @@ impl MidLoopSubReason {
                 (false, 180) => (
                     "Slow-turn TTL",
                     "Turn took >=3m from prefill start (idle <60s), expiring its 180s KV cache mid-stream",
+                ),
+                (true, 240) => (
+                    "慢轮自过期",
+                    "单轮生成耗时 >=4 分钟（空闲 <60s），prefill 起的 240s 缓存 TTL 在流式中途过期",
+                ),
+                (false, 240) => (
+                    "Slow-turn TTL",
+                    "Turn took >=4m from prefill start (idle <60s), expiring its 240s KV cache mid-stream",
                 ),
                 (true, _) => (
                     "慢轮自过期",
@@ -163,6 +173,8 @@ impl ColdCacheKind {
                             "跨轮次唤醒缓存部分失效并触发重写入"
                         } else if ttl_sec == 180 {
                             "跨轮次首步缓存未命中（>3 分钟 prefill TTL 过期或副本切换）"
+                        } else if ttl_sec == 240 {
+                            "跨轮次首步缓存未命中（>4 分钟 prefill TTL 过期或副本切换）"
                         } else {
                             "跨轮次首步缓存未命中（>5 分钟 TTL 过期或副本切换）"
                         },
@@ -174,6 +186,8 @@ impl ColdCacheKind {
                             "Partial prefix miss across user turns with cache rebuild"
                         } else if ttl_sec == 180 {
                             "First step of a new turn missed cache (>3m prefill-anchored TTL expiry or replica shift)"
+                        } else if ttl_sec == 240 {
+                            "First step of a new turn missed cache (>4m prefill-anchored TTL expiry or replica shift)"
                         } else {
                             "First step of a new turn missed cache (>5m TTL expiry or replica shift)"
                         },
@@ -969,11 +983,11 @@ pub fn build_session_telemetry_with_probe(
     let e2e_tps = round_dp(median_f64(&mut e2e_tps_vals), 1);
     let total_cny = total_usd * fx_rate;
 
-    let crit_line = (prof.recommend_ctx + 40_000).max(cfg.context.critical_threshold);
+    let crit_line = effective_critical_threshold(&prof, &cfg);
     let (level, suggest_compact) = if just_compacted {
         ("ok", false)
     } else if latest_ctx >= crit_line {
-        ("critical", latest_ctx >= prof.recommend_ctx)
+        ("critical", true)
     } else if latest_ctx >= prof.min_ctx {
         ("warn", latest_ctx >= prof.recommend_ctx)
     } else {
@@ -1157,7 +1171,7 @@ pub fn build_session_telemetry_with_probe(
         profile_label: prof.label,
         min_compact_tokens: prof.min_ctx,
         recommend_compact_tokens: prof.recommend_ctx,
-        urgent_compact_tokens: prof.urgent_ctx,
+        urgent_compact_tokens: crit_line,
         just_compacted,
         cross_model_compact,
         compact_summary_kb,

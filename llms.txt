@@ -33,8 +33,8 @@ Generic stdio MCP configuration (`mcpServers`):
 - `context_radar_overview`: Live status (`ready`/`running`/`waiting`/`error`), headroom, thinking share, Stream/E2E speed, loop rollup, and subagents.
 - `context_radar_turns`: Per-turn tokens, cache hit rate, 3-way cold-cache attribution, TTFT, speed, and cost.
 - `context_radar_hotspots`: Locate context spikes (`hotspots`) or distill a step range into `scratch/` (`distill`, `save_note: true`).
-- `context_radar_prepare_handoff`: Evaluate budget tier, cooldown, subagent drain, and break-even economics.
-- `context_radar_commit_handoff`: Issue a scoped single-use grant for `/compact` (`kind: "compact"`) or fresh chat (`kind: "handoff"`).
+- `radar_prepare_handoff`: Evaluate budget tier, cooldown, subagent drain, and break-even economics.
+- `radar_commit_handoff`: Issue a scoped single-use grant for `/compact` (`kind: "compact"`) or fresh chat (`kind: "handoff"`).
 
 ## CLI Subcommands
 

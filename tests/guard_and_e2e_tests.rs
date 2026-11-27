@@ -527,8 +527,8 @@ fn test_full_stdio_mcp_daemon_e2e_with_synthetic_fixture() {
             "context_radar_ui_action",
             "context_radar_turns",
             "context_radar_hotspots",
-            "context_radar_prepare_handoff",
-            "context_radar_commit_handoff",
+            "radar_prepare_handoff",
+            "radar_commit_handoff",
         ]
         .into_iter()
         .collect()
@@ -539,7 +539,9 @@ fn test_full_stdio_mcp_daemon_e2e_with_synthetic_fixture() {
         .unwrap();
     assert_eq!(ui_act["_meta"]["ui"]["visibility"], json!(["app"]));
 
-    // Every MCP tool must fit Antigravity's 64-char namespaced tool limit
+    // Every MCP tool must fit Antigravity's 64-char namespaced tool limit (mcp_<plugin>_<server>_<tool>)
+    let plugin_cfg: Value = serde_json::from_str(include_str!("../plugin.json")).unwrap();
+    let plugin_name = plugin_cfg["name"].as_str().unwrap();
     let mcp_cfg: Value = serde_json::from_str(include_str!("../mcp_config.json")).unwrap();
     let servers = mcp_cfg["mcpServers"].as_object().unwrap();
     assert_eq!(servers.len(), 1);
@@ -549,7 +551,7 @@ fn test_full_stdio_mcp_daemon_e2e_with_synthetic_fixture() {
         "MCP server key must be plugin-prefixed to avoid global namespace collisions"
     );
     for name in &names {
-        let full = format!("mcp_{server_key}_{name}");
+        let full = format!("mcp_{plugin_name}_{server_key}_{name}");
         assert!(
             full.len() <= 64,
             "Namespaced MCP tool '{full}' is {} chars (> 64-char host limit!)",

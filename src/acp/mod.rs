@@ -6,7 +6,7 @@
 //!   (Zed, JetBrains, Xcode, Android Studio, VS Code ACP Client) and `agy acp`
 //!   (including `--remote-agent` / SSH setups).
 //!   Observes official ACP `session/update` notifications (`tool_call`, `tool_call_update`,
-//!   `usage_update`). When `context_radar_commit_handoff(kind: "compact", auto_fire: true)`
+//!   `usage_update`). When `radar_commit_handoff(kind: "compact", auto_fire: true)`
 //!   finishes with `status: "completed"`, queues the directed `/compact` prompt and injects
 //!   a native ACP `session/prompt` at the clean `stopReason == "end_turn"` boundary on the
 //!   exact same connection before resolving the client's original prompt response.
@@ -176,10 +176,14 @@ pub fn prompt_starts_with_compact(params: &Value) -> bool {
 
 fn is_commit_handoff_tool_name(name: &str) -> bool {
     let trimmed = name.trim();
-    trimmed == "context_radar_commit_handoff"
-        || trimmed.ends_with("_context_radar_commit_handoff")
-        || trimmed.ends_with(":context_radar_commit_handoff")
-        || trimmed.ends_with("/context_radar_commit_handoff")
+    ["radar_commit_handoff", "context_radar_commit_handoff"]
+        .iter()
+        .any(|target| {
+            trimmed == *target
+                || trimmed.ends_with(&format!("_{target}"))
+                || trimmed.ends_with(&format!(":{target}"))
+                || trimmed.ends_with(&format!("/{target}"))
+        })
 }
 
 fn is_call_mcp_tool_wrapper(name: &str) -> bool {

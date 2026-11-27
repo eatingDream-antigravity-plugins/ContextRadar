@@ -144,6 +144,8 @@ test("panel/dist/panel.html meets <=43.5 KB budget, CSP, 16 family tokens, zero 
   // Official relay + overview + zero infra jargon + bilingual Carbon concurrency tip
   assert.ok(html.includes("com.google.antigravity/message"), "must support official target:new relay");
   assert.ok(html.includes("context_radar_overview"), "must call context_radar_overview");
+  assert.ok(html.includes("radar_prepare_handoff"), "must call <=24-char radar_prepare_handoff");
+  assert.equal(html.includes("context_radar_prepare_handoff"), false, "must not reference >24-char context_radar_prepare_handoff");
   for (const forbidden of ["HBM", "radix", "SHA-1", "0600 Unix Socket", "原生 Rust"]) {
     assert.equal(html.includes(forbidden), false, `panel.html must not expose jargon '${forbidden}'`);
   }
@@ -740,6 +742,21 @@ test("rich live telemetry: 4-state dots, phase badges, headroom, KV cache meter,
     mid_loop_breakdown: { slow_turn_self_expiry: 1, replica_spillover: 1, model_switch_cold: 1 },
   });
   assert.deepEqual({ t: parsedCold.t, m: parsedCold.m, p: parsedCold.p, s: parsedCold.s, r: parsedCold.r, w: parsedCold.w }, { t: 1, m: 3, p: 0, s: 1, r: 1, w: 1 });
+
+  // 8. Panel gauge tone follows backend level 1:1 (no premature red at 85% when urgent_ctx is 440k/460k)
+  sandbox.setLang("en");
+  sandbox.patchHeroSlot(mkSess("c-warn-86", "Flagship 438k", {
+    level: "warn", suggest_compact: true, latest_context_tokens: 438000, context_limit: 512000, context_pct: 85.5,
+    min_compact_tokens: 310000, recommend_compact_tokens: 370000, urgent_compact_tokens: 440000,
+  }));
+  assert.equal(hn.className, "hn wn", "438k/512k warn session below 440k urgent_ctx must stay warn, not red");
+  assert.equal(hBlk[4].className, "bf wn");
+  sandbox.patchHeroSlot(mkSess("c-crit-440", "Flagship 440k", {
+    level: "critical", suggest_compact: true, latest_context_tokens: 440000, context_limit: 512000, context_pct: 85.9,
+    min_compact_tokens: 310000, recommend_compact_tokens: 370000, urgent_compact_tokens: 440000,
+  }));
+  assert.equal(hn.className, "hn er", "440k/512k critical session at urgent_ctx must render red");
+  assert.equal(hBlk[4].className, "bf er");
 });
 
 test("hero docks subagents inside .hero without negative margins, separates Pinned vs Recent cards cleanly, and preserves tab counts", () => {

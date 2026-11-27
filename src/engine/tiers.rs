@@ -6,11 +6,13 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 use crate::i18n::{resolve_active_lang, Lang};
-use crate::settings::Settings;
 pub use crate::settings::{BudgetTierSpec, TierMatchRule};
+use crate::settings::{Settings, DEFAULT_CRITICAL_THRESHOLD};
 
-/// Empirical Gemini 4 implicit KV cache TTL (3 minutes, anchored to prefill start `prev.began`).
+/// Empirical Gemini 4 Carbon / Argon implicit KV cache TTL (3 minutes, anchored to prefill start `prev.began`).
 pub const GEMINI_4_CACHE_TTL_SEC: f64 = 180.0;
+/// Empirical Gemini 4 Neon / Hydrogen implicit KV cache TTL (4 minutes, anchored to prefill start `prev.began`).
+pub const GEMINI_4_NEON_CACHE_TTL_SEC: f64 = 240.0;
 /// Default implicit/explicit KV cache TTL for non-Gemini-4 models (5 minutes).
 pub const DEFAULT_CACHE_TTL_SEC: f64 = 300.0;
 
@@ -36,11 +38,37 @@ pub fn is_gemini_4_carbon(model: &str, model_display: &str) -> bool {
 }
 
 #[inline]
+pub fn is_gemini_4_carbon_or_argon(model: &str, model_display: &str) -> bool {
+    if is_gemini_4_carbon(model, model_display) {
+        return true;
+    }
+    let m = model.trim().to_ascii_lowercase();
+    let d = model_display.trim().to_ascii_lowercase();
+    m.starts_with("gemini-4-argon")
+        || m.contains("/gemini-4-argon")
+        || (is_gemini_4_model(model, model_display) && (m.contains("argon") || d.contains("argon")))
+}
+
+#[inline]
 pub fn model_cache_ttl_sec(model: &str, model_display: &str) -> f64 {
-    if is_gemini_4_model(model, model_display) {
+    if is_gemini_4_carbon_or_argon(model, model_display) {
         GEMINI_4_CACHE_TTL_SEC
+    } else if is_gemini_4_model(model, model_display) {
+        GEMINI_4_NEON_CACHE_TTL_SEC
     } else {
         DEFAULT_CACHE_TTL_SEC
+    }
+}
+
+/// Effective critical threshold aligning UI red status, alert copy, and `urgent` gate 1:1.
+/// Uses the resolved tier's `urgent_ctx` by default, honoring an explicit non-default user
+/// `context.critical_threshold` override when configured.
+#[inline]
+pub fn effective_critical_threshold(prof: &BudgetTierSpec, settings: &Settings) -> u64 {
+    if settings.context.critical_threshold != DEFAULT_CRITICAL_THRESHOLD {
+        settings.context.critical_threshold
+    } else {
+        prof.urgent_ctx
     }
 }
 
@@ -76,15 +104,28 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
     let mut m = HashMap::new();
     let specs = [
         BudgetTierSpec {
+            profile_id: "carbon_heavy".into(),
+            label: if zh {
+                "重型旗舰档位（Carbon / Argon）".into()
+            } else {
+                "Heavy Flagship Tier (Carbon / Argon)".into()
+            },
+            min_ctx: 260_000,
+            recommend_ctx: 320_000,
+            urgent_ctx: 400_000,
+            min_turns_since_ckpt: 15,
+            min_remaining_turns: 7,
+        },
+        BudgetTierSpec {
             profile_id: "high_reasoning".into(),
             label: if zh {
                 "高推理档位（高思考输出）".into()
             } else {
                 "High Reasoning Tier".into()
             },
-            min_ctx: 250_000,
-            recommend_ctx: 290_000,
-            urgent_ctx: 410_000,
+            min_ctx: 300_000,
+            recommend_ctx: 360_000,
+            urgent_ctx: 430_000,
             min_turns_since_ckpt: 15,
             min_remaining_turns: 7,
         },
@@ -95,9 +136,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
             } else {
                 "Flagship Tier".into()
             },
-            min_ctx: 270_000,
-            recommend_ctx: 310_000,
-            urgent_ctx: 420_000,
+            min_ctx: 310_000,
+            recommend_ctx: 370_000,
+            urgent_ctx: 440_000,
             min_turns_since_ckpt: 18,
             min_remaining_turns: 8,
         },
@@ -108,8 +149,8 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
             } else {
                 "Standard Balanced Tier".into()
             },
-            min_ctx: 280_000,
-            recommend_ctx: 320_000,
+            min_ctx: 300_000,
+            recommend_ctx: 360_000,
             urgent_ctx: 430_000,
             min_turns_since_ckpt: 18,
             min_remaining_turns: 8,
@@ -122,7 +163,7 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
                 "Claude Tier (1.25x Cache Write)".into()
             },
             min_ctx: 300_000,
-            recommend_ctx: 350_000,
+            recommend_ctx: 360_000,
             urgent_ctx: 440_000,
             min_turns_since_ckpt: 22,
             min_remaining_turns: 10,
@@ -134,9 +175,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
             } else {
                 "Fast High-Reasoning Tier".into()
             },
-            min_ctx: 300_000,
-            recommend_ctx: 340_000,
-            urgent_ctx: 430_000,
+            min_ctx: 320_000,
+            recommend_ctx: 380_000,
+            urgent_ctx: 445_000,
             min_turns_since_ckpt: 20,
             min_remaining_turns: 10,
         },
@@ -147,9 +188,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
             } else {
                 "Fast Efficiency Tier".into()
             },
-            min_ctx: 330_000,
-            recommend_ctx: 370_000,
-            urgent_ctx: 445_000,
+            min_ctx: 340_000,
+            recommend_ctx: 400_000,
+            urgent_ctx: 460_000,
             min_turns_since_ckpt: 25,
             min_remaining_turns: 12,
         },
@@ -217,11 +258,11 @@ pub fn resolve_budget_tier(
         let key = if is_xhigh { "fast_reasoning" } else { "fast" };
         return merged.remove(key).unwrap();
     }
+    if carbon_re().is_match(&raw) {
+        return merged.remove("carbon_heavy").unwrap();
+    }
     if is_xhigh {
         return merged.remove("high_reasoning").unwrap();
-    }
-    if carbon_re().is_match(&raw) {
-        return merged.remove("standard").unwrap();
     }
     if neon_re().is_match(&raw)
         || (pro_re().is_match(&raw) && !(raw.contains("medium") || raw.contains("low")))

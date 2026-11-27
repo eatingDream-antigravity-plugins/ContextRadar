@@ -25,7 +25,10 @@ use context_radar_mcp::ledger::sqlite_ro::open_host_readonly;
 use context_radar_mcp::ledger::TurnSample;
 use context_radar_mcp::rpc::protocol::McpDaemon;
 use context_radar_mcp::rpc::tools::{summarize_snapshot_text, HANDOFF_URI, PANEL_URI};
-use context_radar_mcp::settings::{SettingsWatcher, DEFAULT_CONTEXT_LIMIT, DEFAULT_FX_RATE};
+use context_radar_mcp::settings::{
+    SettingsWatcher, DEFAULT_COMPACT_THRESHOLD, DEFAULT_CONTEXT_LIMIT, DEFAULT_CRITICAL_THRESHOLD,
+    DEFAULT_FX_RATE, DEFAULT_WARN_THRESHOLD,
+};
 use context_radar_mcp::wire::pb_cursor::{
     decode_step_metadata, decode_timestamp, extract_gen_model,
 };
@@ -182,6 +185,9 @@ fn test_builtin_defaults_and_external_user_config_live_reload() {
     {
         let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
         assert_eq!(DEFAULT_CONTEXT_LIMIT, 512_000);
+        assert_eq!(DEFAULT_WARN_THRESHOLD, 300_000);
+        assert_eq!(DEFAULT_COMPACT_THRESHOLD, 360_000);
+        assert_eq!(DEFAULT_CRITICAL_THRESHOLD, 430_000);
 
         let p = rates.resolve_rate("gemini-3-pro", "Gemini 3 Pro (High)");
         assert_eq!(
@@ -378,22 +384,85 @@ fn test_checkpoint_post_compaction_estimation() {
 fn test_generic_tiers_and_hard_gates() {
     let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
     let tiers = builtin_tiers();
+    assert!(tiers.contains_key("carbon_heavy"));
     assert!(tiers.contains_key("high_reasoning"));
     assert!(tiers.contains_key("flagship"));
+    assert!(tiers.contains_key("standard"));
+    assert!(tiers.contains_key("fast_reasoning"));
     assert!(tiers.contains_key("fast"));
+    assert!(tiers.contains_key("claude_tier"));
 
     let cfg = rates.current_settings();
+    let carbon_t = resolve_budget_tier("gemini-4-carbon-high", "Gemini 4 Carbon (High)", &cfg);
+    let neon_xh = resolve_budget_tier("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)", &cfg);
+    let neon_h = resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Neon (High)", &cfg);
+    let hydro_xh =
+        resolve_budget_tier("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)", &cfg);
+    let hydro_m = resolve_budget_tier(
+        "gemini-4-hydrogen-medium",
+        "Gemini 4 Hydrogen (Medium)",
+        &cfg,
+    );
+    let claude_t = resolve_budget_tier("claude-opus-5-5-high", "Claude Opus 5.5", &cfg);
+    let std_t = resolve_budget_tier("gpt-oss-120b-medium", "GPT OSS 120B (Medium)", &cfg);
+
+    assert_eq!(
+        (
+            carbon_t.min_ctx,
+            carbon_t.recommend_ctx,
+            carbon_t.urgent_ctx
+        ),
+        (260_000, 320_000, 400_000)
+    );
+    assert_eq!(
+        (neon_xh.min_ctx, neon_xh.recommend_ctx, neon_xh.urgent_ctx),
+        (300_000, 360_000, 430_000)
+    );
+    assert_eq!(
+        (neon_h.min_ctx, neon_h.recommend_ctx, neon_h.urgent_ctx),
+        (310_000, 370_000, 440_000)
+    );
+    assert_eq!(
+        (std_t.min_ctx, std_t.recommend_ctx, std_t.urgent_ctx),
+        (300_000, 360_000, 430_000)
+    );
+    assert_eq!(
+        (
+            hydro_xh.min_ctx,
+            hydro_xh.recommend_ctx,
+            hydro_xh.urgent_ctx
+        ),
+        (320_000, 380_000, 445_000)
+    );
+    assert_eq!(
+        (hydro_m.min_ctx, hydro_m.recommend_ctx, hydro_m.urgent_ctx),
+        (340_000, 400_000, 460_000)
+    );
+    assert_eq!(
+        (
+            claude_t.min_ctx,
+            claude_t.recommend_ctx,
+            claude_t.urgent_ctx
+        ),
+        (300_000, 360_000, 440_000)
+    );
+    // Strict tier ordering: carbon_heavy < high_reasoning < flagship < fast_reasoning < fast
+    assert!(carbon_t.urgent_ctx < neon_xh.urgent_ctx);
+    assert!(neon_xh.urgent_ctx < neon_h.urgent_ctx);
+    assert!(neon_h.urgent_ctx < hydro_xh.urgent_ctx);
+    assert!(hydro_xh.urgent_ctx < hydro_m.urgent_ctx);
+
     assert_eq!(
         resolve_budget_tier("gemini-3-pro", "Gemini 3 Pro (XHigh)", &cfg).min_ctx,
-        250_000
+        300_000
     );
     assert_eq!(
         resolve_budget_tier("gemini-3-pro", "Gemini 3 Pro (High)", &cfg).min_ctx,
-        270_000
+        310_000
     );
     assert_eq!(
         resolve_budget_tier("gemini-3-flash", "Gemini 3 Flash", &cfg).min_ctx,
-        330_000
+        340_000
     );
 
     let mut base = build_session_telemetry(
@@ -1927,11 +1996,20 @@ fn test_live_antigravity_models_unpriced_break_even_and_i18n() {
             "Gemini 4 Neon (XHigh)",
             "high_reasoning",
         ),
-        ("gemini-4-carbon-high", "Gemini 4 Carbon (High)", "standard"),
+        (
+            "gemini-4-carbon-high",
+            "Gemini 4 Carbon (High)",
+            "carbon_heavy",
+        ),
+        (
+            "gemini-4-carbon-xhigh",
+            "Gemini 4 Carbon (XHigh)",
+            "carbon_heavy",
+        ),
         (
             "gemini-4-argon-medium",
             "Gemini 4 Argon (Medium)",
-            "standard",
+            "carbon_heavy",
         ),
         (
             "gemini-4-hydrogen-medium",
@@ -2164,6 +2242,18 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
         180.0
     );
     assert_eq!(
+        model_cache_ttl_sec("gemini-4-argon-medium", "Gemini 4 Argon (Medium)"),
+        180.0
+    );
+    assert_eq!(
+        model_cache_ttl_sec("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"),
+        240.0
+    );
+    assert_eq!(
+        model_cache_ttl_sec("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+        240.0
+    );
+    assert_eq!(
         model_cache_ttl_sec("claude-sonnet-4-5", "Claude Sonnet 4.5"),
         300.0
     );
@@ -2280,6 +2370,81 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
     assert_eq!(g4_plan.cache_ttl_sec, 180);
     let cl_plan = prepare_handoff_plan(Some(&cl_tel), 12, 0, &mut rates);
     assert_eq!(cl_plan.cache_ttl_sec, 300);
+
+    // Gemini 4 Neon/Hydrogen 240s TTL: 210s gap (<240s) is NOT TTL-expired (MidLoop), 250s (>=240s) IS TurnStart with 4m/240s copy
+    let neon_turns = vec![
+        sample_turn(
+            1,
+            1000.0,
+            5_000,
+            "gemini-4-neon-xhigh",
+            "Gemini 4 Neon (XHigh)",
+            45_000,
+            0,
+            0,
+            Some(true),
+        ),
+        sample_turn(
+            2,
+            1210.0,
+            4_000,
+            "gemini-4-neon-xhigh",
+            "Gemini 4 Neon (XHigh)",
+            48_000,
+            0,
+            0,
+            None,
+        ),
+        sample_turn(
+            3,
+            1460.0,
+            4_000,
+            "gemini-4-neon-xhigh",
+            "Gemini 4 Neon (XHigh)",
+            52_000,
+            0,
+            0,
+            None,
+        ),
+    ];
+    let neon_tel = build_session_telemetry(
+        "g4-neon-ttl-test",
+        None,
+        &neon_turns,
+        1464.0,
+        7.2,
+        &mut rates,
+        1470.0,
+        None,
+    );
+    assert_eq!(neon_tel.cache_ttl_sec, 240);
+    assert_eq!(
+        neon_tel.cold_cache_breakdown,
+        ColdCacheBreakdown {
+            turn_start_cold: 2,
+            mid_loop_cold: 1,
+            post_compact_cold: 0,
+        }
+    );
+    let neon_rows = format_turn_rows(&neon_turns, 5, 7.2, &mut rates, None);
+    assert!(
+        neon_rows[0].cold_cache_reason.contains("4m")
+            || neon_rows[0].cold_cache_reason.contains("4 分钟")
+            || neon_rows[0].cold_cache_reason.contains("240s"),
+        "expected 240s/4m reason copy for Neon, got: {}",
+        neon_rows[0].cold_cache_reason
+    );
+    let neon_plan = prepare_handoff_plan(Some(&neon_tel), 12, 0, &mut rates);
+    assert_eq!(neon_plan.cache_ttl_sec, 240);
+    assert!(
+        neon_plan
+            .partial_compaction_recipes
+            .as_ref()
+            .unwrap()
+            .future_branch_fold
+            .contains("240s"),
+        "Neon recipe should mention 240s TTL"
+    );
 
     // 1) slow_turn_self_expiry: idle_gap = 7s (<60s) AND curr.began - prev.began = 192s (>=180s)
     // 2) replica_spillover: partial rollback to turn 1 prompt (22_847)
@@ -3316,4 +3481,105 @@ fn test_summary_and_turn_read_errors_fail_closed_and_manual_claim_checks_subagen
         claim_on_turn_err["result"]["structuredContent"]["reason"],
         json!("telemetry_read_error")
     );
+}
+
+#[test]
+fn test_crit_line_matches_urgent_ctx_and_respects_explicit_override() {
+    let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
+
+    let make_single = |model: &str, disp: &str, ctx_tokens: u64, rates: &mut RateTable| {
+        let turns = vec![sample_turn(
+            1,
+            1000.0,
+            4_000,
+            model,
+            disp,
+            2_000,
+            ctx_tokens.saturating_sub(2_000),
+            0,
+            Some(true),
+        )];
+        build_session_telemetry(
+            "crit-parity-test",
+            None,
+            &turns,
+            1004.0,
+            7.2,
+            rates,
+            1010.0,
+            None,
+        )
+    };
+
+    // Default runs: panel critical line aligns 1:1 with prof.urgent_ctx across all tiers (never pinned to 350k)
+    for (model, disp, urgent_ctx) in [
+        ("gemini-4-carbon-high", "Gemini 4 Carbon (High)", 400_000),
+        ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)", 430_000),
+        ("gemini-4-neon-high", "Gemini 4 Neon (High)", 440_000),
+        (
+            "gemini-4-hydrogen-medium",
+            "Gemini 4 Hydrogen (Medium)",
+            460_000,
+        ),
+    ] {
+        let below = make_single(model, disp, urgent_ctx - 1_000, &mut rates);
+        assert_eq!(
+            below.level,
+            "warn",
+            "{model} at {} should stay warn below urgent_ctx {}",
+            urgent_ctx - 1_000,
+            urgent_ctx
+        );
+        assert_eq!(below.urgent_compact_tokens, urgent_ctx);
+        assert!(!evaluate_handoff_gate(Some(&below), 1, &mut rates).urgent_bypass);
+
+        let at_line = make_single(model, disp, urgent_ctx, &mut rates);
+        assert_eq!(
+            at_line.level, "critical",
+            "{model} at {} should turn critical at urgent_ctx",
+            urgent_ctx
+        );
+        assert!(at_line.suggest_compact);
+        assert_eq!(at_line.urgent_compact_tokens, urgent_ctx);
+        assert!(evaluate_handoff_gate(Some(&at_line), 1, &mut rates).urgent_bypass);
+    }
+
+    // Explicit non-default critical_threshold override aligns level, urgent_compact_tokens, and urgent gate 1:1
+    let td = TempDir::new().unwrap();
+    let cfg_path = td.path().join("settings.json");
+    fs::write(
+        &cfg_path,
+        serde_json::to_string(&json!({
+            "version": 1,
+            "context": { "critical_threshold": 380000 }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut custom_rates = RateTable::new(
+        SettingsWatcher::new(Some(cfg_path.to_string_lossy().into_owned())),
+        None,
+        None,
+    );
+    let below_override = make_single(
+        "gemini-4-neon-high",
+        "Gemini 4 Neon (High)",
+        379_000,
+        &mut custom_rates,
+    );
+    assert_eq!(below_override.level, "warn");
+    assert_eq!(below_override.urgent_compact_tokens, 380_000);
+    assert!(!evaluate_handoff_gate(Some(&below_override), 1, &mut custom_rates).urgent_bypass);
+
+    let at_override = make_single(
+        "gemini-4-neon-high",
+        "Gemini 4 Neon (High)",
+        380_000,
+        &mut custom_rates,
+    );
+    assert_eq!(at_override.level, "critical");
+    assert_eq!(at_override.urgent_compact_tokens, 380_000);
+    let gate = evaluate_handoff_gate(Some(&at_override), 1, &mut custom_rates);
+    assert!(gate.urgent_bypass);
+    assert_eq!(gate.profile.urgent_ctx, 380_000);
 }

@@ -249,7 +249,7 @@ pub fn tools_spec() -> Value {
             }
         },
         {
-            "name": "context_radar_prepare_handoff",
+            "name": "radar_prepare_handoff",
             "title": "Evaluate Compaction & Handoff Budget",
             "description": "Evaluate model x reasoning-effort budget tiers, checkpoint cooldown, recent cold-rebuild protection, running_subagent_count == 0, and economic / token-physics break-even turns before compacting or starting a new conversation.",
             "inputSchema": {
@@ -276,7 +276,7 @@ pub fn tools_spec() -> Value {
             }
         },
         {
-            "name": "context_radar_commit_handoff",
+            "name": "radar_commit_handoff",
             "title": "Commit /compact Command & Scoped target:new Handoff Grant",
             "description": "Verify server-side hard gates (model tier floor, cooldown, cold-rebuild amortization, break-even turns, and running_subagent_count == 0) and issue a workspace- and conversation-scoped single-use handoff grant with a ready-to-copy /compact command and official target:new prompt.",
             "inputSchema": {
