@@ -151,6 +151,8 @@ test("panel/dist/panel.html meets <=43.5 KB budget, CSP, 16 family tokens, zero 
   }
   assert.ok(html.includes("Concurrency tip:") && html.includes("并发提示："), "panel.html must include bilingual Carbon concurrency tip");
   assert.ok(cssSrc.includes('html:not([data-can-msg="1"]) .cr-cap-msg'), "message buttons must be hidden by default until hostCapabilities confirm");
+  assert.ok(cssSrc.includes(".bf{display:block;") || cssSrc.includes(".ht>.bf{display:block"), "hotspot fill bars (.ht > .bf) must be display:block to render width");
+  assert.ok(html.includes("<title>Context Radar</title>"), "panel.html must use spaced Title Case title");
   assert.equal(cssSrc.includes("--buncss-"), false, "panel.html must contain zero --buncss-* declarations");
 });
 

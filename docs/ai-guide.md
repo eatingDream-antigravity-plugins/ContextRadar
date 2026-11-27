@@ -1,6 +1,6 @@
-# ContextRadar (context-radar-mcp) — AI Agent & Operator Guide
+# Context Radar (context-radar-mcp) — AI Agent & Operator Guide
 
-Complete reference for AI agents, MCP clients, ACP editors, and power users configuring **ContextRadar** (`context-radar-mcp`). Homepage: <https://contextradar.eatingdream.dev>.
+Complete reference for AI agents, MCP clients, ACP editors, and power users configuring **Context Radar** (`context-radar-mcp`). Homepage: <https://contextradar.eatingdream.dev>.
 
 ## MCP Tools
 
@@ -52,7 +52,7 @@ Optionally pass `--native-auto-compact <val>` (`AGY_CLI_AUTO_COMPACT_OVERRIDE`, 
 
 Add the portable skill (`agentskills.io` compatible):
 ```sh
-npx skills add eatingDream-antigravity-plugins/ContextRadar
+npx skills add eatingDream-antigravity-plugins/context-radar
 ```
 
 ## CLI Subcommands & Environment Variables
@@ -77,7 +77,7 @@ npx skills add eatingDream-antigravity-plugins/ContextRadar
 Requires Rust (`cargo`) and Node.js 20+ (panel pack & tests):
 
 ```sh
-git clone https://github.com/eatingDream-antigravity-plugins/ContextRadar.git && cd ContextRadar
+git clone https://github.com/eatingDream-antigravity-plugins/context-radar.git && cd context-radar
 node panel/pack.mjs && node --test panel/panel.test.mjs
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --locked
 cargo build --release --locked

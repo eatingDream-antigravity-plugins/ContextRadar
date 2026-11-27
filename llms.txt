@@ -1,4 +1,4 @@
-# ContextRadar (context-radar-mcp)
+# Context Radar (context-radar-mcp)
 
 > Native Rust MCP server, live SEP-1865 side panel, and pure-protocol ACP thin client that monitors Antigravity session/subagent context budgets, attributes 3-way cold-cache misses, distills bloated history slices to `scratch/` without breaking KV prefixes, and runs gated `/compact` or fresh-chat handoffs. Homepage: https://contextradar.eatingdream.dev
 
@@ -13,7 +13,7 @@
 
 Install the prebuilt binary (macOS / Linux):
 ```sh
-curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/ContextRadar/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar/main/scripts/install.sh | sh
 ```
 
 Generic stdio MCP configuration (`mcpServers`):

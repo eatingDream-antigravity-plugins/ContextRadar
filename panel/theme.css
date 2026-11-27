@@ -43,7 +43,7 @@ button{font:inherit;color:inherit;background:0 0;border:0}button,.rw{cursor:poin
 .lg{gap:1px}.lo{padding:0 6px}
 .ib{width:28px}.bnr{border-left:3px solid var(--c)}.hero{background-image:linear-gradient(180deg,color-mix(in srgb,var(--ac) 6%,transparent),transparent 64px)}
 .bt{gap:5px}.bt.p{background:var(--ac);color:#fff}.bt.p:hover{background:var(--ah)}
-.hl{min-width:86px}.hn{font-size:22px;line-height:1.1}.gt{height:6px}.kt,.ht{height:3px}.bf{background:var(--c,var(--ok));transition:width .2s}
+.hl{min-width:86px}.hn{font-size:22px;line-height:1.1}.gt{height:6px}.kt,.ht{height:3px}.bf{display:block;background:var(--c,var(--ok));transition:width .2s}
 .gk{top:-2px;height:10px;width:1px;background:var(--c,var(--t3))}.pls{display:grid;grid-template-columns:repeat(3,minmax(0,1fr))}
 .bt0{padding-top:8px}.sg{display:inline-grid;grid-template-columns:repeat(3,1fr)}
 .sth{inset:2px auto 2px 2px;width:calc(33.33% - 1.3px)}.sth,.th{transition:transform .16s}.sb{z-index:1}
