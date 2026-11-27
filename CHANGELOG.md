@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.3](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.5.2...v1.5.3) (2026-11-27)
+
+
+### Bug Fixes
+
+* align Context Radar branding, kebab-case URLs, hotspot bar layout, and CI/README polish ([#34](https://github.com/eatingDream-antigravity-plugins/context-radar/issues/34)) ([d21238d](https://github.com/eatingDream-antigravity-plugins/context-radar/commit/d21238d877c9afbc9dfe1eb9a95bca146a513279))
+
 ## [1.5.2](https://github.com/eatingDream-antigravity-plugins/ContextRadar/compare/v1.5.1...v1.5.2) (2026-11-27)
 
 
