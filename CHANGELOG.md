@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.5.2](https://github.com/eatingDream-antigravity-plugins/ContextRadar/compare/v1.5.1...v1.5.2) (2026-11-27)
+
+
+### Bug Fixes
+
+* calibrate context thresholds, split Gemini 4 TTLs, and shorten handoff tool names ([#32](https://github.com/eatingDream-antigravity-plugins/ContextRadar/issues/32)) ([4dfacba](https://github.com/eatingDream-antigravity-plugins/ContextRadar/commit/4dfacba1d57a07a0247f4841824afac384709c7f))
+
 ## [1.5.1](https://github.com/eatingDream-antigravity-plugins/context-radar-mcp/compare/v1.5.0...v1.5.1) (2026-11-26)
 
 
