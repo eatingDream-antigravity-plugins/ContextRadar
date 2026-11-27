@@ -119,9 +119,9 @@ pub fn evaluate_handoff_gate(
             urgent_bypass: false,
             pricing_known: false,
             reasons: vec![if zh {
-                "未找到目标活跃会话，已拒绝签发接力票据。".into()
+                "未找到目标会话，暂不能生成接续。".into()
             } else {
-                "Target active session not found; handoff grant denied.".into()
+                "Target session not found; can't create handoff.".into()
             }],
             profile: fallback_prof,
             post_compact_target_tokens: 0,
@@ -159,25 +159,24 @@ pub fn evaluate_handoff_gate(
         } else {
             s.id.as_str()
         };
-        reasons.push(if zh {
-            format!(
-                "目标 {sub_name} 是子代理，无主输入框执行 /compact；请在当前步骤收尾后保存结论并切换新子代理接续（切棒）。"
-            )
+        reasons.push(if s.is_side_question {
+            if zh {
+                format!("「{sub_name}」是顺便问会话，请回到主会话处理。")
+            } else {
+                format!("'{sub_name}' is an aside. Handle it from its main chat.")
+            }
+        } else if zh {
+            format!("「{sub_name}」是子代理会话，请回到主会话处理。")
         } else {
-            format!(
-                "Target '{sub_name}' is a subagent without a /compact input box; finish the current atomic step and pass the baton to a fresh subagent."
-            )
+            format!("'{sub_name}' is a subagent. Handle it from its main chat.")
         });
     }
     if s.just_compacted {
         reasons.push(if zh {
-            format!(
-                "该会话最后一步已是压缩检查点（等效上下文约 {}k），禁止重复压缩。",
-                ctx / 1000
-            )
+            format!("这个会话刚压缩过（约 {}k），不用重复压缩。", ctx / 1000)
         } else {
             format!(
-                "Latest step is already a compaction checkpoint (~{}k context); duplicate compaction blocked.",
+                "This chat was just compacted (~{}k); no need to compact again.",
                 ctx / 1000
             )
         });
@@ -185,7 +184,7 @@ pub fn evaluate_handoff_gate(
     if ctx < prof.min_ctx {
         reasons.push(if zh {
             format!(
-                "当前上下文 {}k 低于【{}】硬下限 {}k（满载 {}k），全量压缩会白白作废热前缀；若需整理早期长输出，请改用 context_radar_hotspots 旁路提炼到 scratch/。",
+                "当前上下文 {}k，还没到「{}」下限 {}k（上限 {}k）；现在压缩会丢掉已有缓存，换新会话或先把要点存进笔记文件更划算。",
                 ctx / 1000,
                 prof.label,
                 prof.min_ctx / 1000,
@@ -193,7 +192,7 @@ pub fn evaluate_handoff_gate(
             )
         } else {
             format!(
-                "Current context {}k is below {} floor {}k (limit {}k); full compaction would discard the warm KV prefix. Use context_radar_hotspots to distill slices to scratch/ instead.",
+                "Current context {}k is below the {} floor {}k (limit {}k). Compacting now throws away the cache; save key points to a notes file instead.",
                 ctx / 1000,
                 prof.label,
                 prof.min_ctx / 1000,
@@ -204,14 +203,14 @@ pub fn evaluate_handoff_gate(
     if s.checkpoint_count > 0 && s.turns_since_compact < prof.min_turns_since_ckpt && !urgent {
         reasons.push(if zh {
             format!(
-                "距上次压缩仅间隔 {} 轮 < 冷却轮数 {} 轮（且未达紧急线 {}k）。",
+                "距上次压缩只过了 {} 轮（建议至少 {} 轮，或达到 {}k 再压缩）。",
                 s.turns_since_compact,
                 prof.min_turns_since_ckpt,
                 prof.urgent_ctx / 1000
             )
         } else {
             format!(
-                "Only {} turns elapsed since last compaction < {} cooldown turns (and below urgent threshold {}k).",
+                "Only {} turns since the last compact (wait {} turns, or until {}k).",
                 s.turns_since_compact,
                 prof.min_turns_since_ckpt,
                 prof.urgent_ctx / 1000
@@ -220,20 +219,20 @@ pub fn evaluate_handoff_gate(
     }
     if s.recent_cold_rebuild && !urgent {
         reasons.push(if zh {
-            "最近 3 轮刚发生过冷缓存重建，尚未收回冷启动成本，暂缓全量压缩。".into()
+            "最近 3 轮刚重建过缓存，先继续用，暂不压缩。".into()
         } else {
-            "A full cold-cache rebuild occurred within the last 3 turns; deferring compaction until prefill cost amortizes.".into()
+            "Cache was rebuilt within the last 3 turns; keep going before compacting.".into()
         });
     }
     if s.running_subagent_count > 0 {
         reasons.push(if zh {
             format!(
-                "当前有 {} 个活跃子代理正在运行（不满足 running_subagent_count == 0 硬校验），禁止原地压缩或自动接力新会话；请等待子代理收尾后再执行。",
+                "还有 {} 个子代理在运行，请等所有子代理结束后再操作。",
                 s.running_subagent_count
             )
         } else {
             format!(
-                "{} subagent(s) currently active (violates running_subagent_count == 0); wait for subagents to finish before compacting or handing off.",
+                "{} subagent(s) still running. Wait until all subagents finish.",
                 s.running_subagent_count
             )
         });
@@ -245,23 +244,23 @@ pub fn evaluate_handoff_gate(
         reasons.push(if zh {
             if econ.pricing_known {
                 format!(
-                    "预计剩余 {} 轮 < 回本所需 {} 轮（冷缓存+摘要约 {}{:.2}），直接复用热前缀更划算。",
+                    "预计还剩 {} 轮，大约 {} 轮后回本（压缩成本约 {}{:.2}），先不压缩更划算。",
                     rem_turns, req_rem, sym, disp_ovh
                 )
             } else {
                 format!(
-                    "预计剩余 {} 轮 < Token 物理回本所需 {} 轮，直接复用热前缀更省更快。",
+                    "预计还剩 {} 轮，大约 {} 轮后回本，先不压缩更省更快。",
                     rem_turns, req_rem
                 )
             }
         } else if econ.pricing_known {
             format!(
-                "Estimated remaining {} turns < {} turns required to break even (compaction + cold rebuild ~{}{:.2}); keeping warm prefix is cheaper.",
+                "About {} turns left, but compacting pays off after about {} turns (~{}{:.2}). Keep going instead.",
                 rem_turns, req_rem, sym, disp_ovh
             )
         } else {
             format!(
-                "Estimated remaining {} turns < {} token-physics break-even turns; keeping warm prefix is faster.",
+                "About {} turns left, and compacting pays off after about {} turns. Keep going instead.",
                 rem_turns, req_rem
             )
         });
@@ -337,13 +336,13 @@ pub fn prepare_handoff_plan(
 
     let Some(s) = session else {
         let msg = if zh {
-            "未找到匹配的活跃会话，建议保持当前前缀继续执行。"
+            "未找到匹配的会话，先继续当前对话。".into()
         } else {
-            "No matching active session found; keep current prefix."
+            "No matching session found; keep going.".into()
         };
         return HandoffPlan {
             found: false,
-            reason: Some(msg.into()),
+            reason: Some(msg),
             lang: lang.as_str().into(),
             conversation_id: String::new(),
             title: String::new(),
@@ -367,7 +366,11 @@ pub fn prepare_handoff_plan(
             per_turn_saving_cny: 0.0,
             break_even_turns: 0,
             action: "keep_prefix".into(),
-            headline: msg.into(),
+            headline: if zh {
+                "未找到匹配的会话，先继续当前对话。".into()
+            } else {
+                "No matching session found; keep going.".into()
+            },
             partial_compaction_recipes: None,
         };
     };
@@ -383,19 +386,36 @@ pub fn prepare_handoff_plan(
     let gate = evaluate_handoff_gate(Some(s), rem_turns, rates);
     let prof = &gate.profile;
 
-    let (action, headline) = if s.is_subagent {
+    let (action, headline) = if s.is_side_question {
+        (
+            "keep_prefix",
+            if zh {
+                format!(
+                    "这是顺便问会话（{}k / {}k），请回到主会话处理。",
+                    ctx / 1000,
+                    limit_k
+                )
+            } else {
+                format!(
+                    "This is an aside ({}k / {}k). Handle it from its main chat.",
+                    ctx / 1000,
+                    limit_k
+                )
+            },
+        )
+    } else if s.is_subagent {
         if ctx >= prof.recommend_ctx {
             (
                 "subagent_handoff",
                 if zh {
                     format!(
-                        "子代理超推荐线（{}k >= {}k）：子代理无 /compact 输入框，请在当前步骤收尾后保存结论并切换新子代理接续。",
+                        "子代理上下文已达 {}k（建议线 {}k）：收尾后带上接续说明开新子代理。",
                         ctx / 1000,
                         prof.recommend_ctx / 1000
                     )
                 } else {
                     format!(
-                        "Subagent above recommended threshold ({}k >= {}k): finish current step, report summary, and spawn a fresh subagent.",
+                        "Subagent is at {}k (suggested {}k): wrap up and continue in a fresh subagent.",
                         ctx / 1000,
                         prof.recommend_ctx / 1000
                     )
@@ -406,14 +426,14 @@ pub fn prepare_handoff_plan(
                 "keep_prefix",
                 if zh {
                     format!(
-                        "子代理保持热前缀继续执行（当前 {}k / {}k，缓存命中 {:.1}%）。",
+                        "子代理可继续运行（{}k / {}k，缓存命中 {:.1}%）。",
                         ctx / 1000,
                         limit_k,
                         cache_hit
                     )
                 } else {
                     format!(
-                        "Keep subagent warm prefix ({}k / {}k, {:.1}% cache hit).",
+                        "Keep going in this subagent ({}k / {}k, {:.1}% cache hit).",
                         ctx / 1000,
                         limit_k,
                         cache_hit
@@ -426,7 +446,7 @@ pub fn prepare_handoff_plan(
             "active_full_compact",
             if zh {
                 format!(
-                    "建议全量压缩或接力新会话：当前 {}k >= 推荐线 {}k（上限 {}k），已满足冷却、零运行子代理与回本校验（>= {} 轮）；可调 radar_commit_handoff 生成 /compact 指令或 target:new 接力票据。",
+                    "可以压缩或换新会话：当前 {}k >= 建议线 {}k（上限 {}k），大约 {} 轮后回本。",
                     ctx / 1000,
                     prof.recommend_ctx / 1000,
                     limit_k,
@@ -434,7 +454,7 @@ pub fn prepare_handoff_plan(
                 )
             } else {
                 format!(
-                    "Full /compact or new-chat handoff recommended: {}k >= {}k target (limit {}k), satisfying cooldown, 0 running subagents, and >={} turn break-even. Call radar_commit_handoff.",
+                    "Ready to compact or start a new chat: {}k >= {}k (limit {}k), pays off after about {} turns.",
                     ctx / 1000,
                     prof.recommend_ctx / 1000,
                     limit_k,
@@ -447,14 +467,14 @@ pub fn prepare_handoff_plan(
             "partial_branch_fold",
             if zh {
                 format!(
-                    "处于可选压缩区（{}k，下限 {}k / 推荐 {}k）：优先用 scratch/ 切片摘要或分支子代理保住热前缀，跨阶段边界时可调 radar_commit_handoff。",
+                    "处于可选压缩区（{}k，下限 {}k / 建议 {}k）：先把要点存进笔记文件，或在阶段收尾时换新会话。",
                     ctx / 1000,
                     prof.min_ctx / 1000,
                     prof.recommend_ctx / 1000
                 )
             } else {
                 format!(
-                    "Optional compaction window ({}k; floor {}k, target {}k): prefer scratch/ slice notes or branch workers to preserve warm cache, or commit handoff at a clean phase boundary.",
+                    "Optional compact range ({}k; floor {}k, target {}k): save key points to a notes file, or hand off at a clean milestone.",
                     ctx / 1000,
                     prof.min_ctx / 1000,
                     prof.recommend_ctx / 1000
@@ -466,12 +486,12 @@ pub fn prepare_handoff_plan(
             "partial_branch_fold",
             if zh {
                 format!(
-                    "未达全量压缩下限（{}k）：建议将早期冗长片段调 context_radar_hotspots 旁路写入 scratch/ 供后续接力读取，高噪声探索交给分支子代理消化。",
+                    "未到压缩下限（{}k）：先把要点存进笔记文件，噪声大的探索交给子代理去做。",
                     prof.min_ctx / 1000
                 )
             } else {
                 format!(
-                    "Below full-compaction floor ({}k): keep live prefix intact—distill older bloated slices to scratch/ for future handoffs and isolate noisy exploration in a subagent.",
+                    "Below compact floor ({}k): save key points to a notes file first, and hand noisy exploration to a subagent.",
                     prof.min_ctx / 1000
                 )
             },
@@ -482,7 +502,7 @@ pub fn prepare_handoff_plan(
             .first()
             .map(|r| {
                 if zh {
-                    format!("（原因：{r}）")
+                    format!("（{r}）")
                 } else {
                     format!(" ({r})")
                 }
@@ -492,14 +512,14 @@ pub fn prepare_handoff_plan(
             "keep_prefix",
             if zh {
                 format!(
-                    "保持现有热前缀（{}k / {}k，缓存命中 {:.1}%）{reason_tail}",
+                    "先不压缩（{}k / {}k，缓存命中 {:.1}%）{reason_tail}",
                     ctx / 1000,
                     limit_k,
                     cache_hit
                 )
             } else {
                 format!(
-                    "Keep warm prefix ({}k / {}k, {:.1}% cache hit){reason_tail}",
+                    "Keep going ({}k / {}k, {:.1}% cache hit){reason_tail}",
                     ctx / 1000,
                     limit_k,
                     cache_hit
@@ -511,27 +531,27 @@ pub fn prepare_handoff_plan(
     let cache_ttl_sec = model_cache_ttl_sec(&s.model, &s.model_display) as u64;
     let recipes = if zh {
         HandoffRecipes {
-            past_slice_distill: "调用 context_radar_hotspots(mode='distill', save_note=true)：在不改动当前会话前缀的前提下，将早期高膨胀步骤浓缩写入 scratch/，供全新子代理或后续 target:new 接力会话按需读取。".into(),
+            past_slice_distill: "先把要点存进笔记文件（context_radar_hotspots），不改动当前缓存，换新会话或新子代理时按需读取。".into(),
             future_branch_fold: if is_gemini_4_model(&s.model, &s.model_display) && ctx > 40_000 {
                 format!(
-                    "当前上下文 >40k：Gemini 4 上 fork 会触发全量冷 prefill 且缓存 TTL 为 {cache_ttl_sec}s（自 prefill 起算）；请用精简摘要派发全新子代理，勿使用 fork。"
+                    "当前上下文 >40k（缓存有效期 {cache_ttl_sec} 秒）：派发新子代理时给简短摘要，不要直接 fork 完整历史。"
                 )
             } else {
-                "需要继承当前上下文的高噪声探索可调用 swarm(action='add', fork='coordinator')：探索噪声留在分支，回传简短结论后结束子代理。".into()
+                "噪声大的探索交给子代理去做，回传简短结论后再继续。".into()
             },
-            official_handoff_new: "跨阶段且 running_subagent_count == 0 时调用 radar_commit_handoff：生成完整 /compact 指令，并在已打开的面板/卡片中通过官方 target:new 拉起同工作区新会话。".into(),
+            official_handoff_new: "所有子代理结束后，调用 radar_commit_handoff 生成 /compact 指令或换新会话。".into(),
         }
     } else {
         HandoffRecipes {
-            past_slice_distill: "Call context_radar_hotspots(mode='distill', save_note=true) to write an out-of-band <600-token summary to scratch/ for fresh subagents or a future target:new chat without touching the live KV prefix.".into(),
+            past_slice_distill: "Save the key points to a notes file first (context_radar_hotspots) without breaking the current cache.".into(),
             future_branch_fold: if is_gemini_4_model(&s.model, &s.model_display) && ctx > 40_000 {
                 format!(
-                    "Context >40k: on Gemini 4, fork triggers a full cold Turn-1 prefill and cache TTL is {cache_ttl_sec}s from prefill start; spawn a fresh subagent with a concise brief instead of fork."
+                    "Context >40k (cache lifetime {cache_ttl_sec}s): start a fresh subagent with a short brief instead of forking."
                 )
             } else {
-                "Delegate noisy exploration via swarm(action='add', fork='coordinator') so noisy tool output stays off the main thread.".into()
+                "Hand noisy exploration to a subagent so noisy output stays off the main chat.".into()
             },
-            official_handoff_new: "At a phase boundary with running_subagent_count == 0, call radar_commit_handoff to prepare a copyable /compact command or launch a scoped target:new session from an open UI view.".into(),
+            official_handoff_new: "Once all subagents finish, call radar_commit_handoff to create a /compact command or open a new chat.".into(),
         }
     };
 

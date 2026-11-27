@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: "20"
+          node-version: "24"
       - name: Resolve release tag
         id: resolve
         env:
@@ -90,7 +90,7 @@ jobs:
           ref: ${{ needs.prepare-release.outputs.tag }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: "20"
+          node-version: "24"
       - name: Add Rust target
         run: rustup target add "${TARGET}"
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -98,9 +98,10 @@ jobs:
           key: linux-x86_64
       - name: Pack and verify MCP App panel
         run: |
-          npm --prefix "${RUNNER_TEMP}/esbuild" install --no-save esbuild@0.28.2
-          ESBUILD_PATH="${RUNNER_TEMP}/esbuild/node_modules/esbuild" node panel/pack.mjs
-          node --test panel/panel.test.mjs
+          npm --prefix panel ci --ignore-scripts
+          npm --prefix panel run typecheck
+          npm --prefix panel run build
+          npm --prefix panel test
       - name: Run Rust test suite
         run: cargo test --locked
       - name: Build, verify, and stage Linux tarball
@@ -147,7 +148,7 @@ jobs:
           ref: ${{ needs.prepare-release.outputs.tag }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: "20"
+          node-version: "24"
       - name: Add macOS Rust targets
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
@@ -155,9 +156,10 @@ jobs:
           key: macos-universal
       - name: Pack and verify MCP App panel
         run: |
-          npm --prefix "${RUNNER_TEMP}/esbuild" install --no-save esbuild@0.28.2
-          ESBUILD_PATH="${RUNNER_TEMP}/esbuild/node_modules/esbuild" node panel/pack.mjs
-          node --test panel/panel.test.mjs
+          npm --prefix panel ci --ignore-scripts
+          npm --prefix panel run typecheck
+          npm --prefix panel run build
+          npm --prefix panel test
       - name: Run Rust test suite
         run: cargo test --locked
       - name: Build, verify, and stage macOS tarballs

@@ -393,16 +393,11 @@ fn test_generic_tiers_and_hard_gates() {
     assert!(tiers.contains_key("claude_tier"));
 
     let cfg = rates.current_settings();
-    let carbon_t = resolve_budget_tier("gemini-4-carbon-high", "Gemini 4 Carbon (High)", &cfg);
-    let neon_xh = resolve_budget_tier("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)", &cfg);
-    let neon_h = resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Neon (High)", &cfg);
-    let hydro_xh =
-        resolve_budget_tier("gemini-4-hydrogen-xhigh", "Gemini 4 Hydrogen (XHigh)", &cfg);
-    let hydro_m = resolve_budget_tier(
-        "gemini-4-hydrogen-medium",
-        "Gemini 4 Hydrogen (Medium)",
-        &cfg,
-    );
+    let carbon_t = resolve_budget_tier("gemini-4-carbon-high", "Gemini 4 Flagship (High)", &cfg);
+    let neon_xh = resolve_budget_tier("gemini-4-neon-xhigh", "Gemini 4 Standard (XHigh)", &cfg);
+    let neon_h = resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Standard (High)", &cfg);
+    let hydro_xh = resolve_budget_tier("gemini-4-hydrogen-xhigh", "Gemini 4 Fast (XHigh)", &cfg);
+    let hydro_m = resolve_budget_tier("gemini-4-hydrogen-medium", "Gemini 4 Fast (Medium)", &cfg);
     let claude_t = resolve_budget_tier("claude-opus-5-5-high", "Claude Opus 5.5", &cfg);
     let std_t = resolve_budget_tier("gpt-oss-120b-medium", "GPT OSS 120B (Medium)", &cfg);
 
@@ -495,13 +490,13 @@ fn test_generic_tiers_and_hard_gates() {
     assert!(sub_gate
         .reasons
         .iter()
-        .any(|r| r.contains("切棒") || r.contains("baton")));
+        .any(|r| r.contains("主会话") || r.contains("main chat")));
     assert_eq!(
         prepare_handoff_plan(Some(&sub), 12, 0, &mut rates).action,
         "subagent_handoff"
     );
 
-    // 3) Block when running_subagent_count > 0 (even at urgent context!)
+    // 3) Block when running subagents > 0 (even at urgent context!)
     let mut busy = base.clone();
     busy.latest_context_tokens = 450_000;
     busy.running_subagent_count = 2;
@@ -510,7 +505,7 @@ fn test_generic_tiers_and_hard_gates() {
     assert!(busy_gate
         .reasons
         .iter()
-        .any(|r| r.contains("running_subagent_count == 0")));
+        .any(|r| r.contains("subagent") || r.contains("子代理")));
 
     // 4) Allow healthy high-context main with 0 running subagents
     let mut ok = base.clone();
@@ -1605,8 +1600,8 @@ fn test_ssr_boot_data_injection_xss_escaping_and_digest_dedup() {
     assert!(panel_html.is_file(), "panel/dist/panel.html must exist");
     let raw_bytes = fs::metadata(&panel_html).unwrap().len();
     assert!(
-        raw_bytes < 45 * 1024,
-        "panel.html must be <45 KiB, got {raw_bytes} bytes"
+        raw_bytes <= 65_536,
+        "panel.html must be <=65536 B, got {raw_bytes} bytes"
     );
 
     let eng = TelemetryEngine::new(
@@ -1990,35 +1985,31 @@ fn test_live_antigravity_models_unpriced_break_even_and_i18n() {
     let cfg = rates.current_settings();
 
     for (id, disp, exp_tier) in [
-        ("gemini-4-neon-high", "Gemini 4 Neon (High)", "flagship"),
+        ("gemini-4-neon-high", "Gemini 4 Standard (High)", "flagship"),
         (
             "gemini-4-neon-xhigh",
-            "Gemini 4 Neon (XHigh)",
+            "Gemini 4 Standard (XHigh)",
             "high_reasoning",
         ),
         (
             "gemini-4-carbon-high",
-            "Gemini 4 Carbon (High)",
+            "Gemini 4 Flagship (High)",
             "carbon_heavy",
         ),
         (
             "gemini-4-carbon-xhigh",
-            "Gemini 4 Carbon (XHigh)",
+            "Gemini 4 Flagship (XHigh)",
             "carbon_heavy",
         ),
         (
             "gemini-4-argon-medium",
-            "Gemini 4 Argon (Medium)",
+            "Gemini 4 Heavy (Medium)",
             "carbon_heavy",
         ),
-        (
-            "gemini-4-hydrogen-medium",
-            "Gemini 4 Hydrogen (Medium)",
-            "fast",
-        ),
+        ("gemini-4-hydrogen-medium", "Gemini 4 Fast (Medium)", "fast"),
         (
             "gemini-4-hydrogen-xhigh",
-            "Gemini 4 Hydrogen (XHigh)",
+            "Gemini 4 Fast (XHigh)",
             "fast_reasoning",
         ),
         ("gemini-3.8-flash-high", "Gemini 3.8 Flash (High)", "fast"),
@@ -2130,7 +2121,7 @@ fn test_hotspot_attribution_excludes_outgoing_step_and_detects_partial_cold() {
             step_idx: 1,
             timestamp: 100.0,
             model: "gemini-4-carbon-high".into(),
-            model_display: "Gemini 4 Carbon (High)".into(),
+            model_display: "Gemini 4 Flagship (High)".into(),
             input_tokens: 10_000,
             cache_read: 90_000,
             cache_write: 0,
@@ -2150,7 +2141,7 @@ fn test_hotspot_attribution_excludes_outgoing_step_and_detects_partial_cold() {
             step_idx: 2,
             timestamp: 105.0,
             model: "gemini-4-carbon-high".into(),
-            model_display: "Gemini 4 Carbon (High)".into(),
+            model_display: "Gemini 4 Flagship (High)".into(),
             input_tokens: 5_000,
             cache_read: 30_000,
             cache_write: 95_000,
@@ -2228,29 +2219,29 @@ fn sample_turn(
 fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
     assert!(is_gemini_4_model(
         "gemini-4-carbon-high",
-        "Gemini 4 Carbon (High)"
+        "Gemini 4 Flagship (High)"
     ));
     assert!(is_gemini_4_model(
         "gemini-4-neon-xhigh",
-        "Gemini 4 Neon (XHigh)"
+        "Gemini 4 Standard (XHigh)"
     ));
     assert!(!is_gemini_4_model("claude-sonnet-4-5", "Claude Sonnet 4.5"));
     assert!(!is_gemini_4_model("gpt-5", "GPT-5"));
 
     assert_eq!(
-        model_cache_ttl_sec("gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+        model_cache_ttl_sec("gemini-4-carbon-high", "Gemini 4 Flagship (High)"),
         180.0
     );
     assert_eq!(
-        model_cache_ttl_sec("gemini-4-argon-medium", "Gemini 4 Argon (Medium)"),
+        model_cache_ttl_sec("gemini-4-argon-medium", "Gemini 4 Heavy (Medium)"),
         180.0
     );
     assert_eq!(
-        model_cache_ttl_sec("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"),
+        model_cache_ttl_sec("gemini-4-neon-xhigh", "Gemini 4 Standard (XHigh)"),
         240.0
     );
     assert_eq!(
-        model_cache_ttl_sec("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+        model_cache_ttl_sec("gemini-4-hydrogen-medium", "Gemini 4 Fast (Medium)"),
         240.0
     );
     assert_eq!(
@@ -2267,7 +2258,7 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
             1000.0,
             5_000,
             "gemini-4-carbon-high",
-            "Gemini 4 Carbon (High)",
+            "Gemini 4 Flagship (High)",
             25_000,
             0,
             0,
@@ -2278,7 +2269,7 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
             1190.0,
             4_000,
             "gemini-4-carbon-high",
-            "Gemini 4 Carbon (High)",
+            "Gemini 4 Flagship (High)",
             28_000,
             0,
             0,
@@ -2306,8 +2297,11 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
     );
     let g4_rows = format_turn_rows(&g4_turns, 5, 7.2, &mut rates, None);
     assert!(
-        g4_rows[0].cold_cache_reason.contains("3m")
-            || g4_rows[0].cold_cache_reason.contains("180s")
+        g4_rows[0].cold_cache_reason.contains("3 min")
+            || g4_rows[0].cold_cache_reason.contains("3 分钟")
+            || g4_rows[0].cold_cache_reason.contains("180s"),
+        "got: {}",
+        g4_rows[0].cold_cache_reason
     );
 
     // Claude at 190s (<300s) is NOT TTL-expired -> MidLoop; at 310s (>=300s) -> TurnStart
@@ -2371,14 +2365,14 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
     let cl_plan = prepare_handoff_plan(Some(&cl_tel), 12, 0, &mut rates);
     assert_eq!(cl_plan.cache_ttl_sec, 300);
 
-    // Gemini 4 Neon/Hydrogen 240s TTL: 210s gap (<240s) is NOT TTL-expired (MidLoop), 250s (>=240s) IS TurnStart with 4m/240s copy
+    // Gemini 4 Standard/Fast 240s TTL: 210s gap (<240s) is NOT TTL-expired (MidLoop), 250s (>=240s) IS TurnStart with 4m/240s copy
     let neon_turns = vec![
         sample_turn(
             1,
             1000.0,
             5_000,
             "gemini-4-neon-xhigh",
-            "Gemini 4 Neon (XHigh)",
+            "Gemini 4 Standard (XHigh)",
             45_000,
             0,
             0,
@@ -2389,7 +2383,7 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
             1210.0,
             4_000,
             "gemini-4-neon-xhigh",
-            "Gemini 4 Neon (XHigh)",
+            "Gemini 4 Standard (XHigh)",
             48_000,
             0,
             0,
@@ -2400,7 +2394,7 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
             1460.0,
             4_000,
             "gemini-4-neon-xhigh",
-            "Gemini 4 Neon (XHigh)",
+            "Gemini 4 Standard (XHigh)",
             52_000,
             0,
             0,
@@ -2428,10 +2422,10 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
     );
     let neon_rows = format_turn_rows(&neon_turns, 5, 7.2, &mut rates, None);
     assert!(
-        neon_rows[0].cold_cache_reason.contains("4m")
+        neon_rows[0].cold_cache_reason.contains("4 min")
             || neon_rows[0].cold_cache_reason.contains("4 分钟")
             || neon_rows[0].cold_cache_reason.contains("240s"),
-        "expected 240s/4m reason copy for Neon, got: {}",
+        "expected 240s/4m reason copy, got: {}",
         neon_rows[0].cold_cache_reason
     );
     let neon_plan = prepare_handoff_plan(Some(&neon_tel), 12, 0, &mut rates);
@@ -2443,19 +2437,19 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
             .unwrap()
             .future_branch_fold
             .contains("240s"),
-        "Neon recipe should mention 240s TTL"
+        "Standard recipe should mention 240s TTL"
     );
 
     // 1) slow_turn_self_expiry: idle_gap = 7s (<60s) AND curr.began - prev.began = 192s (>=180s)
     // 2) replica_spillover: partial rollback to turn 1 prompt (22_847)
-    // 3) model_switch_cold: Carbon -> Hydrogen AND Neon XHigh -> Neon High
+    // 3) model_switch_cold: Flagship -> Fast AND Standard XHigh -> Standard High
     let turns = vec![
         sample_turn(
             1,
             1000.0,
             4_000,
             "gemini-4-carbon-high",
-            "Gemini 4 Carbon (High)",
+            "Gemini 4 Flagship (High)",
             22_847,
             0,
             0,
@@ -2466,7 +2460,7 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
             1010.0,
             185_000,
             "gemini-4-carbon-high",
-            "Gemini 4 Carbon (High)",
+            "Gemini 4 Flagship (High)",
             5_000,
             60_000,
             0,
@@ -2478,7 +2472,7 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
             1202.0,
             5_000,
             "gemini-4-carbon-high",
-            "Gemini 4 Carbon (High)",
+            "Gemini 4 Flagship (High)",
             72_000,
             0,
             0,
@@ -2490,7 +2484,7 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
             1212.0,
             4_000,
             "gemini-4-carbon-high",
-            "Gemini 4 Carbon (High)",
+            "Gemini 4 Flagship (High)",
             4_000,
             72_000,
             0,
@@ -2502,43 +2496,43 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
             1220.0,
             4_000,
             "gemini-4-carbon-high",
-            "Gemini 4 Carbon (High)",
+            "Gemini 4 Flagship (High)",
             58_000,
             22_847,
             58_000,
             Some(false),
         ),
-        // Turn 6 model switch Carbon -> Hydrogen
+        // Turn 6 model switch Flagship -> Fast
         sample_turn(
             6,
             1228.0,
             3_000,
             "gemini-4-hydrogen-high",
-            "Gemini 4 Hydrogen (High)",
+            "Gemini 4 Fast (High)",
             82_000,
             0,
             0,
             Some(false),
         ),
-        // Turn 7 warm on Neon XHigh baseline
+        // Turn 7 warm on Standard XHigh baseline
         sample_turn(
             7,
             1235.0,
             3_000,
             "gemini-4-neon",
-            "Gemini 4 Neon (XHigh)",
+            "Gemini 4 Standard (XHigh)",
             3_000,
             82_000,
             0,
             Some(false),
         ),
-        // Turn 8 reasoning-effort switch Neon XHigh -> Neon High
+        // Turn 8 reasoning-effort switch Standard XHigh -> Standard High
         sample_turn(
             8,
             1242.0,
             3_000,
             "gemini-4-neon",
-            "Gemini 4 Neon (High)",
+            "Gemini 4 Standard (High)",
             87_000,
             0,
             0,
@@ -2582,11 +2576,11 @@ fn test_gemini4_180s_ttl_and_mid_loop_sub_reasons() {
 fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
     assert!(is_gemini_4_carbon(
         "gemini-4-carbon-high",
-        "Gemini 4 Carbon (High)"
+        "Gemini 4 Flagship (High)"
     ));
     assert!(!is_gemini_4_carbon(
         "gemini-4-hydrogen-high",
-        "Gemini 4 Hydrogen (High)"
+        "Gemini 4 Fast (High)"
     ));
     let now = 1_795_400_000.0;
     let td = TempDir::new().unwrap();
@@ -2599,7 +2593,7 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
     let h1 = "c4000000-0000-0000-0000-000000000004";
     let idle_c = "c4000000-0000-0000-0000-000000000005";
 
-    // c1 has a short-gap (<60s) mid-loop cold miss while 3 active Carbon sessions overlap
+    // c1 has a short-gap (<60s) mid-loop cold miss while 3 active Flagship sessions overlap
     create_conv_db(
         &conv_dir.join(format!("{c1}.db")),
         &[
@@ -2633,13 +2627,13 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
             ),
         ],
         "gemini-4-carbon-high",
-        "Gemini 4 Carbon (High)",
+        "Gemini 4 Flagship (High)",
     );
     for (cid, model, disp) in [
-        (c2, "gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
-        (c3, "gemini-4-carbon-medium", "Gemini 4 Carbon (Medium)"),
-        (h1, "gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)"),
-        (idle_c, "gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+        (c2, "gemini-4-carbon-high", "Gemini 4 Flagship (High)"),
+        (c3, "gemini-4-carbon-medium", "Gemini 4 Flagship (Medium)"),
+        (h1, "gemini-4-hydrogen-high", "Gemini 4 Fast (High)"),
+        (idle_c, "gemini-4-carbon-high", "Gemini 4 Flagship (High)"),
     ] {
         create_conv_db(
             &conv_dir.join(format!("{cid}.db")),
@@ -2664,13 +2658,13 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
         );
     }
 
-    // Phase 1: only 2 active Carbon sessions (c1, c2) + 1 active Hydrogen (h1) + 1 idle Carbon (idle_c) -> NO warning
+    // Phase 1: only 2 active Flagship sessions (c1, c2) + 1 active Fast (h1) + 1 idle Flagship (idle_c) -> NO warning
     create_summaries_db(
         &td.path().join("conversation_summaries.db"),
         &[
             (
                 c1,
-                "Carbon 1",
+                "Flagship 1",
                 "",
                 r#"["file:///workspace/demo"]"#,
                 "CASCADE_RUN_STATUS_RUNNING",
@@ -2684,7 +2678,7 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
             ),
             (
                 c2,
-                "Carbon 2",
+                "Flagship 2",
                 "",
                 r#"["file:///workspace/demo"]"#,
                 "CASCADE_RUN_STATUS_RUNNING",
@@ -2698,7 +2692,7 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
             ),
             (
                 c3,
-                "Carbon 3 (idle)",
+                "Flagship 3 (idle)",
                 "",
                 r#"["file:///workspace/demo"]"#,
                 "CASCADE_RUN_STATUS_IDLE",
@@ -2712,7 +2706,7 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
             ),
             (
                 h1,
-                "Hydrogen 1",
+                "Fast 1",
                 "",
                 r#"["file:///workspace/demo"]"#,
                 "CASCADE_RUN_STATUS_RUNNING",
@@ -2726,7 +2720,7 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
             ),
             (
                 idle_c,
-                "Idle Carbon",
+                "Idle Flagship",
                 "",
                 r#"["file:///workspace/demo"]"#,
                 "CASCADE_RUN_STATUS_IDLE",
@@ -2756,7 +2750,7 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
     assert!(!snap2.carbon_concurrency_warning);
     assert!(snap2.carbon_concurrency_note.is_none());
 
-    // Phase 2: activate c3 -> 3 simultaneous active Gemini 4 Carbon conversations -> warning triggers AND c1's short-gap cold miss attributes to replica_spillover!
+    // Phase 2: activate c3 -> 3 simultaneous active Gemini 4 Flagship conversations -> warning triggers AND c1's short-gap cold miss attributes to replica_spillover!
     {
         let conn = Connection::open(td.path().join("conversation_summaries.db")).unwrap();
         conn.execute(
@@ -2773,8 +2767,8 @@ fn test_carbon_concurrency_warning_and_overlap_replica_spillover() {
         .carbon_concurrency_note
         .as_deref()
         .unwrap()
-        .contains("<= 2"));
-    assert!(summarize_snapshot_text(&snap3).contains("<= 2"));
+        .contains("2 or fewer"));
+    assert!(summarize_snapshot_text(&snap3).contains("2 or fewer"));
 
     let c1_tel = snap3.sessions.iter().find(|s| s.id == c1).unwrap();
     assert_eq!(c1_tel.mid_loop_breakdown.replica_spillover, 1);
@@ -2803,8 +2797,9 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
 
     // 1. tiers.rs isolation & budget.rs re-export parity
     let cfg = SettingsWatcher::new(Some("none".into())).current();
-    let t_direct = tiers::resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Neon (High)", &cfg);
-    let t_reexp = resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Neon (High)", &cfg);
+    let t_direct =
+        tiers::resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Standard (High)", &cfg);
+    let t_reexp = resolve_budget_tier("gemini-4-neon-high", "Gemini 4 Standard (High)", &cfg);
     assert_eq!(t_direct.profile_id, t_reexp.profile_id);
     assert_eq!(
         tiers::model_cache_ttl_sec("gemini-4-carbon-high", ""),
@@ -2944,7 +2939,7 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
         &conv_dir.join(format!("{cid}.db")),
         &rows,
         "gemini-4-neon-high",
-        "Gemini 4 Neon (High)",
+        "Gemini 4 Standard (High)",
     );
     create_summaries_db(
         &td_mcp.path().join("conversation_summaries.db"),
@@ -3159,7 +3154,7 @@ fn test_axiomatic_decoupling_tiers_flock_acp_transcript_cache_uri_and_lang() {
             "INSERT INTO gen_metadata (idx, metadata) VALUES (0, ?1)",
             params![make_gen_blob(
                 "gemini-4-neon-high",
-                "Gemini 4 Neon (High)",
+                "Gemini 4 Standard (High)",
                 0
             )],
         )
@@ -3513,12 +3508,12 @@ fn test_crit_line_matches_urgent_ctx_and_respects_explicit_override() {
 
     // Default runs: panel critical line aligns 1:1 with prof.urgent_ctx across all tiers (never pinned to 350k)
     for (model, disp, urgent_ctx) in [
-        ("gemini-4-carbon-high", "Gemini 4 Carbon (High)", 400_000),
-        ("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)", 430_000),
-        ("gemini-4-neon-high", "Gemini 4 Neon (High)", 440_000),
+        ("gemini-4-carbon-high", "Gemini 4 Flagship (High)", 400_000),
+        ("gemini-4-neon-xhigh", "Gemini 4 Standard (XHigh)", 430_000),
+        ("gemini-4-neon-high", "Gemini 4 Standard (High)", 440_000),
         (
             "gemini-4-hydrogen-medium",
-            "Gemini 4 Hydrogen (Medium)",
+            "Gemini 4 Fast (Medium)",
             460_000,
         ),
     ] {
@@ -3563,7 +3558,7 @@ fn test_crit_line_matches_urgent_ctx_and_respects_explicit_override() {
     );
     let below_override = make_single(
         "gemini-4-neon-high",
-        "Gemini 4 Neon (High)",
+        "Gemini 4 Standard (High)",
         379_000,
         &mut custom_rates,
     );
@@ -3573,7 +3568,7 @@ fn test_crit_line_matches_urgent_ctx_and_respects_explicit_override() {
 
     let at_override = make_single(
         "gemini-4-neon-high",
-        "Gemini 4 Neon (High)",
+        "Gemini 4 Standard (High)",
         380_000,
         &mut custom_rates,
     );

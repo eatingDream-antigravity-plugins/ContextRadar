@@ -3,14 +3,16 @@
 
 # Context Radar (`context-radar-mcp`)
 
-**See how full your Antigravity context really is, why a turn slowed down, and whether `/compact` actually saves tokens.**
+**Know how full your context is before it bites.**
+
+Context Radar shows token use, cache hits, and cost for every Antigravity session and subagent, live in the sidebar. When a chat is getting full, it tells you whether to `/compact` or start fresh — and writes the handoff note for you.
 
 [Homepage](https://contextradar.eatingdream.dev) · **English** | [简体中文](README.zh-CN.md) · [Releases](https://github.com/eatingDream-antigravity-plugins/context-radar/releases) · [AI Guide](docs/ai-guide.md) · [`llms.txt`](llms.txt)
 
 [![CI](https://github.com/eatingDream-antigravity-plugins/context-radar/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar/actions/workflows/ci.yml)
 [![Release](assets/release-badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar/releases)
-![Built with Rust](https://img.shields.io/badge/built%20with-Rust-1A1916?logo=rust&logoColor=white)
-[![License: MIT](https://img.shields.io/badge/license-MIT-1A1916)](LICENSE)
+![Built with Rust](https://img.shields.io/badge/built%20with-Rust-12151E?logo=rust&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/license-MIT-12151E)](LICENSE)
 
 <br>
 
@@ -43,12 +45,26 @@
 curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar/main/scripts/install.sh | sh
 ```
 
-<sub>Verifies the release archive SHA-256 automatically · Supports macOS (Apple Silicon & Intel) and Linux `x86_64` · Pin a tag with `CONTEXT_RADAR_VERSION=vX.Y.Z` · Remove cleanly anytime with `curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar/main/scripts/install.sh | sh -s -- --uninstall`.</sub>
+<sub>Verifies the release archive SHA-256 automatically · Refreshes MCP servers automatically inside Antigravity (use `--reload` outside or `--no-reload` to skip) · Supports macOS (Apple Silicon & Intel) and Linux `x86_64` · Pin a tag with `CONTEXT_RADAR_VERSION=vX.Y.Z` · Remove cleanly anytime with `... | sh -s -- --uninstall`.</sub>
 
 Reload Antigravity, open **Context Radar** in the side pane, or ask your agent:
 
 - *"Why did the last few turns get slow?"*
 - *"Which turns bloated this session, and is it worth running `/compact` now?"*
+
+### 30-Second Local Demo
+
+Check your live local telemetry latency or inspect the built panel offline right from the terminal:
+
+```sh
+~/.gemini/config/plugins/context-radar-mcp/bin/context-radar-mcp bench --iterations 5
+```
+
+Or from a source checkout:
+
+```sh
+npm --prefix panel ci --ignore-scripts && npm --prefix panel run build && open panel/dist/panel.html
+```
 
 ## For AI Agents
 
@@ -74,7 +90,7 @@ npx skills add eatingDream-antigravity-plugins/context-radar
 
 ## Antigravity Plugin Suite
 
-Part of the [eatingDream Antigravity Plugin Suite](https://eatingdream.dev): **Context Radar** (`context-radar-mcp`) · [Clam Guard](https://github.com/eatingDream-antigravity-plugins/clam-guard) (`mac-clamshell-mcp`) · [Remote Cast](https://github.com/eatingDream-antigravity-plugins/remote-cast) (`chrome-stream-mcp`) · [Colab Deck](https://github.com/eatingDream-antigravity-plugins/colab-deck) (`colab-mcp`) — powered by [Panel Kit](https://github.com/eatingDream-antigravity-plugins/panel-kit) (`agy-mcp-kit`).
+Part of the [Antigravity Plugins](https://github.com/eatingDream-antigravity-plugins) suite: **Context Radar** · [Clam Guard](https://github.com/eatingDream-antigravity-plugins/clam-guard) · [Remote Cast](https://github.com/eatingDream-antigravity-plugins/remote-cast) · [Colab Deck](https://github.com/eatingDream-antigravity-plugins/colab-deck) · [Panel Kit](https://github.com/eatingDream-antigravity-plugins/panel-kit).
 
 ## License
 

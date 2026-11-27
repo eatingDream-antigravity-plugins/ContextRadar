@@ -115,6 +115,35 @@ pub fn tools_spec() -> Value {
                         "enum": ["auto", "en", "zh-CN"],
                         "description": "When action='set_prefs', persist panel display language preference."
                     },
+                    "currency_code": {
+                        "type": "string",
+                        "enum": ["auto", "USD", "CNY"],
+                        "description": "When action='set_prefs', persist preferred display currency ('auto', 'USD', or 'CNY')."
+                    },
+                    "fx_rate": {
+                        "type": "number",
+                        "minimum": 0.01,
+                        "maximum": 1000,
+                        "description": "When action='set_prefs', persist USD-to-CNY exchange rate."
+                    },
+                    "poll_interval_sec": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 300,
+                        "description": "When action='set_prefs', foreground refresh interval in seconds (0 = adaptive auto)."
+                    },
+                    "bg_poll_interval_sec": {
+                        "type": "integer",
+                        "minimum": -1,
+                        "maximum": 3600,
+                        "description": "When action='set_prefs', background refresh interval in seconds (0 = adaptive auto, -1 = paused)."
+                    },
+                    "compact_threshold": {
+                        "type": "integer",
+                        "minimum": 10000,
+                        "maximum": 2000000,
+                        "description": "When action='set_prefs', token threshold for suggesting /compact."
+                    },
                     "grant_id": {
                         "type": "string",
                         "description": "Single-use relay grant ID."
@@ -251,7 +280,7 @@ pub fn tools_spec() -> Value {
         {
             "name": "radar_prepare_handoff",
             "title": "Evaluate Compaction & Handoff Budget",
-            "description": "Evaluate model x reasoning-effort budget tiers, checkpoint cooldown, recent cold-rebuild protection, running_subagent_count == 0, and economic / token-physics break-even turns before compacting or starting a new conversation.",
+            "description": "Evaluate model x reasoning-effort budget tiers, checkpoint cooldown, recent cold-rebuild protection, zero running subagents, and economic / token-physics break-even turns before compacting or starting a new conversation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -278,7 +307,7 @@ pub fn tools_spec() -> Value {
         {
             "name": "radar_commit_handoff",
             "title": "Commit /compact Command & Scoped target:new Handoff Grant",
-            "description": "Verify server-side hard gates (model tier floor, cooldown, cold-rebuild amortization, break-even turns, and running_subagent_count == 0) and issue a workspace- and conversation-scoped single-use handoff grant with a ready-to-copy /compact command and official target:new prompt.",
+            "description": "Verify server-side hard gates (model tier floor, cooldown, cold-rebuild amortization, break-even turns, and zero running subagents) and issue a workspace- and conversation-scoped single-use handoff grant with a ready-to-copy /compact command and official target:new prompt.",
             "inputSchema": {
                 "type": "object",
                 "required": ["preserve_points"],
@@ -366,29 +395,77 @@ fn truncate_inline(s: &str, max_chars: usize) -> String {
     s.to_string()
 }
 
+/// Shared compact duration formatter (handles days cleanly, never overflows 32-bit ints).
+/// EN: `45s`, `7m`, `2h 5m`, `3d 4h` · ZH: `45 秒`, `7 分钟`, `2 小时 5 分`, `3 天 4 小时`.
+pub fn format_duration_compact(total_sec: u64, zh: bool) -> String {
+    if total_sec < 60 {
+        return if zh {
+            format!("{total_sec} 秒")
+        } else {
+            format!("{total_sec}s")
+        };
+    }
+    let total_min = total_sec / 60;
+    if total_min < 60 {
+        return if zh {
+            format!("{total_min} 分钟")
+        } else {
+            format!("{total_min}m")
+        };
+    }
+    let total_hr = total_min / 60;
+    let rem_min = total_min % 60;
+    if total_hr < 24 {
+        return if rem_min > 0 {
+            if zh {
+                format!("{total_hr} 小时 {rem_min} 分")
+            } else {
+                format!("{total_hr}h {rem_min}m")
+            }
+        } else if zh {
+            format!("{total_hr} 小时")
+        } else {
+            format!("{total_hr}h")
+        };
+    }
+    let days = total_hr / 24;
+    let rem_hr = total_hr % 24;
+    if rem_hr > 0 {
+        if zh {
+            format!("{days} 天 {rem_hr} 小时")
+        } else {
+            format!("{days}d {rem_hr}h")
+        }
+    } else if zh {
+        format!("{days} 天")
+    } else {
+        format!("{days}d")
+    }
+}
+
 pub fn format_live_status_tag(item: &SessionTelemetry, zh: bool) -> String {
     if item.live_status == "error" {
         if item.live_error.is_empty() {
-            return if zh { " [异常]" } else { " [error]" }.to_string();
+            return if zh { " [出错]" } else { " [error]" }.to_string();
         }
         let short_err = truncate_inline(&item.live_error, 48);
         return if zh {
-            format!(" [异常: {short_err}]")
+            format!(" [出错：{short_err}]")
         } else {
             format!(" [error: {short_err}]")
         };
     }
     if item.live_phase == "compacting" {
         let elapsed = if item.live_elapsed_sec > 0 {
-            format!(" {}s", item.live_elapsed_sec)
+            format!(" {}", format_duration_compact(item.live_elapsed_sec, zh))
         } else {
             String::new()
         };
         let xmod = if item.cross_model_compact {
             if zh {
-                "·跨模型"
+                " · 换模型"
             } else {
-                "·cross-model"
+                " · new model"
             }
         } else {
             ""
@@ -401,13 +478,14 @@ pub fn format_live_status_tag(item: &SessionTelemetry, zh: bool) -> String {
     }
     if item.live_status == "waiting" {
         return if item.live_elapsed_sec > 0 {
+            let dur = format_duration_compact(item.live_elapsed_sec, zh);
             if zh {
-                format!(" [等待 {}s]", item.live_elapsed_sec)
+                format!(" [等待中 {dur}]")
             } else {
-                format!(" [waiting {}s]", item.live_elapsed_sec)
+                format!(" [waiting {dur}]")
             }
         } else if zh {
-            " [等待]".to_string()
+            " [等待中]".to_string()
         } else {
             " [waiting]".to_string()
         };
@@ -465,7 +543,7 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
     }
     if s.error_session_count > 0 {
         live_counts.push_str(&if zh {
-            format!("，异常 {} 个", s.error_session_count)
+            format!("，出错 {} 个", s.error_session_count)
         } else {
             format!(", {} error", s.error_session_count)
         });
@@ -533,9 +611,9 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
             }
         } else if item.suggest_compact {
             if zh {
-                " [建议 /compact]".to_string()
+                " [建议压缩]".to_string()
             } else {
-                " [handoff recommended]".to_string()
+                " [compact suggested]".to_string()
             }
         } else {
             String::new()
@@ -559,12 +637,12 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
         {
             if zh {
                 format!(
-                    "[慢轮{}/溢出{}/切模{}]",
+                    "[过期{}/被清{}/换模{}]",
                     mb.slow_turn_self_expiry, mb.replica_spillover, mb.model_switch_cold
                 )
             } else {
                 format!(
-                    "[slow:{}/spill:{}/switch:{}]",
+                    "[expired:{}/dropped:{}/switch:{}]",
                     mb.slow_turn_self_expiry, mb.replica_spillover, mb.model_switch_cold
                 )
             }
@@ -574,7 +652,7 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
         let cold_txt = if item.cold_cache_count > 0 {
             if zh {
                 format!(
-                    " (冷未命中 {}: 新轮次 {}/中途 {}{}/压缩后 {})",
+                    " (缓存未命中 {}：新一轮 {}/中途 {}{}/压缩后 {})",
                     item.cold_cache_count,
                     cb.turn_start_cold,
                     cb.mid_loop_cold,
@@ -583,7 +661,7 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
                 )
             } else {
                 format!(
-                    " ({} cold: {} new-turn/{} mid-turn{}/{} post-compact)",
+                    " ({} cache miss: {} new-turn/{} mid-turn{}/{} after-compact)",
                     item.cold_cache_count,
                     cb.turn_start_cold,
                     cb.mid_loop_cold,
@@ -632,18 +710,28 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
         for sub in item.subagents.iter().take(4) {
             let sub_cost = select_display_cost(sub.cost_usd, sub.cost_cny, ccode);
             let sub_run = format_live_status_tag(sub, zh);
-            let sub_flag = if sub.suggest_compact && !sub.just_compacted {
+            let sub_flag = if !sub.is_side_question && sub.suggest_compact && !sub.just_compacted {
                 if zh {
-                    " [建议切棒]"
+                    " [建议换新会话]"
                 } else {
-                    " [baton-pass]"
+                    " [new chat suggested]"
                 }
             } else {
                 ""
             };
+            let kind_zh = if sub.is_side_question {
+                "顺便问"
+            } else {
+                "子代理"
+            };
+            let kind_en = if sub.is_side_question {
+                "Aside"
+            } else {
+                "Subagent"
+            };
             lines.push(if zh {
                 format!(
-                    "  · 子代理 {} ({}){}: {}/{} (余 {}) | {} | 缓存 {:.1}% | {}{:.2}{}",
+                    "  · {kind_zh} {} ({}){}: {}/{} (余 {}) | {} | 缓存 {:.1}% | {}{:.2}{}",
                     sub.title,
                     sub.id,
                     sub_run,
@@ -658,7 +746,7 @@ pub fn summarize_snapshot_text(snap: &OverviewSnapshot) -> String {
                 )
             } else {
                 format!(
-                    "  · Subagent {} ({}){}: {}/{} ({} left) | {} | cache {:.1}% | {}{:.2}{}",
+                    "  · {kind_en} {} ({}){}: {}/{} ({} left) | {} | cache {:.1}% | {}{:.2}{}",
                     sub.title,
                     sub.id,
                     sub_run,

@@ -3,14 +3,16 @@
 
 # Context Radar (`context-radar-mcp`)
 
-**看清 Antigravity 上下文到底占了多少、为什么突然变慢，以及现在执行 `/compact` 到底划不划算。**
+**在上下文撑满之前，先看清余量。**
+
+Context Radar 在 Antigravity 侧边栏实时显示每个会话、子代理和顺便问的上下文占用、缓存命中率与费用。对话快满时，它会告诉你现在该执行 `/compact` 还是换新会话，并帮你写好接续说明。
 
 [主页](https://contextradar.eatingdream.dev) · [English](README.md) | **简体中文** · [Releases](https://github.com/eatingDream-antigravity-plugins/context-radar/releases) · [AI 指南](docs/ai-guide.md) · [`llms.txt`](llms.txt)
 
 [![CI](https://github.com/eatingDream-antigravity-plugins/context-radar/actions/workflows/ci.yml/badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar/actions/workflows/ci.yml)
 [![Release](assets/release-badge.svg)](https://github.com/eatingDream-antigravity-plugins/context-radar/releases)
-![Built with Rust](https://img.shields.io/badge/built%20with-Rust-1A1916?logo=rust&logoColor=white)
-[![License: MIT](https://img.shields.io/badge/license-MIT-1A1916)](LICENSE)
+![Built with Rust](https://img.shields.io/badge/built%20with-Rust-12151E?logo=rust&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/license-MIT-12151E)](LICENSE)
 
 <br>
 
@@ -43,12 +45,26 @@
 curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar/main/scripts/install.sh | sh
 ```
 
-<sub>安装脚本自动校验发行版 SHA-256 · 支持 macOS（Apple Silicon / Intel）与 Linux `x86_64` · 可用 `CONTEXT_RADAR_VERSION=vX.Y.Z` 指定版本 · 随时可用 `curl -fsSL https://raw.githubusercontent.com/eatingDream-antigravity-plugins/context-radar/main/scripts/install.sh | sh -s -- --uninstall` 干净卸载。</sub>
+<sub>安装脚本自动校验发行版 SHA-256 · 在 Antigravity 内自动热刷新 MCP 服务（外部终端可加 `--reload`，跳过可加 `--no-reload`）· 支持 macOS（Apple Silicon / Intel）与 Linux `x86_64` · 可用 `CONTEXT_RADAR_VERSION=vX.Y.Z` 指定版本 · 随时可用 `... | sh -s -- --uninstall` 干净卸载。</sub>
 
 重载 Antigravity 后在侧边栏打开 **Context Radar**，或直接问你的 Agent：
 
 - *「刚才几轮为什么突然变慢了？」*
 - *「哪几轮把上下文撑大了？现在执行 `/compact` 划算吗？」*
+
+### 30 秒本地体验
+
+直接用命令行测试本机只读遥测速度，或离线预览单文件面板：
+
+```sh
+~/.gemini/config/plugins/context-radar-mcp/bin/context-radar-mcp bench --iterations 5
+```
+
+或在源码目录中：
+
+```sh
+npm --prefix panel ci --ignore-scripts && npm --prefix panel run build && open panel/dist/panel.html
+```
 
 ## 面向 AI Agent
 
@@ -74,7 +90,7 @@ npx skills add eatingDream-antigravity-plugins/context-radar
 
 ## Antigravity 插件套件
 
-隶属于 [eatingDream Antigravity 插件套件](https://eatingdream.dev)：**Context Radar**（`context-radar-mcp`）· [Clam Guard](https://github.com/eatingDream-antigravity-plugins/clam-guard)（`mac-clamshell-mcp`）· [Remote Cast](https://github.com/eatingDream-antigravity-plugins/remote-cast)（`chrome-stream-mcp`）· [Colab Deck](https://github.com/eatingDream-antigravity-plugins/colab-deck)（`colab-mcp`），由 [Panel Kit](https://github.com/eatingDream-antigravity-plugins/panel-kit)（`agy-mcp-kit`）统一驱动。
+隶属于 [Antigravity Plugins](https://github.com/eatingDream-antigravity-plugins) 套件：**Context Radar** · [Clam Guard](https://github.com/eatingDream-antigravity-plugins/clam-guard) · [Remote Cast](https://github.com/eatingDream-antigravity-plugins/remote-cast) · [Colab Deck](https://github.com/eatingDream-antigravity-plugins/colab-deck) · [Panel Kit](https://github.com/eatingDream-antigravity-plugins/panel-kit)。
 
 ## 许可证
 

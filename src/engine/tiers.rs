@@ -9,9 +9,9 @@ use crate::i18n::{resolve_active_lang, Lang};
 pub use crate::settings::{BudgetTierSpec, TierMatchRule};
 use crate::settings::{Settings, DEFAULT_CRITICAL_THRESHOLD};
 
-/// Empirical Gemini 4 Carbon / Argon implicit KV cache TTL (3 minutes, anchored to prefill start `prev.began`).
+/// Empirical Gemini 4 flagship implicit KV cache TTL (3 minutes, anchored to prefill start `prev.began`).
 pub const GEMINI_4_CACHE_TTL_SEC: f64 = 180.0;
-/// Empirical Gemini 4 Neon / Hydrogen implicit KV cache TTL (4 minutes, anchored to prefill start `prev.began`).
+/// Empirical Gemini 4 standard/fast implicit KV cache TTL (4 minutes, anchored to prefill start `prev.began`).
 pub const GEMINI_4_NEON_CACHE_TTL_SEC: f64 = 240.0;
 /// Default implicit/explicit KV cache TTL for non-Gemini-4 models (5 minutes).
 pub const DEFAULT_CACHE_TTL_SEC: f64 = 300.0;
@@ -106,9 +106,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
         BudgetTierSpec {
             profile_id: "carbon_heavy".into(),
             label: if zh {
-                "重型旗舰档位（Carbon / Argon）".into()
+                "旗舰 · 重度".into()
             } else {
-                "Heavy Flagship Tier (Carbon / Argon)".into()
+                "Flagship · Heavy".into()
             },
             min_ctx: 260_000,
             recommend_ctx: 320_000,
@@ -119,9 +119,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
         BudgetTierSpec {
             profile_id: "high_reasoning".into(),
             label: if zh {
-                "高推理档位（高思考输出）".into()
+                "深度推理".into()
             } else {
-                "High Reasoning Tier".into()
+                "Deep reasoning".into()
             },
             min_ctx: 300_000,
             recommend_ctx: 360_000,
@@ -132,9 +132,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
         BudgetTierSpec {
             profile_id: "flagship".into(),
             label: if zh {
-                "旗舰主力档位".into()
+                "旗舰".into()
             } else {
-                "Flagship Tier".into()
+                "Flagship".into()
             },
             min_ctx: 310_000,
             recommend_ctx: 370_000,
@@ -145,9 +145,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
         BudgetTierSpec {
             profile_id: "standard".into(),
             label: if zh {
-                "标准均衡档位".into()
+                "均衡".into()
             } else {
-                "Standard Balanced Tier".into()
+                "Balanced".into()
             },
             min_ctx: 300_000,
             recommend_ctx: 360_000,
@@ -158,9 +158,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
         BudgetTierSpec {
             profile_id: "claude_tier".into(),
             label: if zh {
-                "Claude 档位（缓存写 1.25x 溢价）".into()
+                "Claude（写缓存按 1.25 倍计费）".into()
             } else {
-                "Claude Tier (1.25x Cache Write)".into()
+                "Claude (cache writes ×1.25)".into()
             },
             min_ctx: 300_000,
             recommend_ctx: 360_000,
@@ -171,9 +171,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
         BudgetTierSpec {
             profile_id: "fast_reasoning".into(),
             label: if zh {
-                "轻量高推理档位".into()
+                "快速 · 推理".into()
             } else {
-                "Fast High-Reasoning Tier".into()
+                "Fast · Reasoning".into()
             },
             min_ctx: 320_000,
             recommend_ctx: 380_000,
@@ -184,9 +184,9 @@ pub fn builtin_tiers_for_lang(lang: Lang) -> HashMap<String, BudgetTierSpec> {
         BudgetTierSpec {
             profile_id: "fast".into(),
             label: if zh {
-                "轻量高性价比档位".into()
+                "快速 · 省钱".into()
             } else {
-                "Fast Efficiency Tier".into()
+                "Fast · Low cost".into()
             },
             min_ctx: 340_000,
             recommend_ctx: 400_000,

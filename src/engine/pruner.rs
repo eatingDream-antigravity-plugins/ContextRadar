@@ -105,9 +105,9 @@ fn attribute_spike_cause(
 
     if parts.is_empty() {
         if zh {
-            "上下文累积".to_string()
+            "逐步累积".to_string()
         } else {
-            "Context accumulation".to_string()
+            "Gradual buildup".to_string()
         }
     } else {
         truncate_chars(&parts.join(" · "), 110)
@@ -307,9 +307,9 @@ pub fn distill_slice_with_lang(
             found: false,
             mode: "distill".into(),
             error: Some(if zh {
-                "未找到可提炼的会话轨迹文件".into()
+                "找不到这个会话的记录文件。".into()
             } else {
-                "No transcript file found for distillation".into()
+                "Couldn't find this chat's transcript.".into()
             }),
             conversation_id: cid.to_string(),
             active_step_range: None,
@@ -388,12 +388,12 @@ pub fn distill_slice_with_lang(
     let est_raw_tokens = (raw_chars / 4).max(1);
     let mut lines = vec![if zh {
         format!(
-            "### 切片提炼摘要（步 #{s_idx}–#{e_idx}，共 {step_count} 步，原文约 {}k tok → <0.5k tok，当前会话前缀未改动）",
+            "### 要点摘要（第 {s_idx}–{e_idx} 步，共 {step_count} 步，约 {}k → <0.5k，未改动当前缓存）",
             est_raw_tokens / 1000
         )
     } else {
         format!(
-            "### Slice Digest (steps #{s_idx}–#{e_idx}, {step_count} steps, ~{}k raw tok → <0.5k tok, live KV prefix untouched)",
+            "### Key points (steps #{s_idx}–#{e_idx}, {step_count} steps, ~{}k → <0.5k, live cache untouched)",
             est_raw_tokens / 1000
         )
     }];
@@ -475,9 +475,9 @@ pub fn distill_slice_with_lang(
             }
             Err(err) => {
                 save_error = Some(if zh {
-                    format!("保存提炼备忘失败：{err}")
+                    format!("要点文件保存失败：{err}")
                 } else {
-                    format!("Failed to save distilled note: {err}")
+                    format!("Couldn't save notes file: {err}")
                 });
             }
         }
@@ -486,20 +486,20 @@ pub fn distill_slice_with_lang(
     let handoff_hint = if !saved_path.is_empty() {
         Some(if zh {
             format!(
-                "可将 {saved_path} 作为 scratch_note_path 传给 context_radar_commit_handoff，或交由全新子代理 / target:new 新会话读取。"
+                "可将 {saved_path} 传给 radar_commit_handoff，或在换新会话 / 新子代理时按需读取。"
             )
         } else {
             format!(
-                "Pass {saved_path} as scratch_note_path to context_radar_commit_handoff, or read it from a fresh subagent or target:new session."
+                "Pass {saved_path} as scratch_note_path to radar_commit_handoff, or read it from a fresh subagent or new chat."
             )
         })
     } else if save_error.is_some() {
         None
     } else {
         Some(if zh {
-            "可加 save_note=true 写入 scratch/，供全新子代理或接力新会话按需读取。".into()
+            "可加 save_note=true 把要点存进笔记文件，供新子代理或新会话按需读取。".into()
         } else {
-            "Pass save_note=true to persist this summary under scratch/ for fresh subagents or target:new handoff chats.".into()
+            "Pass save_note=true to save these notes for fresh subagents or a new chat.".into()
         })
     };
 

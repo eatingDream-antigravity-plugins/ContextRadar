@@ -11,9 +11,12 @@ set -eu
 
 REPO="eatingDream-antigravity-plugins/context-radar"
 PLUGIN_NAME="context-radar-mcp"
+MCP_SERVER_ID="${PLUGIN_NAME}_${PLUGIN_NAME}"
 PLUGINS_DIR="${ANTIGRAVITY_PLUGINS_DIR:-$HOME/.gemini/config/plugins}"
 INSTALL_DIR="${PLUGINS_DIR}/${PLUGIN_NAME}"
 UNINSTALL=0
+FORCE_RELOAD=0
+NO_RELOAD=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -21,8 +24,16 @@ while [ $# -gt 0 ]; do
       UNINSTALL=1
       shift
       ;;
+    --reload)
+      FORCE_RELOAD=1
+      shift
+      ;;
+    --no-reload)
+      NO_RELOAD=1
+      shift
+      ;;
     -h|--help)
-      printf 'Usage: %s [--uninstall]\n' "$0"
+      printf 'Usage: %s [--uninstall] [--reload] [--no-reload]\n' "$0"
       printf 'Env:   CONTEXT_RADAR_VERSION, ANTIGRAVITY_PLUGINS_DIR\n'
       exit 0
       ;;
@@ -117,6 +128,29 @@ uninstall_plugin() {
   fi
 }
 
+refresh_mcp_host() {
+  if [ "$NO_RELOAD" -eq 1 ]; then
+    return 0
+  fi
+  if [ -n "${ANTIGRAVITY_CSRF_TOKEN:-}" ]; then
+    ls_addr="${ANTIGRAVITY_LS_ADDRESS:-localhost:5387}"
+    if curl -sf -H "Content-Type: application/json" \
+      -H "x-codeium-csrf-token: ${ANTIGRAVITY_CSRF_TOKEN}" \
+      -d "{\"serverName\":\"${MCP_SERVER_ID}\"}" \
+      "http://${ls_addr}/exa.language_server_pb.LanguageServerService/RefreshMcpServers" >/dev/null 2>&1; then
+      printf 'Reloaded MCP server %s in Antigravity (reopen any open Context Radar panel tab to see UI updates).\n' "$MCP_SERVER_ID"
+      return 0
+    fi
+  fi
+  if [ "$FORCE_RELOAD" -eq 1 ] && command -v agy >/dev/null 2>&1; then
+    if agy plugin disable "$PLUGIN_NAME" >/dev/null 2>&1 && agy plugin enable "$PLUGIN_NAME" >/dev/null 2>&1; then
+      printf 'Reloaded plugin %s via agy CLI.\n' "$PLUGIN_NAME"
+      return 0
+    fi
+  fi
+  printf 'Note: To load the updated binary/UI, restart the MCP server in Antigravity (Customizations > Installed > %s > MCP > Restart) or run with --reload outside Antigravity.\n' "$PLUGIN_NAME"
+}
+
 main() {
   if [ "$UNINSTALL" -eq 1 ]; then
     uninstall_plugin
@@ -173,6 +207,7 @@ main() {
 
   printf 'Installed %s %s to %s\n' "$PLUGIN_NAME" "$tag" "$INSTALL_DIR"
   "${INSTALL_DIR}/bin/${PLUGIN_NAME}" --version || true
+  refresh_mcp_host
 }
 
 main "$@"

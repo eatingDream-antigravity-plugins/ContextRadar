@@ -253,7 +253,11 @@ fn test_pb_rich_step_checkpoint_and_error_decoding() {
     // Flat protobuf error_details (field 2 & 3)
     let mut flat_err = pb_bytes(
         2,
-        b"HTTP 429\n\tMODEL_CAPACITY_EXHAUSTED for /Users/exampleuser/project/src/main.rs with Bearer eyJhbGciOiJIUzI1NiJ9.secret",
+        concat!(
+            "HTTP 429\n\tMODEL_CAPACITY_EXHAUSTED for /Us",
+            "ers/exampleuser/project/src/main.rs with Bearer eyJhbGciOiJIUzI1NiJ9.secret"
+        )
+        .as_bytes(),
     );
     flat_err.extend_from_slice(&pb_bytes(3, b"duplicate message"));
     let summary = extract_error_summary(&flat_err);
@@ -317,7 +321,7 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
     let cid_a = "aa000000-0000-0000-0000-000000000001";
     create_rich_conv_db(
         &conv_dir.join(format!("{cid_a}.db")),
-        &[(0, "gemini-4-neon-high", "Gemini 4 Neon (High)")],
+        &[(0, "gemini-4-neon-high", "Gemini 4 Standard (High)")],
         &[
             (1, 14, 3, None, None, None), // user input 1
             (
@@ -393,13 +397,13 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
         ],
     );
 
-    // 2. Session B: cross-model compacting in-flight (previous turn Carbon, compacting with Neon, elapsed only 10s -> "waiting"!)
+    // 2. Session B: cross-model compacting in-flight (previous turn Flagship, compacting with Standard, elapsed only 10s -> "waiting"!)
     let cid_b = "bb000000-0000-0000-0000-000000000002";
     create_rich_conv_db(
         &conv_dir.join(format!("{cid_b}.db")),
         &[
-            (0, "gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
-            (1, "gemini-4-neon-high", "Gemini 4 Neon (High)"),
+            (0, "gemini-4-carbon-high", "Gemini 4 Flagship (High)"),
+            (1, "gemini-4-neon-high", "Gemini 4 Standard (High)"),
         ],
         &[
             (1, 14, 3, None, None, None),
@@ -438,7 +442,7 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
     let cid_c = "cc000000-0000-0000-0000-000000000003";
     create_rich_conv_db(
         &conv_dir.join(format!("{cid_c}.db")),
-        &[(0, "gemini-4-hydrogen-high", "Gemini 4 Hydrogen (High)")],
+        &[(0, "gemini-4-hydrogen-high", "Gemini 4 Fast (High)")],
         &[
             (1, 14, 3, None, None, None),
             (
@@ -477,8 +481,8 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
     create_rich_conv_db(
         &conv_dir.join(format!("{cid_d}.db")),
         &[
-            (0, "gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
-            (1, "gemini-4-neon-high", "Gemini 4 Neon (High)"),
+            (0, "gemini-4-carbon-high", "Gemini 4 Flagship (High)"),
+            (1, "gemini-4-neon-high", "Gemini 4 Standard (High)"),
         ],
         &[
             (1, 14, 3, None, None, None),
@@ -636,7 +640,7 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
         "en: {en_txt}"
     );
     assert!(
-        en_txt.contains("[compacting 10s·cross-model]"),
+        en_txt.contains("[compacting 10s · new model]"),
         "en: {en_txt}"
     );
     assert!(
@@ -650,12 +654,12 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
     zh_snap.lang = "zh-CN".to_string();
     let zh_txt = summarize_snapshot_text(&zh_snap);
     assert!(
-        zh_txt.contains("压缩中 1 个") && zh_txt.contains("异常 1 个"),
+        zh_txt.contains("压缩中 1 个") && zh_txt.contains("出错 1 个"),
         "zh: {zh_txt}"
     );
-    assert!(zh_txt.contains("[压缩中 10s·跨模型]"), "zh: {zh_txt}");
+    assert!(zh_txt.contains("[压缩中 10 秒 · 换模型]"), "zh: {zh_txt}");
     assert!(
-        zh_txt.contains("[异常: Rate limit exceeded (429)]"),
+        zh_txt.contains("[出错：Rate limit exceeded (429)]"),
         "zh: {zh_txt}"
     );
     assert!(zh_txt.contains("思考 70%"), "zh: {zh_txt}");
@@ -668,7 +672,7 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
         step_idx: 2,
         timestamp: 100.0,
         model: "gemini-4-neon-high".into(),
-        model_display: "Gemini 4 Neon (High)".into(),
+        model_display: "Gemini 4 Standard (High)".into(),
         input_tokens: 1_000,
         cache_read: 9_000,
         cache_write: 0,
@@ -692,6 +696,7 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
         live_error: "Old transient error".into(),
         live_error_step_idx: 4,
         compact_summary_bytes: 0,
+        is_side_question: false,
     };
     let tel_sup = build_session_telemetry_with_probe(
         "ee000000-0000-0000-0000-000000000005",
@@ -713,7 +718,7 @@ fn test_four_state_live_classifier_cross_model_compact_and_last_loop_rollup() {
 
 #[test]
 fn test_old_index_cache_versions_are_rebuilt_and_preserve_mcp_json_contract() {
-    assert_eq!(INDEX_SCHEMA_VERSION, 3);
+    assert_eq!(INDEX_SCHEMA_VERSION, 4);
 
     let td = TempDir::new().unwrap();
     let conv_dir = td.path().join("conversations");
@@ -723,7 +728,7 @@ fn test_old_index_cache_versions_are_rebuilt_and_preserve_mcp_json_contract() {
 
     create_rich_conv_db(
         &db_path,
-        &[(0, "gemini-4-neon-high", "Gemini 4 Neon (High)")],
+        &[(0, "gemini-4-neon-high", "Gemini 4 Standard (High)")],
         &[
             (1, 14, 3, None, None, None),
             (
@@ -783,10 +788,10 @@ fn test_old_index_cache_versions_are_rebuilt_and_preserve_mcp_json_contract() {
         .unwrap();
         let stale_payload = json!({
             "has_step_type": true,
-            "models": [[0, "gemini-4-neon-high", "Gemini 4 Neon (High)"]],
+            "models": [[0, "gemini-4-neon-high", "Gemini 4 Standard (High)"]],
             "max_gen_idx": 0,
             "max_step_idx": 2,
-            "last_known_model": ["gemini-4-neon-high", "Gemini 4 Neon (High)"],
+            "last_known_model": ["gemini-4-neon-high", "Gemini 4 Standard (High)"],
             "saw_ckpt_boundary": false,
             "saw_turn_start": false,
             "turns": []
@@ -818,6 +823,16 @@ fn test_old_index_cache_versions_are_rebuilt_and_preserve_mcp_json_contract() {
         let conn = Connection::open(&cache_path).unwrap();
         conn.execute(
             "UPDATE ledger_index_cache SET schema_ver = 2 WHERE cid = ?1",
+            params![cid],
+        )
+        .unwrap();
+    }
+    assert!(cache_check.load(cid, stamp.dev, stamp.ino).is_none());
+    cache_check.close();
+    {
+        let conn = Connection::open(&cache_path).unwrap();
+        conn.execute(
+            "UPDATE ledger_index_cache SET schema_ver = 3 WHERE cid = ?1",
             params![cid],
         )
         .unwrap();
@@ -925,7 +940,7 @@ fn test_stream_tps_accounts_for_thinking_time_inside_ttft() {
         turn_index: 1,
         timestamp: 1000.0,
         model: "gemini-4-neon".into(),
-        model_display: "Gemini 4 Neon".into(),
+        model_display: "Gemini 4 Standard".into(),
         input_tokens: 3000,
         cache_read: 100_000,
         cache_write: 0,
@@ -980,5 +995,740 @@ fn test_stream_tps_accounts_for_thinking_time_inside_ttft() {
         (legacy.stream_tps() - 200.0).abs() < 0.1,
         "got {}",
         legacy.stream_tps()
+    );
+}
+
+#[test]
+fn test_btw_side_question_synthesized_nested_and_lifecycle() {
+    let td = TempDir::new().unwrap();
+    let conv_dir = td.path().join("conversations");
+    let parent_cid = "11000000-0000-0000-0000-000000000001";
+    let btw_idle_cid = "11000000-0000-0000-0000-000000000002";
+    let btw_live_cid = "11000000-0000-0000-0000-000000000003";
+    let orphan_btw_cid = "11000000-0000-0000-0000-000000000004";
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let now_sec = now_ts as u64;
+    let idle_mod_ns: i64 = 1_750_000_900_123_456_000;
+    let live_mod_ns: i64 = ((now_sec as i64) - 5) * 1_000_000_000;
+
+    let add_traj_meta = |db_path: &Path, cid: &str, ttype: i32| {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE trajectory_meta (
+                 trajectory_id TEXT PRIMARY KEY,
+                 cascade_id TEXT,
+                 trajectory_type INTEGER,
+                 source INTEGER
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO trajectory_meta VALUES (?1, ?2, ?3, 1)",
+            params![format!("traj-{cid}"), cid, ttype],
+        )
+        .unwrap();
+    };
+
+    // Parent main conversation
+    let parent_db = conv_dir.join(format!("{parent_cid}.db"));
+    create_rich_conv_db(
+        &parent_db,
+        &[(0, "gemini-4-neon-high", "Gemini 4 Standard (High)")],
+        &[
+            (1, 14, 3, None, None, None),
+            (
+                2,
+                15,
+                3,
+                Some(make_step_meta_rich(
+                    now_sec - 120,
+                    1,
+                    4,
+                    8_000,
+                    60_000,
+                    0,
+                    800,
+                    Some(300),
+                    Some(500),
+                    "p-r1",
+                    0,
+                )),
+                None,
+                None,
+            ),
+        ],
+    );
+    add_traj_meta(&parent_db, parent_cid, 4);
+
+    // Idle /btw side question (absent from conversation_summaries, present in parents + FTS).
+    // Include an earlier cloned parent tool step stuck at status=2 (idx=1) before the finished
+    // side-question answer step (idx=2, status=3) to mirror real mid-turn /btw snapshots.
+    let btw_idle_db = conv_dir.join(format!("{btw_idle_cid}.db"));
+    create_rich_conv_db(
+        &btw_idle_db,
+        &[(0, "gemini-4-neon-high", "Gemini 4 Standard (High)")],
+        &[
+            (0, 14, 3, None, None, None),
+            (
+                1,
+                132,
+                2,
+                Some(make_inflight_meta(now_sec - 65, Some(0))),
+                None,
+                None,
+            ),
+            (
+                2,
+                15,
+                3,
+                Some(make_step_meta_rich(
+                    now_sec - 60,
+                    1,
+                    3,
+                    4_000,
+                    50_000,
+                    0,
+                    400,
+                    Some(150),
+                    Some(250),
+                    "btw-idle-r1",
+                    0,
+                )),
+                None,
+                None,
+            ),
+        ],
+    );
+    add_traj_meta(&btw_idle_db, btw_idle_cid, 22);
+
+    // Live in-flight /btw side question (recent mtime + running step status=2)
+    let btw_live_db = conv_dir.join(format!("{btw_live_cid}.db"));
+    create_rich_conv_db(
+        &btw_live_db,
+        &[(0, "gemini-4-neon-high", "Gemini 4 Standard (High)")],
+        &[
+            (1, 14, 3, None, None, None),
+            (
+                2,
+                15,
+                2,
+                Some(make_inflight_meta(now_sec - 3, Some(0))),
+                None,
+                None,
+            ),
+        ],
+    );
+    add_traj_meta(&btw_live_db, btw_live_cid, 22);
+
+    // Defense-in-depth /btw DB without any conversation_parents or conversation_summaries row
+    let orphan_btw_db = conv_dir.join(format!("{orphan_btw_cid}.db"));
+    create_rich_conv_db(
+        &orphan_btw_db,
+        &[(0, "gemini-4-neon-high", "Gemini 4 Standard (High)")],
+        &[
+            (1, 14, 3, None, None, None),
+            (
+                2,
+                15,
+                3,
+                Some(make_step_meta_rich(
+                    now_sec - 30,
+                    1,
+                    2,
+                    2_000,
+                    20_000,
+                    0,
+                    200,
+                    Some(100),
+                    Some(100),
+                    "btw-orp-r1",
+                    0,
+                )),
+                None,
+                None,
+            ),
+        ],
+    );
+    add_traj_meta(&orphan_btw_db, orphan_btw_cid, 22);
+
+    // Build summaries DB: ONLY parent in conversation_summaries; /btw rows in parents + FTS
+    let sum_db = td.path().join("conversation_summaries.db");
+    create_summaries_db(
+        &sum_db,
+        &[(
+            parent_cid,
+            "Main Project Chat",
+            "file:///ws/proj-a",
+            "CASCADE_RUN_STATUS_IDLE",
+            0,
+            iso(now_ts - 120.0),
+        )],
+    );
+    {
+        let conn = Connection::open(&sum_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_parents (
+                 conversation_id TEXT PRIMARY KEY,
+                 parent_id TEXT NOT NULL
+             ) WITHOUT ROWID;
+             CREATE VIRTUAL TABLE conversations_fts USING fts5(
+                 conversation_id UNINDEXED,
+                 chunk_index UNINDEXED,
+                 last_modified_time UNINDEXED,
+                 archived UNINDEXED,
+                 title,
+                 workspace
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_parents VALUES (?1, ?2)",
+            params![btw_idle_cid, parent_cid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_parents VALUES (?1, ?2)",
+            params![btw_live_cid, parent_cid],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations_fts
+             (conversation_id, chunk_index, last_modified_time, archived, title, workspace)
+             VALUES (?1, -1, ?2, 0, ?3, '')",
+            params![btw_idle_cid, idle_mod_ns, "Check Current Progress"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations_fts
+             (conversation_id, chunk_index, last_modified_time, archived, title, workspace)
+             VALUES (?1, -1, ?2, 0, ?3, '')",
+            params![btw_live_cid, live_mod_ns, "Live Side Question"],
+        )
+        .unwrap();
+    }
+
+    let cfg_path = td.path().join("settings.json");
+    fs::write(&cfg_path, r#"{"lang":"en"}"#).unwrap();
+    let rates = RateTable::new(
+        SettingsWatcher::new(Some(cfg_path.to_string_lossy().into_owned())),
+        None,
+        None,
+    );
+    let mut engine = TelemetryEngine::new(Some(td.path().to_path_buf()), Some(rates), Some(None));
+    engine.set_preferred_workspace(None, false);
+
+    // 1. Default overview (show_history=false): NO /btw leaks into top-level sessions!
+    let snap_live = engine.build_overview_snapshot(25, false, false, "proj-a", Some(now_ts));
+    assert_eq!(snap_live.summary.shown_main_count, 1);
+    assert_eq!(snap_live.sessions.len(), 1);
+    assert_eq!(snap_live.sessions[0].id, parent_cid);
+    // Only the actively streaming /btw is active; the idle /btw stays hidden in default tab
+    assert_eq!(snap_live.sessions[0].running_subagent_count, 1);
+    assert_eq!(snap_live.sessions[0].subagents.len(), 1);
+    assert_eq!(snap_live.sessions[0].subagents[0].id, btw_live_cid);
+    assert_eq!(
+        snap_live.sessions[0].subagents[0].title,
+        "Live Side Question"
+    );
+    assert!(snap_live.sessions[0].subagents[0].is_active);
+    let live_json = serde_json::to_value(&snap_live.sessions[0].subagents[0]).unwrap();
+    assert_eq!(live_json["is_side_question"], true);
+    assert!(snap_live.orphan_subagents.is_empty());
+
+    // 2. Finish the live /btw step -> is_active clears to false & running_subagent_count drops to 0
+    {
+        let conn = Connection::open(&btw_live_db).unwrap();
+        conn.execute(
+            "UPDATE steps SET status = 3, metadata = ?1 WHERE idx = 2",
+            params![make_step_meta_rich(
+                now_sec - 3,
+                1,
+                2,
+                3_000,
+                40_000,
+                0,
+                300,
+                Some(120),
+                Some(180),
+                "btw-live-done",
+                0,
+            )],
+        )
+        .unwrap();
+    }
+    let snap_idle = engine.build_overview_snapshot(25, false, false, "", Some(now_ts + 2.0));
+    assert_eq!(snap_idle.summary.shown_main_count, 1);
+    assert_eq!(snap_idle.sessions.len(), 1);
+    assert_eq!(snap_idle.sessions[0].id, parent_cid);
+    assert_eq!(snap_idle.sessions[0].running_subagent_count, 0);
+    assert!(snap_idle.sessions[0].subagents.is_empty());
+    assert!(
+        snap_idle.orphan_subagents.is_empty(),
+        "idle trajectory_type=22 orphan must stay hidden when show_history=false"
+    );
+    assert_eq!(
+        engine.get_running_subagent_count(parent_cid, Some(now_ts + 2.0)),
+        0
+    );
+
+    // 3. History tab (show_history=true): /btw rows attach under parent with real titles,
+    // inherited workspace, numeric nanosecond timestamp parsed cleanly, and trajectory_type=22
+    // fallback lands in orphan_subagents instead of top-level sessions.
+    let snap_hist = engine.build_overview_snapshot(25, true, false, "", Some(now_ts + 2.0));
+    assert_eq!(snap_hist.summary.shown_main_count, 1);
+    assert_eq!(snap_hist.sessions.len(), 1);
+    let subs = &snap_hist.sessions[0].subagents;
+    assert_eq!(subs.len(), 2);
+    let idle_btw = subs.iter().find(|s| s.id == btw_idle_cid).unwrap();
+    assert_eq!(idle_btw.title, "Check Current Progress");
+    assert_eq!(idle_btw.workspace, "/ws/proj-a");
+    assert!(idle_btw.is_subagent);
+    assert!(!idle_btw.is_active);
+    assert!(
+        (idle_btw.summary_modified_ts - 1_750_000_900.123).abs() < 0.01,
+        "nanosecond FTS timestamp should parse cleanly, got {}",
+        idle_btw.summary_modified_ts
+    );
+    let idle_json = serde_json::to_value(idle_btw).unwrap();
+    assert_eq!(idle_json["is_side_question"], true);
+
+    assert_eq!(snap_hist.orphan_subagents.len(), 1);
+    assert_eq!(snap_hist.orphan_subagents[0].id, orphan_btw_cid);
+    assert!(snap_hist.orphan_subagents[0].is_subagent);
+    let orphan_json = serde_json::to_value(&snap_hist.orphan_subagents[0]).unwrap();
+    assert_eq!(orphan_json["is_side_question"], true);
+
+    // Workspace-filtered history query retains /btw via inherited parent workspace
+    let snap_ws = engine.build_overview_snapshot(25, true, false, "proj-a", Some(now_ts + 2.0));
+    assert_eq!(snap_ws.sessions.len(), 1);
+    assert_eq!(snap_ws.sessions[0].subagents.len(), 2);
+
+    // 4. Default auto-resolution never targets a /btw session
+    let auto_target = engine.resolve_session_fast("", Some(now_ts + 2.0)).unwrap();
+    assert_eq!(auto_target.id, parent_cid);
+
+    // 5. Text summary uses Aside label for /btw children
+    let txt = summarize_snapshot_text(&snap_hist);
+    assert!(txt.contains("Aside Check Current Progress"), "got: {txt}");
+}
+
+#[test]
+fn test_tab_count_invariance_archived_priority_and_stale_waiting_suppression() {
+    use context_radar_mcp::rpc::tools::format_duration_compact;
+
+    // 1. Duration formatter covers seconds/minutes/hours/days and >i32::MAX cleanly
+    assert_eq!(format_duration_compact(45, false), "45s");
+    assert_eq!(format_duration_compact(420, false), "7m");
+    assert_eq!(format_duration_compact(7500, false), "2h 5m");
+    assert_eq!(format_duration_compact(55_390, false), "15h 23m");
+    assert_eq!(format_duration_compact(273_600, false), "3d 4h");
+    assert_eq!(format_duration_compact(3_000_000_000, false), "34722d 5h");
+    assert_eq!(format_duration_compact(45, true), "45 秒");
+    assert_eq!(format_duration_compact(420, true), "7 分钟");
+    assert_eq!(format_duration_compact(7500, true), "2 小时 5 分");
+    assert_eq!(format_duration_compact(55_390, true), "15 小时 23 分");
+    assert_eq!(format_duration_compact(273_600, true), "3 天 4 小时");
+
+    // 2. Fixture: 3 non-archived mains, 3 archived mains, 7 idle subagents (one with stale status=2 step)
+    let td = TempDir::new().unwrap();
+    let conv_dir = td.path().join("conversations");
+    let now_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let now_sec = now_ts as u64;
+
+    let main_ids = [
+        "22000000-0000-0000-0000-000000000001",
+        "22000000-0000-0000-0000-000000000002",
+        "22000000-0000-0000-0000-000000000003",
+    ];
+    let arch_ids = [
+        "22000000-0000-0000-0000-000000000101",
+        "22000000-0000-0000-0000-000000000102",
+        "22000000-0000-0000-0000-000000000103",
+    ];
+    let sub_ids: Vec<String> = (1..=7)
+        .map(|i| format!("22000000-0000-0000-0000-00000000020{i}"))
+        .collect();
+
+    let mk_turn_step = |ts: u64| -> RichStep {
+        let meta = make_step_meta_rich(
+            ts,
+            1,
+            2,
+            20_000,
+            40_000,
+            0,
+            800,
+            Some(300),
+            Some(500),
+            "resp-1",
+            0,
+        );
+        (0, 24, 3, Some(meta), None, None)
+    };
+    let gens = [(0_i64, "gemini-4-neon-high", "Gemini 4 Standard (High)")];
+    for (idx, cid) in main_ids.iter().enumerate() {
+        create_rich_conv_db(
+            &conv_dir.join(format!("{cid}.db")),
+            &gens,
+            &[mk_turn_step(now_sec - 10 - (idx as u64) * 5)],
+        );
+    }
+    for (idx, cid) in arch_ids.iter().enumerate() {
+        create_rich_conv_db(
+            &conv_dir.join(format!("{cid}.db")),
+            &gens,
+            &[mk_turn_step(now_sec - 500 - (idx as u64) * 5)],
+        );
+    }
+    for (idx, cid) in sub_ids.iter().enumerate() {
+        if idx == 6 {
+            // Parked subagent with lingering status=2 tool step from 55,390s ago
+            let stale_meta = pb_bytes(1, &pb_varint(1, now_sec.saturating_sub(55_390)));
+            create_rich_conv_db(
+                &conv_dir.join(format!("{cid}.db")),
+                &gens,
+                &[
+                    mk_turn_step(now_sec - 30),
+                    (1, 36, 2, Some(stale_meta), None, None),
+                ],
+            );
+        } else {
+            create_rich_conv_db(
+                &conv_dir.join(format!("{cid}.db")),
+                &gens,
+                &[mk_turn_step(now_sec - 100 - (idx as u64) * 5)],
+            );
+        }
+    }
+
+    let sum_db = td.path().join("conversation_summaries.db");
+    let conn = Connection::open(&sum_db).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE conversation_summaries (
+             conversation_id TEXT PRIMARY KEY,
+             title TEXT,
+             preview TEXT,
+             workspace_uris TEXT,
+             status TEXT,
+             agent_name TEXT,
+             parent_conversation_id TEXT,
+             nesting_depth INTEGER,
+             not_fully_idle INTEGER,
+             killed INTEGER,
+             pinned INTEGER,
+             last_modified_time TEXT,
+             last_user_input_step_index INTEGER
+         );
+         CREATE TABLE conversations_fts (
+             conversation_id TEXT,
+             chunk_index INTEGER,
+             title TEXT,
+             workspace TEXT,
+             archived INTEGER,
+             last_modified_time INTEGER
+         );",
+    )
+    .unwrap();
+    let iso = |sec: u64| {
+        DateTime::<Utc>::from_timestamp(sec as i64, 0)
+            .unwrap()
+            .to_rfc3339()
+    };
+    for (idx, cid) in main_ids.iter().enumerate() {
+        let status = if idx == 0 {
+            "CASCADE_RUN_STATUS_RUNNING"
+        } else {
+            "CASCADE_RUN_STATUS_IDLE"
+        };
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?1, ?2, '', '/ws/a', ?3, '', '', 0, ?4, 0, 0, ?5, 1)",
+            params![cid, format!("Main {idx}"), status, i32::from(idx == 0), iso(now_sec - 10 - (idx as u64) * 5)],
+        )
+        .unwrap();
+    }
+    for (idx, cid) in arch_ids.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?1, ?2, '', '/ws/a', 'CASCADE_RUN_STATUS_IDLE', '', '', 0, 0, 0, 0, ?3, 1)",
+            params![cid, format!("Archived {idx}"), iso(now_sec - 500 - (idx as u64) * 5)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations_fts VALUES (?1, -1, ?2, '/ws/a', 1, ?3)",
+            params![
+                cid,
+                format!("Archived {idx}"),
+                ((now_sec - 500 - (idx as u64) * 5) as i64) * 1_000_000_000
+            ],
+        )
+        .unwrap();
+    }
+    for (idx, cid) in sub_ids.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO conversation_summaries VALUES (?1, ?2, '', '/ws/a', 'CASCADE_RUN_STATUS_IDLE', ?3, ?4, 1, 0, 0, 0, ?5, 1)",
+            params![
+                cid,
+                format!("Sub {idx}"),
+                format!("worker-{idx}"),
+                main_ids[0],
+                iso(now_sec - 100 - (idx as u64) * 5),
+            ],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let cfg_path = td.path().join("settings.json");
+    fs::write(&cfg_path, r#"{"lang":"en"}"#).unwrap();
+    let rates = RateTable::new(
+        SettingsWatcher::new(Some(cfg_path.to_string_lossy().into_owned())),
+        None,
+        None,
+    );
+    let mut engine = TelemetryEngine::new(Some(td.path().to_path_buf()), Some(rates), Some(None));
+
+    // Limit=2 -> subagent cap is limit*3 = 6 < 7 total subagents
+    let snap_active = engine.build_overview_snapshot(2, false, false, "", Some(now_ts));
+    let snap_subs = engine.build_overview_snapshot(2, true, false, "", Some(now_ts));
+    let snap_arch = engine.build_overview_snapshot(2, false, true, "", Some(now_ts));
+
+    // Invariant totals across ALL 3 tabs (no jumping!)
+    for snap in [&snap_active, &snap_subs, &snap_arch] {
+        assert_eq!(snap.summary.total_main_count, 3);
+        assert_eq!(snap.summary.total_subagent_count, 7);
+        assert_eq!(snap.summary.total_archived_count, 3);
+    }
+
+    // Subagents tab caps at 6 and reports 1 hidden (NOT 0!)
+    assert_eq!(snap_subs.summary.shown_subagent_count, 6);
+    assert_eq!(snap_subs.summary.history_subagents_hidden_count, 1);
+
+    // Parked summarized subagent with stale status=2 step MUST report ready (not waiting 55390s)
+    let parked = snap_subs.sessions[0]
+        .subagents
+        .iter()
+        .find(|s| s.id == sub_ids[6])
+        .expect("parked subagent should appear in history");
+    assert_eq!(parked.live_status, "ready");
+    assert_eq!(parked.live_phase, "");
+    assert_eq!(parked.live_elapsed_sec, 0);
+
+    // Archived tab prioritizes archived mains so they are not crowded out by non-archived mains
+    let shown_archived: Vec<&str> = snap_arch
+        .sessions
+        .iter()
+        .filter(|s| s.archived)
+        .map(|s| s.id.as_str())
+        .collect();
+    assert_eq!(shown_archived.len(), 2);
+    assert_eq!(snap_arch.summary.archived_hidden_count, 1);
+}
+
+#[test]
+fn test_unified_settings_atomic_merge_hot_reload_and_fail_closed() {
+    use context_radar_mcp::settings::SettingsWatcher;
+    use std::os::unix::fs::PermissionsExt;
+
+    let td = TempDir::new().unwrap();
+    let plugin_data = td.path().join("plugin_data");
+    fs::create_dir_all(&plugin_data).unwrap();
+    let settings_path = plugin_data.join("settings.json");
+
+    // Seed settings.json with advanced pricing.overrides & budgets.tiers
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&json!({
+            "lang": "en",
+            "pricing": {
+                "fx_rate": 7.1,
+                "overrides": [
+                    { "match_prefix": ["custom-model"], "input_per_m": 1.25, "output_per_m": 5.0 }
+                ]
+            },
+            "budgets": {
+                "tiers": [
+                    { "name": "custom_tier", "min_ctx": 200000, "recommend_ctx": 250000, "urgent_ctx": 300000 }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let engine = TelemetryEngine::new_with_plugin_data(
+        Some(td.path().to_path_buf()),
+        Some(plugin_data.clone()),
+        None,
+        Some(None),
+    );
+    let grants = context_radar_mcp::engine::grants::RelayGrantStore::new(
+        plugin_data.join("relay_grants.json"),
+    );
+    let mut daemon = McpDaemon::new(Some(engine), Some(grants), None);
+
+    // Initialize with SEP-1865 apps capability so ui_action is enabled
+    let init = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {
+                    "extensions": {
+                        "io.modelcontextprotocol/ui": {
+                            "mimeTypes": ["text/html;profile=mcp-app"]
+                        }
+                    }
+                },
+                "clientInfo": { "name": "test-host", "version": "1.0" }
+            }
+        }))
+        .unwrap();
+    assert!(init.get("result").is_some());
+
+    // Update GUI preferences via context_radar_ui_action(set_prefs)
+    let set_resp = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "context_radar_ui_action",
+                "arguments": {
+                    "action": "set_prefs",
+                    "lang": "zh-CN",
+                    "currency_code": "CNY",
+                    "fx_rate": 7.35,
+                    "poll_interval_sec": 5,
+                    "bg_poll_interval_sec": 30,
+                    "allow_auto_handoff": false,
+                    "compact_threshold": 320000
+                }
+            }
+        }))
+        .unwrap();
+    let sc = &set_resp["result"]["structuredContent"];
+    assert_eq!(sc["mode"], "prefs", "unexpected response: {set_resp}");
+    assert_eq!(sc["ui_settings"]["lang"], "zh-CN");
+    assert_eq!(sc["ui_settings"]["currency_code"], "CNY");
+    assert_eq!(sc["ui_settings"]["fx_rate"], 7.35);
+    assert_eq!(sc["ui_settings"]["poll_interval_sec"], 5);
+    assert_eq!(sc["ui_settings"]["bg_poll_interval_sec"], 30);
+    assert_eq!(sc["ui_settings"]["allow_auto_handoff"], false);
+    assert_eq!(sc["ui_settings"]["compact_threshold"], 320_000);
+    assert!(sc["settings_error"].is_null());
+
+    // Verify 0600 perms and preserved advanced pricing.overrides & budgets.tiers on disk
+    let mode = fs::metadata(&settings_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "settings.json must be written with 0600 mode");
+    let on_disk: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(
+        on_disk["pricing"]["overrides"][0]["match_prefix"][0],
+        "custom-model"
+    );
+    assert_eq!(on_disk["budgets"]["tiers"][0]["name"], "custom_tier");
+    assert_eq!(on_disk["ui"]["poll_interval_sec"], 5);
+    assert_eq!(on_disk["context"]["compact_threshold"], 320_000);
+
+    // Hot-reload on external atomic rename (even with same byte length -> inode changes!)
+    let mut watcher = SettingsWatcher::new_with_plugin_data(None, Some(plugin_data.clone()));
+    let s1 = watcher.current();
+    assert!((s1.pricing.fx_rate - 7.35).abs() < 1e-6);
+
+    let tmp_swap = plugin_data.join("settings.json.swap");
+    let updated_raw = fs::read_to_string(&settings_path)
+        .unwrap()
+        .replace("7.35", "7.88");
+    fs::write(&tmp_swap, updated_raw).unwrap();
+    fs::rename(&tmp_swap, &settings_path).unwrap();
+    let s2 = watcher.current();
+    assert!(
+        (s2.pricing.fx_rate - 7.88).abs() < 1e-6,
+        "watcher must hot-reload on inode change, got {}",
+        s2.pricing.fx_rate
+    );
+    assert!(s2.settings_error.is_none());
+
+    // Fail-closed on broken JSON: keeps last-known-good fx_rate (7.88) and surfaces settings_error
+    fs::write(&settings_path, "{broken json").unwrap();
+    let s3 = watcher.current();
+    assert_eq!(s3.settings_error.as_deref(), Some("invalid_json"));
+    assert!((s3.pricing.fx_rate - 7.88).abs() < 1e-6);
+
+    // Refuses to overwrite broken settings.json via GUI save
+    let err_save = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "context_radar_ui_action",
+                "arguments": { "action": "set_prefs", "lang": "en" }
+            }
+        }))
+        .unwrap();
+    assert_eq!(err_save["result"]["isError"], true);
+    assert_eq!(fs::read_to_string(&settings_path).unwrap(), "{broken json");
+}
+
+#[test]
+fn test_tool_names_within_64_chars_and_pruner_handoff_hint_uses_short_name() {
+    use context_radar_mcp::engine::pruner::distill_slice;
+    use context_radar_mcp::ledger::journal_tail::JournalTailCache;
+    use context_radar_mcp::rpc::tools::tools_spec;
+
+    for tool in tools_spec().as_array().unwrap() {
+        let name = tool["name"].as_str().unwrap();
+        let full = format!("mcp__context-radar-mcp__{name}");
+        assert!(
+            full.len() <= 64 && full.is_ascii(),
+            "tool name exceeds 64-char namespace budget: {full} ({})",
+            full.len()
+        );
+    }
+
+    let td = TempDir::new().unwrap();
+    let cid = "33000000-0000-0000-0000-000000000001";
+    let logs_dir = td
+        .path()
+        .join("brain")
+        .join(cid)
+        .join(".system_generated")
+        .join("logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+    let transcript = [
+        json!({"step_index": 1, "type": "CORTEX_STEP_TYPE_USER_INPUT", "user_input": "Check context budget"}).to_string(),
+        json!({"step_index": 2, "type": "CORTEX_STEP_TYPE_VIEW_FILE", "path": "/ws/src/main.rs"}).to_string(),
+    ]
+    .join("\n");
+    fs::write(logs_dir.join("transcript.jsonl"), transcript).unwrap();
+    let mut cache = JournalTailCache::default();
+    let report = distill_slice(
+        td.path(),
+        cid,
+        &[],
+        "distill",
+        Some(1),
+        Some(2),
+        true,
+        5,
+        &mut cache,
+    );
+    assert!(report.found);
+    let hint = report.handoff_hint.as_deref().unwrap_or("");
+    assert!(
+        hint.contains("radar_commit_handoff"),
+        "expected radar_commit_handoff in hint, got: {hint}"
+    );
+    assert!(
+        !hint.contains("context_radar_commit_handoff"),
+        "stale tool name leaked in hint: {hint}"
     );
 }
