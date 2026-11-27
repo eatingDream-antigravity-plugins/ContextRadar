@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.0](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.5.3...v1.6.0) (2026-11-27)
+
+
+### Features
+
+* Lucid Indigo 64 KiB TS panel, /btw side-question tracking, settings hot-reload, and 30s demo ([#36](https://github.com/eatingDream-antigravity-plugins/context-radar/issues/36)) ([30d5c3f](https://github.com/eatingDream-antigravity-plugins/context-radar/commit/30d5c3f7156d302b23bd4e6266012d6b8840861f))
+
 ## [1.5.3](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.5.2...v1.5.3) (2026-11-27)
 
 
