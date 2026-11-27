@@ -5,9 +5,9 @@ use serde::Serialize;
 use crate::engine::rates::RateTable;
 use crate::engine::telemetry::SessionTelemetry;
 pub use crate::engine::tiers::{
-    builtin_tiers, builtin_tiers_for_lang, is_gemini_4_carbon, is_gemini_4_model,
-    model_cache_ttl_sec, resolve_budget_tier, BudgetTierSpec, DEFAULT_CACHE_TTL_SEC,
-    GEMINI_4_CACHE_TTL_SEC,
+    builtin_tiers, builtin_tiers_for_lang, effective_critical_threshold, is_gemini_4_carbon,
+    is_gemini_4_carbon_or_argon, is_gemini_4_model, model_cache_ttl_sec, resolve_budget_tier,
+    BudgetTierSpec, DEFAULT_CACHE_TTL_SEC, GEMINI_4_CACHE_TTL_SEC, GEMINI_4_NEON_CACHE_TTL_SEC,
 };
 use crate::i18n::select_display_cost;
 
@@ -144,7 +144,8 @@ pub fn evaluate_handoff_gate(
     } else {
         s.model_display.as_str()
     };
-    let prof = resolve_budget_tier(model, model_disp, &cfg);
+    let mut prof = resolve_budget_tier(model, model_disp, &cfg);
+    prof.urgent_ctx = effective_critical_threshold(&prof, &cfg);
     let econ = compute_economics(ctx, model, model_disp, rates);
     let rem_turns = estimated_remaining_turns.max(1);
     let urgent = ctx >= prof.urgent_ctx;
@@ -425,7 +426,7 @@ pub fn prepare_handoff_plan(
             "active_full_compact",
             if zh {
                 format!(
-                    "建议全量压缩或接力新会话：当前 {}k >= 推荐线 {}k（上限 {}k），已满足冷却、零运行子代理与回本校验（>= {} 轮）；可调 context_radar_commit_handoff 生成 /compact 指令或 target:new 接力票据。",
+                    "建议全量压缩或接力新会话：当前 {}k >= 推荐线 {}k（上限 {}k），已满足冷却、零运行子代理与回本校验（>= {} 轮）；可调 radar_commit_handoff 生成 /compact 指令或 target:new 接力票据。",
                     ctx / 1000,
                     prof.recommend_ctx / 1000,
                     limit_k,
@@ -433,7 +434,7 @@ pub fn prepare_handoff_plan(
                 )
             } else {
                 format!(
-                    "Full /compact or new-chat handoff recommended: {}k >= {}k target (limit {}k), satisfying cooldown, 0 running subagents, and >={} turn break-even. Call context_radar_commit_handoff.",
+                    "Full /compact or new-chat handoff recommended: {}k >= {}k target (limit {}k), satisfying cooldown, 0 running subagents, and >={} turn break-even. Call radar_commit_handoff.",
                     ctx / 1000,
                     prof.recommend_ctx / 1000,
                     limit_k,
@@ -446,7 +447,7 @@ pub fn prepare_handoff_plan(
             "partial_branch_fold",
             if zh {
                 format!(
-                    "处于可选压缩区（{}k，下限 {}k / 推荐 {}k）：优先用 scratch/ 切片摘要或分支子代理保住热前缀，跨阶段边界时可调 context_radar_commit_handoff。",
+                    "处于可选压缩区（{}k，下限 {}k / 推荐 {}k）：优先用 scratch/ 切片摘要或分支子代理保住热前缀，跨阶段边界时可调 radar_commit_handoff。",
                     ctx / 1000,
                     prof.min_ctx / 1000,
                     prof.recommend_ctx / 1000
@@ -512,21 +513,25 @@ pub fn prepare_handoff_plan(
         HandoffRecipes {
             past_slice_distill: "调用 context_radar_hotspots(mode='distill', save_note=true)：在不改动当前会话前缀的前提下，将早期高膨胀步骤浓缩写入 scratch/，供全新子代理或后续 target:new 接力会话按需读取。".into(),
             future_branch_fold: if is_gemini_4_model(&s.model, &s.model_display) && ctx > 40_000 {
-                "当前上下文 >40k：Gemini 4 上 fork 会触发全量冷 prefill 且缓存 TTL 为 180s（自 prefill 起算）；请用精简摘要派发全新子代理，勿使用 fork。".into()
+                format!(
+                    "当前上下文 >40k：Gemini 4 上 fork 会触发全量冷 prefill 且缓存 TTL 为 {cache_ttl_sec}s（自 prefill 起算）；请用精简摘要派发全新子代理，勿使用 fork。"
+                )
             } else {
                 "需要继承当前上下文的高噪声探索可调用 swarm(action='add', fork='coordinator')：探索噪声留在分支，回传简短结论后结束子代理。".into()
             },
-            official_handoff_new: "跨阶段且 running_subagent_count == 0 时调用 context_radar_commit_handoff：生成完整 /compact 指令，并在已打开的面板/卡片中通过官方 target:new 拉起同工作区新会话。".into(),
+            official_handoff_new: "跨阶段且 running_subagent_count == 0 时调用 radar_commit_handoff：生成完整 /compact 指令，并在已打开的面板/卡片中通过官方 target:new 拉起同工作区新会话。".into(),
         }
     } else {
         HandoffRecipes {
             past_slice_distill: "Call context_radar_hotspots(mode='distill', save_note=true) to write an out-of-band <600-token summary to scratch/ for fresh subagents or a future target:new chat without touching the live KV prefix.".into(),
             future_branch_fold: if is_gemini_4_model(&s.model, &s.model_display) && ctx > 40_000 {
-                "Context >40k: on Gemini 4, fork triggers a full cold Turn-1 prefill and cache TTL is 180s from prefill start; spawn a fresh subagent with a concise brief instead of fork.".into()
+                format!(
+                    "Context >40k: on Gemini 4, fork triggers a full cold Turn-1 prefill and cache TTL is {cache_ttl_sec}s from prefill start; spawn a fresh subagent with a concise brief instead of fork."
+                )
             } else {
                 "Delegate noisy exploration via swarm(action='add', fork='coordinator') so noisy tool output stays off the main thread.".into()
             },
-            official_handoff_new: "At a phase boundary with running_subagent_count == 0, call context_radar_commit_handoff to prepare a copyable /compact command or launch a scoped target:new session from an open UI view.".into(),
+            official_handoff_new: "At a phase boundary with running_subagent_count == 0, call radar_commit_handoff to prepare a copyable /compact command or launch a scoped target:new session from an open UI view.".into(),
         }
     };
 

@@ -192,6 +192,8 @@ pub fn ttl_window_label(lang: Lang, ttl_sec: u64) -> &'static str {
     match (lang.is_zh(), ttl_sec) {
         (true, 180) => "3 分钟",
         (false, 180) => "3m",
+        (true, 240) => "4 分钟",
+        (false, 240) => "4m",
         (true, _) => "5 分钟",
         (false, _) => "5m",
     }

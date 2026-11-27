@@ -4,9 +4,9 @@
   "lang": "auto",
   "context": {
     "default_limit": 512000,
-    "warn_threshold": 220000,
-    "compact_threshold": 270000,
-    "critical_threshold": 350000,
+    "warn_threshold": 300000,
+    "compact_threshold": 360000,
+    "critical_threshold": 430000,
     "est_post_compact_base": 20500,
     "subagent_silent_timeout_sec": 3600,
     "enable_disk_cache": true
@@ -35,8 +35,8 @@
       "custom_heavy": {
         "label": "Custom Heavy (512k)",
         "min_ctx": 260000,
-        "recommend_ctx": 300000,
-        "urgent_ctx": 415000,
+        "recommend_ctx": 320000,
+        "urgent_ctx": 400000,
         "min_turns_since_ckpt": 16,
         "min_remaining_turns": 8
       }

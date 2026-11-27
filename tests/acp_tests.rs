@@ -84,7 +84,7 @@ fn test_acp_coordinator_pure_protocol_direct_and_lazy_wrapper_and_gates() {
             "update": {
                 "sessionUpdate": "tool_call",
                 "toolCallId": "tc-1",
-                "name": "mcp_context-radar-mcp_context_radar_commit_handoff",
+                "name": "mcp_context-radar-mcp_context-radar-mcp_radar_commit_handoff",
                 "rawInput": {
                     "kind": "compact",
                     "preserve_points": "Keep API schema",

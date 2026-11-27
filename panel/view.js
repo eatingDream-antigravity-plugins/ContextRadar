@@ -77,7 +77,7 @@ const K_CC = "compact_command", K_CS = "compact_status", K_JC = "just_compacted"
 const K_SC2 = "structuredContent", K_GID = "grant_id", K_SN = "saved_note_path", K_TN = "turns", K_SA = "subagents", K_AR = "archived", K_OS = "orphan_subagents";
 const K_WS = "workspace", K_WSS = "workspaces", K_CL = "context_limit", K_CT = "context_tokens", K_CR = "cache_hit_rate", K_RCT = "recommend_compact_tokens";
 const K_ST = "settings", K_ACT = "is_active", K_PG = "pending_grant", K_DW = "daemon_workspace", K_GA = "generated_at", K_PK = "pricing_known", K_PF = "context_radar_";
-const DEF_T = [27e4, 31e4, 42e4], thrs = (it) => [it.min_compact_tokens, it[K_RCT], it.urgent_compact_tokens], TABS = [K_TN, K_HS, "advice"], FIDS = [K_AC, "subs", K_AR];
+const DEF_T = [30e4, 36e4, 43e4], thrs = (it) => [it.min_compact_tokens, it[K_RCT], it.urgent_compact_tokens], TABS = [K_TN, K_HS, "advice"], FIDS = [K_AC, "subs", K_AR];
 
 let viewMode = boot?.view === K_HO ? HC : DB, snapshot = boot?.mode === K_SN0 ? boot : null, lastDigest = boot?.[K_DIG] || "";
 let handoffCard = null, handoffStatus = K_PD, loadingInitial = !(boot?.mode === K_SN0);
@@ -96,7 +96,7 @@ const callTool = (name, args, opts) => bridge.callServerTool({ name, arguments: 
 const uiAct = (args) => callTool(`${K_PF}ui_action`, args), uiSc = async (a) => (await uiAct(a))?.[K_SC2];
 const sendTxt = (text, meta) => bridge.sendMessage({ role: "user", content: [{ type: "text", text }], ...(meta ? { _meta: meta } : {}) });
 const num = (v) => Number(v) || 0, fx = (n, d = 0) => num(n).toFixed(d), clp = (v) => M.min(100, M.max(0, v));
-const safeLvl = (l) => (l === K_CRIT || l === "warn" ? l : "ok"), lvlTone = (l, p = 0) => (l === K_CRIT || p >= 85 ? "er" : l === "warn" || p >= 60 ? "wn" : "ok"), lvlCls = (l) => (l === K_CRIT ? "lc" : l === "warn" ? "lw" : "");
+const safeLvl = (l) => (l === K_CRIT || l === "warn" ? l : "ok"), lvlTone = (l) => (l === K_CRIT ? "er" : l === "warn" ? "wn" : "ok"), lvlCls = (l) => (l === K_CRIT ? "lc" : l === "warn" ? "lw" : "");
 const setCls = (e, c) => e && e.className !== c && (e.className = c), setTxt = (e, v) => e && e.textContent !== (v = S(v ?? "")) && (e.textContent = v);
 const sa = (e, k, v) => e && e.getAttribute?.(k) !== (v = S(v)) && e.setAttribute(k, v), ar = (e, k, v) => sa(e, `aria-${k}`, v), hd = (e, b) => { if (e) e.hidden = !!b; }, hdA = (...a) => a.forEach((e) => hd(e, 1)), cl = (e, c, b) => e?.classList?.toggle(c, !!b);
 
@@ -120,7 +120,7 @@ const getVerdict = (it) => {
   if (it[K_JC]) return { cls: "in", text: tr("Compacted|已压缩") };
   if (it[K_SC] || lvl === K_CRIT) return { cls: lvl === K_CRIT ? "er" : "wn", text: L(18) };
   const ctx = num(it[K_LCT]);
-  return ctx >= (num(it.min_compact_tokens) || 27e4) * .72 || (ctx >= 12e4 && getCold(it).m > 0) ? { cls: "wn", text: tr("Slice ready|可提炼") } : { cls: "ok", text: "" };
+  return ctx >= (num(it.min_compact_tokens) || DEF_T[0]) * .72 || (ctx >= 12e4 && getCold(it).m > 0) ? { cls: "wn", text: tr("Slice ready|可提炼") } : { cls: "ok", text: "" };
 };
 
 const DOT_CLS = { running: "run", [K_WT]: "wait", error: "err", ready: K_IE };
@@ -190,7 +190,7 @@ const mountDetailBlock = () => {
 const patchDetailBlock = (d, it, showId, isHero = false) => {
   const cid = it.id || "", lvl = safeLvl(it.level), rs = num(it[K_RSC]), pk = it[K_PK], m0 = (a, b) => num(it[a]) || num(it[b]);
   const lim = getLim(it), ctx = num(it[K_LCT]), ck = fmtK(ctx), ckc = num(it.checkpoint_count);
-  const pct = clp((ctx / lim) * 100), cpct = fx(it[K_CP] ?? pct, 1), rem = num(it.remaining_context_tokens ?? M.max(0, lim - ctx)), tn = lvlTone(lvl, pct), tc = tn !== "ok" ? ` ${tn}` : "";
+  const pct = clp((ctx / lim) * 100), cpct = fx(it[K_CP] ?? pct, 1), rem = num(it.remaining_context_tokens ?? M.max(0, lim - ctx)), tn = lvlTone(lvl), tc = tn !== "ok" ? ` ${tn}` : "";
   const [, hn, hs, gt, gf, tks, g1, g2, kf, k1, k2, ws, tm, wn, sth, tbs, trE, ft] = d;
   setTxt(hn, `${cpct}%`); setCls(hn, `hn${tc}`); setTxt(hs, `${ck} / ${fmtK(lim)}`);
   ar(gt, "label", L(28)); ar(gt, "valuenow", M.round(pct)); setCls(gf, `bf${tc}`); gf.style.width = `${pct.toFixed(1)}%`;
@@ -302,7 +302,7 @@ const patchRowList = (box, items, map) => {
   if (!box) return;
   hd(box, !items.length);
   reconcile(box, map, items, ([it]) => it.id, createRowEntry, (rec, [it, isSub]) => {
-    const [, r, [c, d, p, sb, t, pEl, vEl, x, a], trB] = rec, cid = it.id, lvl = safeLvl(it.level), tn = lvlTone(lvl, num(it[K_CP])), open = openRowId === cid, v = getVerdict(it), pb = getLivePhaseBadge(it);
+    const [, r, [c, d, p, sb, t, pEl, vEl, x, a], trB] = rec, cid = it.id, lvl = safeLvl(it.level), tn = lvlTone(lvl), open = openRowId === cid, v = getVerdict(it), pb = getLivePhaseBadge(it);
     setCls(r, `rw${isSub ? " sub" : ""}${lvlCls(lvl) ? ` ${lvlCls(lvl)}` : ""}`); ar(r, "expanded", S(open));
     setTxt(c, open ? "▾" : "▸"); setCls(d, `dt ${getLiveDot(it)}`); patchBdg(pEl, pb?.cls || "", pb?.text || "");
     patchBdg(p, "ac", !isSub && it.pinned ? L(25) : ""); patchBdg(sb, "t3", isSub ? L(29) : "");
@@ -511,8 +511,8 @@ const withBusy = async (key, fn) => { if (!canCallTools) return; loadingKey = ke
 const openTray = (cid, tab) => {
   if (openTrays.get(cid) === tab) { openTrays.delete(cid); return render(); }
   openTrays.set(cid, tab);
-  const [m, a] = { [K_TN]: [K_TN, { limit: 24 }], [K_HS]: [K_HS, { mode: K_HS, top_k: 5 }], advice: ["prepare_handoff", ERT] }[tab];
-  return withBusy(`${tab}:${cid}`, async () => { const res = await callTool(`${K_PF}${m}`, { [K_CID]: cid, ...a }); if (!res?.[K_ERR] && res?.[K_SC2]) { trayMap[tab].set(cid, res[K_SC2]); subTrayRev += 1; } });
+  const [m, a] = { [K_TN]: [`${K_PF}${K_TN}`, { limit: 24 }], [K_HS]: [`${K_PF}${K_HS}`, { mode: K_HS, top_k: 5 }], advice: ["radar_prepare_handoff", ERT] }[tab];
+  return withBusy(`${tab}:${cid}`, async () => { const res = await callTool(m, { [K_CID]: cid, ...a }); if (!res?.[K_ERR] && res?.[K_SC2]) { trayMap[tab].set(cid, res[K_SC2]); subTrayRev += 1; } });
 };
 const runDistill = (cid) => cid && withBusy(`distill:${cid}`, async () => {
   const rec = cHot.get(cid)?.recommended_distill_range, res = await uiAct({ action: "distill_slice", [K_CID]: cid, ...(rec?.length === 2 ? { start_step: rec[0], end_step: rec[1] } : {}) }), sc = res?.[K_SC2];
