@@ -137,7 +137,9 @@ test("panel/dist/panel.html meets Lucid Indigo Panel Kit invariants, <=64 KiB bu
   assert.ok(html.includes(`<body style="background:${DARK_BG_HEX}">`), "must lock dark canvas inline on <body>");
   assert.ok(html.includes("/*__CONTEXT_RADAR_BOOT__*/"), "must contain SSR boot marker");
   assert.ok(html.includes("window.__CONTEXT_RADAR_BOOT__"), "must read SSR boot data");
-  assert.ok(html.includes("background:var(--color-background-primary,var(--bg))"), "body must paint var(--bg) with host override");
+  assert.ok(html.includes("background:var(--bg)"), "body must paint var(--bg)");
+  assert.equal(/html,body\{[^}]*--color-background-primary/.test(html), false, "html/body CSS must never bind host --color-background-primary");
+  assert.ok(html.includes('class="boot-frame"'), "panel.html must include Frame-0 .boot-frame shell");
 
   // All Lucid Indigo family tokens defined in both dark :root and :root[data-theme="light"]
   const darkRoot = html.match(/:root\{([^}]+)\}/)?.[1] || "";
@@ -636,7 +638,7 @@ function createRenderSandbox(initialLang = "en"): { sandbox: RenderSandbox; root
   const slice = viewSrc.slice(viewSrc.indexOf("// Shared DOM builder"), viewSrc.indexOf("const flashMicro ="));
   const sandbox = {
     D: {
-      getElementById: (id: string) => (id === "root" ? root : null),
+      getElementById: (id: string) => (id === "app" ? root : null),
       createElement: (t: string) => new MockEl(t),
       createElementNS: (_ns: string, t: string) => new MockEl(t),
       createTextNode: (t: unknown) => new MockText(t),
@@ -1404,15 +1406,18 @@ test("weak-net SWR boot: localStorage hydration/redaction, fresh-boot coalescing
   assert.equal(sentCalls.length, 0);
   assert.equal(scheduledTimers.length, 3, "throttled reveal must resume poll timer immediately");
 
-  // Eligible reveal (>250ms past lastForceTs) starts 1 RPC, holds 0 poll timer while pending, schedules 1 poll timer on settle
+  // Eligible reveal (>250ms past lastForceTs) resets pollErrors backoff and fires 1 fresh RPC
   netBox.D.hidden = true;
   netBox.syncNow();
   const pollTimers = () => scheduledTimers.filter((t) => t.ms >= 1000);
   const timersBeforeEligible = pollTimers().length;
+  netBox.pollErrors = 3;
   netBox.D.hidden = false;
   clockNow = 2000;
   netBox.syncNow();
+  assert.equal(netBox.pollErrors, 0, "visible reveal must reset pollErrors backoff to base cadence");
   assert.equal(sentCalls.length, 1, "eligible reveal must fire 1 RPC via real forceNow");
+  assert.equal(sentCalls[0].args.fresh, true, "visible reveal must request fresh:true");
   assert.equal(netBox.inFlightPoll, true);
   assert.equal(netBox.pollTimer, null, "no poll timer scheduled while RPC is pending");
   assert.equal(pollTimers().length, timersBeforeEligible, "no poll timer created while RPC is pending");

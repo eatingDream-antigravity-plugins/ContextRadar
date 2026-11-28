@@ -5,7 +5,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,10 @@ const BOOT_MARKER: &str = "/*__CONTEXT_RADAR_BOOT__*/";
 /// Short burst-coalescing TTL (paired with live disk-activity validation so any new LLM
 /// request invalidates the cache immediately without waiting for TTL expiry).
 pub const SWR_STALE_TTL: Duration = Duration::from_millis(150);
+// Non-blocking `resources/read` reuses warm SWR within 30s when inputs are unchanged.
+pub const RESOURCE_SWR_TTL: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const KEEP_FRESH_INTERVAL: Duration = Duration::from_secs(15);
 // Rendered SSR panel HTML carries a `bootTs` timestamp; never serve a cached copy older than 250ms.
 const PANEL_BOOT_TTL: Duration = Duration::from_millis(250);
 // Conditional polls can reuse a snapshot until a known transition or this safety limit.
@@ -195,6 +199,8 @@ struct SwrHub {
     html: RwLock<Option<HtmlCache>>,
     rendered_panel: RwLock<Option<RenderedPanelCache>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    stop_mu: Mutex<bool>,
+    stop_cv: Condvar,
 }
 
 impl SwrHub {
@@ -204,7 +210,24 @@ impl SwrHub {
             html: RwLock::new(None),
             rendered_panel: RwLock::new(None),
             worker: Mutex::new(None),
+            stop_mu: Mutex::new(false),
+            stop_cv: Condvar::new(),
         }
+    }
+
+    #[cfg(not(test))]
+    fn wait_stop(&self, timeout: Duration) -> bool {
+        let Ok(guard) = self.stop_mu.lock() else {
+            return true;
+        };
+        if *guard {
+            return true;
+        }
+        let (guard, _) = self
+            .stop_cv
+            .wait_timeout_while(guard, timeout, |stopped| !*stopped)
+            .unwrap_or_else(|e| e.into_inner());
+        *guard
     }
 
     fn valid_snapshot(
@@ -328,6 +351,10 @@ impl SwrHub {
     }
 
     fn shutdown(&self) {
+        if let Ok(mut stopped) = self.stop_mu.lock() {
+            *stopped = true;
+            self.stop_cv.notify_all();
+        }
         if let Ok(mut w) = self.worker.lock() {
             if let Some(handle) = w.take() {
                 let _ = handle.join();
@@ -551,14 +578,17 @@ impl McpDaemon {
             .set_lang_override(parse_lang_tag(&lang_pref));
     }
 
-    /// Run a one-shot background startup pre-warm so initial panel opens hit RAM immediately,
-    /// then immediately close and drop the temporary `bg_engine`/`bg_grants` handles.
+    /// Run startup pre-warm so initial panel opens hit RAM immediately, and in `serve`
+    /// mode keep local SWR fresh every 15s via cheap mtime/stat delta (disabled under `#[cfg(test)]`).
     pub fn start_prewarm(&self) {
         let Ok(mut slot) = self.swr.worker.lock() else {
             return;
         };
         if slot.is_some() {
             return;
+        }
+        if let Ok(mut stopped) = self.swr.stop_mu.lock() {
+            *stopped = false;
         }
         let hub = Arc::clone(&self.swr);
         let data_root = self.engine.ledger.data_root.clone();
@@ -569,44 +599,68 @@ impl McpDaemon {
         let handle = thread::Builder::new()
             .name("context-radar-swr".to_string())
             .spawn(move || {
-                let mut bg_engine = TelemetryEngine::new_with_plugin_data(
-                    Some(data_root),
-                    plugin_data_dir,
-                    None,
-                    None,
-                );
-                let mut bg_grants = RelayGrantStore::new(grants_path);
-                bg_engine
-                    .rates
-                    .set_lang_override(parse_lang_tag(&bg_grants.get_settings().lang));
-
-                let panel_path = panel_override
-                    .clone()
-                    .unwrap_or_else(default_panel_html_path);
-                let html_loaded = hub.load_html(&panel_path).ok();
-
-                let built_at = Instant::now();
-                let inputs = SnapshotInputs::capture(&mut bg_engine, &bg_grants);
-                let mut snap = bg_engine.build_overview_snapshot(25, false, false, "", None);
-                attach_grant_and_rehash_inner(
-                    &mut bg_engine,
-                    &mut bg_grants,
-                    &mut snap,
-                    None,
-                    None,
-                );
-                snap.stale = false;
-
-                if let Some((template, mtime_ns, size)) = html_loaded {
-                    let _ = render_and_cache_panel_boot(
-                        &hub, panel_path, &template, mtime_ns, size, &snap,
+                let refresh_once = || {
+                    let mut bg_engine = TelemetryEngine::new_with_plugin_data(
+                        Some(data_root.clone()),
+                        plugin_data_dir.clone(),
+                        None,
+                        None,
                     );
-                }
-                hub.put_cached(Arc::new(snap), inputs, built_at);
+                    let mut bg_grants = RelayGrantStore::new(grants_path.clone());
+                    bg_engine
+                        .rates
+                        .set_lang_override(parse_lang_tag(&bg_grants.get_settings().lang));
 
-                bg_engine.close();
-                drop(bg_grants);
-                drop(bg_engine);
+                    let panel_path = panel_override
+                        .clone()
+                        .unwrap_or_else(default_panel_html_path);
+                    let html_loaded = hub.load_html(&panel_path).ok();
+
+                    let built_at = Instant::now();
+                    let inputs = SnapshotInputs::capture(&mut bg_engine, &bg_grants);
+                    let mut snap = bg_engine.build_overview_snapshot(25, false, false, "", None);
+                    attach_grant_and_rehash_inner(
+                        &mut bg_engine,
+                        &mut bg_grants,
+                        &mut snap,
+                        None,
+                        None,
+                    );
+                    snap.stale = false;
+
+                    if let Some((template, mtime_ns, size)) = html_loaded {
+                        let _ = render_and_cache_panel_boot(
+                            &hub, panel_path, &template, mtime_ns, size, &snap,
+                        );
+                    }
+                    hub.put_cached(Arc::new(snap), inputs, built_at);
+
+                    bg_engine.close();
+                    drop(bg_grants);
+                    drop(bg_engine);
+                };
+
+                refresh_once();
+
+                #[cfg(not(test))]
+                while !hub.wait_stop(KEEP_FRESH_INTERVAL) {
+                    let disk = quick_disk_activity_sig(&data_root);
+                    let bg_grants = RelayGrantStore::new(grants_path.clone());
+                    let grants_sig = bg_grants.disk_signature();
+                    let now_sec = now_epoch_sec();
+                    let still_fresh = hub.cached.read().ok().is_some_and(|guard| {
+                        guard.as_ref().is_some_and(|c| {
+                            c.inputs.disk == disk
+                                && c.inputs.grants == grants_sig
+                                && now_sec < c.snap.refresh_at
+                                && c.built_at.elapsed() < Duration::from_secs(25)
+                        })
+                    });
+                    drop(bg_grants);
+                    if !still_fresh {
+                        refresh_once();
+                    }
+                }
             });
 
         if let Ok(h) = handle {
@@ -1850,8 +1904,8 @@ impl McpDaemon {
         let panel_path = self.resolve_panel_path();
 
         let html = if uri == PANEL_URI {
-            // Reuse a fresh (<150ms) SWR snapshot if inputs are unchanged, or compute
-            // a live synchronous incremental snapshot (<1 ms warm).
+            // Reuse a warm (<30s) SWR snapshot when inputs are unchanged so `resources/read`
+            // never blocks on cold multi-file scans right after `tools/call` or keep-fresh.
             let built_at = Instant::now();
             let inputs = SnapshotInputs::capture(&mut self.engine, &self.grants);
             let eff_ws = self.engine.effective_daemon_workspace().unwrap_or_default();
@@ -1860,7 +1914,7 @@ impl McpDaemon {
                 .valid_snapshot(
                     &inputs,
                     self.engine.rates.get_lang().as_str(),
-                    SWR_STALE_TTL,
+                    RESOURCE_SWR_TTL,
                     now_epoch_sec(),
                 )
                 .filter(|s| s.daemon_workspace == eff_ws);
@@ -2619,5 +2673,19 @@ mod tests {
             sc_bytes < 100,
             "unchanged structuredContent must be <100 B, got {sc_bytes} B"
         );
+
+        // Warm SWR (<30s) serves resources/read without rebuilding telemetry
+        let builds_before = server.engine.overview_build_count;
+        server.backdate_swr_cache(Duration::from_secs(5));
+        let warm_html_5s = read_panel(&mut server);
+        assert_eq!(server.engine.overview_build_count, builds_before);
+        assert!(extract_boot_json(&warm_html_5s)["bootTs"]
+            .as_u64()
+            .is_some());
+
+        // Past RESOURCE_SWR_TTL (30s) rebuilds fresh snapshot
+        server.backdate_swr_cache(RESOURCE_SWR_TTL + Duration::from_secs(1));
+        let _ = read_panel(&mut server);
+        assert_eq!(server.engine.overview_build_count, builds_before + 1);
     }
 }
