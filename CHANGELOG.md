@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.2](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.6.1...v1.6.2) (2026-11-28)
+
+
+### Bug Fixes
+
+* harden read-only EOF journal tailing, checkpoint seek, and protobuf wire cursor ([#42](https://github.com/eatingDream-antigravity-plugins/context-radar/issues/42)) ([e537e99](https://github.com/eatingDream-antigravity-plugins/context-radar/commit/e537e99228149fb81b1d962f45985ad7851b1928))
+
 ## [1.6.1](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.6.0...v1.6.1) (2026-11-28)
 
 
