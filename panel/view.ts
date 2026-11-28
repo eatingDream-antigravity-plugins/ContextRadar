@@ -387,14 +387,21 @@ const loadCachedSnap = (): CachedSnap | null => {
     const raw = typeof localStorage < "u" ? localStorage.getItem(K_SNAP_LS) : null;
     if (!raw) return null;
     const p = JSON.parse(raw) as Partial<CachedSnap>;
-    return p?.v === 1 && typeof p.savedAt === "number" && p.data && p.data.mode === K_SN0 ? (p as CachedSnap) : null;
-  } catch { return null; }
+    const d = p?.data;
+    const validSess = (x: unknown): boolean => !!x && typeof x === "object" && typeof (x as SessionItem).id === "string" && typeof (x as SessionItem).title === "string";
+    if (p?.v === 1 && typeof p.savedAt === "number" && Number.isFinite(p.savedAt) && d && typeof d === "object" && d.mode === K_SN0 && Array.isArray(d.sessions) && d.sessions.every(validSess) && (!d.orphan_subagents || Array.isArray(d.orphan_subagents))) {
+      return p as CachedSnap;
+    }
+  } catch {}
+  return null;
 };
 const saveCachedSnap = (snap: SnapshotData | null, ts = now()): void => {
   if (viewMode !== DB || !snap || snap.mode !== K_SN0) return;
   try {
     if (typeof localStorage < "u") {
-      const { [K_PG]: _pg, ...rest } = snap;
+      const rest: SnapshotData = { ...snap };
+      delete rest[K_PG];
+      if (snap[K_PG]) delete rest[K_DIG];
       localStorage.setItem(K_SNAP_LS, JSON.stringify({ v: 1, savedAt: ts, data: rest }));
     }
   } catch {}
@@ -868,7 +875,7 @@ function applySnapshot(snap: SnapshotData, persist = true): void {
   if (persist && viewMode === DB && snap.mode === K_SN0) {
     try {
       if (typeof localStorage < "u") {
-        const { [K_PG]: _pg, ...rest } = snap;
+        const rest: SnapshotData = { ...snap }; delete rest[K_PG]; if (snap[K_PG]) delete rest[K_DIG];
         localStorage.setItem("cr_snap_v1", JSON.stringify({ v: 1, savedAt: now(), data: rest }));
       }
     } catch {}
@@ -915,7 +922,7 @@ async function refreshSnapshot(force = false, showSynced = false): Promise<void>
       if (viewMode === DB && snapshot?.mode === K_SN0) {
         try {
           if (typeof localStorage < "u") {
-            const { [K_PG]: _pg, ...rest } = snapshot;
+            const rest: SnapshotData = { ...snapshot }; delete rest[K_PG]; if (snapshot[K_PG]) delete rest[K_DIG];
             localStorage.setItem("cr_snap_v1", JSON.stringify({ v: 1, savedAt: now(), data: rest }));
           }
         } catch {}
@@ -1073,10 +1080,11 @@ const ensureConnected = async (): Promise<boolean> => {
 };
 
 const shouldSkipBootRefresh = (): boolean => !bootOverridden && !!(boot && boot.mode === K_SN0 && typeof boot.bootTs === "number" && now() - boot.bootTs < 2500);
-void (async () => {
+const bootPanel = async (): Promise<void> => {
   setupRevealObservers();
   if (snapshot) applySnapshot(snapshot, false);
   if (!bootOverridden && boot?.mode === K_SN0) saveCachedSnap(boot, typeof boot.bootTs === "number" ? boot.bootTs : now());
   render();
   if ((await ensureConnected()) && viewMode === DB && !shouldSkipBootRefresh()) void refreshSnapshot(true, false);
-})();
+};
+void bootPanel();
