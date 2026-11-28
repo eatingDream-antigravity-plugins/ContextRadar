@@ -485,8 +485,8 @@ test("non-force periodic poll updates DOM on digest change, skips render on unch
     num: (v: unknown) => Number(v) || 0, tr: (e: string) => e, L: (i: number) => `L${i}`, parseLoc: () => "",
     K_AAH: "allow_auto_handoff", K_ST: "settings", K_PG: "pending_grant", K_DIG: "digest",
     K_AR: "archived", K_SN0: "snapshot", K_PF: "context_radar_", K_SC2: "structuredContent",
-    K_SM: "server_ms", K_ERR: "isError", K_GA: "generated_at",
-    viewMode: "dashboard", canCallTools: true, inFlightPoll: false, queuedForce: false,
+    K_SM: "server_ms", K_ERR: "isError", K_GA: "generated_at", K_PG2: "pending_grant",
+    viewMode: "dashboard", canCallTools: true, inFlightPoll: false, queuedForce: false, pollSeq: 0, inFlightSeq: 0,
     refreshing: false, showSpinner: false, spinTimer: null, filterTab: "active",
     lastDigest: "d1",
     snapshot: { mode: "snapshot", digest: "d1", sessions: [{ id: "c1", latest_context_tokens: 100000 }] },
@@ -1181,4 +1181,216 @@ test("fmtDur humanizes seconds/minutes/hours/days without overflow, tab totals s
   sandbox.render();
   assert.equal(st.uCap.textContent, "Showing latest 75 of 247");
   assert.ok(st.uSet.textContent.includes("settings.json has an error. Using your last good settings."));
+});
+
+test("weak-net SWR boot: localStorage hydration/redaction, fresh-boot coalescing, RTT adaptive backoff, document.hidden pause, and pollSeq out-of-order drop", async () => {
+  const viewSrc = fs.readFileSync(VIEW_TS, "utf8");
+
+  // 1. Frame-0 localStorage hydration & handoff isolation
+  const runBootSlice = (opts: {
+    boot: Record<string, unknown> | null;
+    storedRaw: string | null;
+    nowMs: number;
+  }) => {
+    const store = new Map<string, string>();
+    if (opts.storedRaw !== null) store.set("cr_snap_v1", opts.storedRaw);
+    const sliceStart = viewSrc.indexOf("let viewMode: string =");
+    const sliceEnd = viewSrc.indexOf("let refreshing =");
+    const slice = viewSrc.slice(sliceStart, sliceEnd);
+    const applyM = viewSrc.match(/function applySnapshot\([\s\S]*?\n\}/)!;
+    const skipM = viewSrc.match(/const shouldSkipBootRefresh = [^\n]+;\n/)!;
+    const box = {
+      boot: opts.boot,
+      HC: "handoff_card", DB: "dashboard", K_SN0: "snapshot", K_DIG: "digest", K_PG: "pending_grant",
+      K_ST: "settings", K_AAH: "allow_auto_handoff", DE: { lang: "en" }, langLocked: true, lang: "en",
+      now: () => opts.nowMs,
+      parseLoc: () => "",
+      maybeAutoRelay: () => {},
+      localStorage: {
+        getItem: (k: string) => store.get(k) ?? null,
+        setItem: (k: string, v: string) => { store.set(k, v); },
+      },
+      getState: null as unknown as () => Record<string, unknown>,
+      applySnapshot: null as unknown as (s: Record<string, unknown>, persist?: boolean) => void,
+      saveCachedSnap: null as unknown as (s: Record<string, unknown> | null, ts?: number) => void,
+      shouldSkipBootRefresh: null as unknown as () => boolean,
+      store,
+    };
+    vm.runInNewContext(
+      stripTs(`${slice}\n${applyM[0]}\n${skipM[0]}`) +
+        `\nthis.applySnapshot=applySnapshot;this.saveCachedSnap=saveCachedSnap;this.shouldSkipBootRefresh=shouldSkipBootRefresh;this.getState=()=>({viewMode,snapshot,lastDigest,loadingInitial,bootOverridden});`,
+      box
+    );
+    return box;
+  };
+
+  // 1a. Missing boot + valid cached snapshot -> immediate Frame-0 hydration, loadingInitial=false, refresh NOT skipped
+  const cachedPayload = JSON.stringify({
+    v: 1,
+    savedAt: 5000,
+    data: { mode: "snapshot", digest: "d-cached", sessions: [{ id: "c-cached", title: "Cached" }] },
+  });
+  const coldReopen = runBootSlice({ boot: null, storedRaw: cachedPayload, nowMs: 6000 });
+  assert.deepEqual(coldReopen.getState().loadingInitial, false);
+  assert.equal(coldReopen.getState().lastDigest, "d-cached");
+  assert.equal((coldReopen.getState().snapshot as { sessions: Array<{ id: string }> }).sessions[0].id, "c-cached");
+  assert.equal(coldReopen.shouldSkipBootRefresh(), false, "cold reopen without boot must still trigger live refresh");
+
+  // 1b. Fresh SSR boot (<2500ms, newer than cache) -> uses boot and coalesces (skips t=0 refreshSnapshot)
+  const freshSsr = runBootSlice({
+    boot: { mode: "snapshot", digest: "d-ssr", bootTs: 9000, sessions: [{ id: "c-ssr" }] },
+    storedRaw: cachedPayload,
+    nowMs: 9200,
+  });
+  assert.equal(freshSsr.getState().bootOverridden, false);
+  assert.equal(freshSsr.getState().lastDigest, "d-ssr");
+  assert.equal(freshSsr.shouldSkipBootRefresh(), true, "fresh SSR boot (<2500ms) must coalesce and skip duplicate t=0 refresh");
+
+  // 1c. Stale SSR boot overridden by newer localStorage -> hydrates newer cache & does NOT skip refresh
+  const newerCache = JSON.stringify({
+    v: 1,
+    savedAt: 9500,
+    data: { mode: "snapshot", digest: "d-newer", sessions: [{ id: "c-newer" }] },
+  });
+  const overridden = runBootSlice({
+    boot: { mode: "snapshot", digest: "d-old-ssr", bootTs: 9000, sessions: [{ id: "c-old" }] },
+    storedRaw: newerCache,
+    nowMs: 9600,
+  });
+  assert.equal(overridden.getState().bootOverridden, true);
+  assert.equal(overridden.getState().lastDigest, "d-newer");
+  assert.equal(overridden.shouldSkipBootRefresh(), false, "overridden SSR boot must refresh live");
+
+  // 1d. Stale SSR boot (>=2500ms) -> does NOT skip refresh
+  const staleSsr = runBootSlice({
+    boot: { mode: "snapshot", digest: "d-ssr", bootTs: 5000, sessions: [{ id: "c-ssr" }] },
+    storedRaw: null,
+    nowMs: 7500,
+  });
+  assert.equal(staleSsr.shouldSkipBootRefresh(), false, "SSR boot >=2500ms must refresh");
+
+  // 1e. applySnapshot strips pending_grant before persisting, and handoff view never hydrates/persists
+  freshSsr.applySnapshot({
+    mode: "snapshot",
+    digest: "d-with-grant",
+    sessions: [],
+    pending_grant: { grant_id: "secret-grant", handoff_prompt: "secret" },
+  });
+  const savedAfter = JSON.parse(freshSsr.store.get("cr_snap_v1")!);
+  assert.equal(savedAfter.v, 1);
+  assert.equal(savedAfter.data.digest, "d-with-grant");
+  assert.equal("pending_grant" in savedAfter.data, false, "pending_grant must be redacted from localStorage");
+
+  const handoffBoot = runBootSlice({
+    boot: { view: "handoff", lang: "en" },
+    storedRaw: cachedPayload,
+    nowMs: 6000,
+  });
+  assert.equal(handoffBoot.getState().viewMode, "handoff_card");
+  assert.equal(handoffBoot.getState().snapshot, null, "handoff view must never hydrate dashboard snapshot");
+  handoffBoot.saveCachedSnap({ mode: "snapshot", digest: "should-not-save" }, 6000);
+  assert.equal(handoffBoot.store.get("cr_snap_v1"), cachedPayload, "handoff view must never overwrite localStorage");
+
+  // 2. RTT adaptive polling, document.hidden pause/resume, and monotonic pollSeq out-of-order drop
+  const applyM = viewSrc.match(/function applySnapshot\([\s\S]*?\n\}/)!;
+  const nextPollM = viewSrc.match(/const nextPollMs = [\s\S]*?\n\};/)!;
+  const cancelPollM = viewSrc.match(/const cancelPoll = [^\n]+;\n/)!;
+  const schedPollM = viewSrc.match(/const scheduleNextPoll = [\s\S]*?\n\};/)!;
+  const refreshM = viewSrc.match(/async function refreshSnapshot\([\s\S]*?\n\}/)!;
+  const kickM = viewSrc.match(/const kickRelay = [^\n]+;\n/)!;
+  const syncNowM = viewSrc.match(/const syncNow = [\s\S]*?\n\};/)!;
+
+  let cancelledCount = 0;
+  let scheduledTimers: Array<{ fn: () => void; ms: number }> = [];
+  let forceNowCalls = 0;
+  let clockNow = 1000;
+  const netBox = {
+    DB: "dashboard", HC: "handoff_card", D: { hidden: false }, DE: { lang: "en" }, M: Math, rd: Math.round,
+    performance: { now: () => 100 }, now: () => clockNow,
+    st: (fn: () => void, ms: number) => { const h = { fn, ms }; scheduledTimers.push(h); return h; },
+    ct: () => { cancelledCount += 1; },
+    num: (v: unknown) => Number(v) || 0, tr: (e: string) => e, L: (i: number) => `L${i}`, parseLoc: () => "",
+    K_AAH: "allow_auto_handoff", K_ST: "settings", K_US: "ui_settings", K_PI: "poll_interval_sec",
+    K_PG: "pending_grant", K_DIG: "digest", K_AR: "archived", K_SN0: "snapshot",
+    K_SC2: "structuredContent", K_SM: "server_ms", K_ERR: "isError", K_GA: "generated_at",
+    viewMode: "dashboard", autoRefresh: true, canCallTools: true,
+    inFlightPoll: false, queuedForce: false, pollSeq: 0, inFlightSeq: 0,
+    pollTimer: null as unknown, pollMs: 1000, refreshing: false, showSpinner: false, spinTimer: null,
+    filterTab: "active", lastDigest: "", snapshot: null as Record<string, unknown> | null,
+    handoffCard: null, loadingInitial: true, errorText: "", serverMs: 0,
+    ewmaRttMs: null as number | null, pollErrors: 0, lastSyncTs: 0, unchangedHits: 0,
+    langLocked: true, lang: "en", allowAutoHandoff: true,
+    pg: () => null, maybeAutoRelay: () => {}, flashMicro: () => {}, render: () => {},
+    forceNow: () => { forceNowCalls += 1; },
+    callTool: null as unknown as (n: string, a: Record<string, unknown>) => Promise<Record<string, unknown>>,
+    nextPollMs: null as unknown as () => number,
+    scheduleNextPoll: null as unknown as () => number,
+    syncNow: null as unknown as () => number | void,
+    refreshSnapshot: null as unknown as (f?: boolean) => Promise<void>,
+  };
+
+  vm.runInNewContext(
+    stripTs(`${applyM[0]}\n${nextPollM[0]}\n${cancelPollM[0]}\n${schedPollM[0]}\n${refreshM[0]}\n${kickM[0]}\n${syncNowM[0]}`) +
+      `\nthis.nextPollMs=nextPollMs;this.scheduleNextPoll=scheduleNextPoll;this.syncNow=syncNow;this.refreshSnapshot=refreshSnapshot;`,
+    netBox
+  );
+
+  // Adaptive RTT cadence
+  assert.equal(netBox.nextPollMs(), 1000);
+  netBox.ewmaRttMs = 300;
+  assert.ok(netBox.nextPollMs() >= 900 && netBox.nextPollMs() === 1000, "300ms RTT must clamp to >=900ms (1000ms floor)");
+  netBox.ewmaRttMs = 450;
+  assert.equal(netBox.nextPollMs(), 1350, "450ms RTT * 3 = 1350ms");
+  netBox.ewmaRttMs = 7000;
+  assert.equal(netBox.nextPollMs(), 15000, "adaptive poll must cap at 15000ms");
+  netBox.snapshot = { mode: "snapshot", ui_settings: { poll_interval_sec: 4 } };
+  assert.equal(netBox.nextPollMs(), 4000, "explicit poll_interval_sec > 0 must override adaptive RTT");
+  netBox.snapshot = { mode: "snapshot", ui_settings: { poll_interval_sec: 0 } };
+  netBox.ewmaRttMs = 400;
+
+  // document.hidden pause & resume
+  assert.equal(netBox.scheduleNextPoll(), 1200);
+  assert.equal(scheduledTimers.length, 1);
+  netBox.D.hidden = true;
+  assert.equal(netBox.nextPollMs(), 0);
+  assert.equal(netBox.scheduleNextPoll(), 0, "scheduleNextPoll must cancel and return 0 when D.hidden");
+  assert.equal(cancelledCount, 1);
+  assert.equal(netBox.pollTimer, null);
+
+  netBox.D.hidden = false;
+  assert.equal(netBox.scheduleNextPoll(), 1200);
+  netBox.D.hidden = true;
+  assert.equal(netBox.syncNow(), 0, "syncNow must cancel active timer and return 0 when D.hidden");
+  assert.equal(cancelledCount, 2);
+  assert.equal(netBox.pollTimer, null);
+  assert.equal(forceNowCalls, 0);
+
+  netBox.D.hidden = false;
+  netBox.syncNow();
+  assert.equal(forceNowCalls, 1, "restoring visibility must trigger forceNow");
+  assert.equal(scheduledTimers.length, 3, "restoring visibility must resume poll schedule");
+
+  // Monotonic pollSeq drops stale out-of-order RPC replies
+  let resolveFirst!: (v: Record<string, unknown>) => void;
+  let resolveSecond!: (v: Record<string, unknown>) => void;
+  let callIdx = 0;
+  netBox.callTool = () => new Promise<Record<string, unknown>>((resolve) => {
+    callIdx += 1;
+    if (callIdx === 1) resolveFirst = resolve;
+    else resolveSecond = resolve;
+  });
+
+  const p1 = netBox.refreshSnapshot(true);
+  // Simulate a newer poll starting (e.g. tab switch / concurrent reveal) before p1 resolves
+  netBox.inFlightPoll = false;
+  const p2 = netBox.refreshSnapshot(true);
+
+  resolveSecond({ isError: false, structuredContent: { mode: "snapshot", digest: "d-new", server_ms: 1, sessions: [{ id: "s-new" }] } });
+  await p2;
+  assert.equal(netBox.lastDigest, "d-new");
+
+  resolveFirst({ isError: false, structuredContent: { mode: "snapshot", digest: "d-stale", server_ms: 1, sessions: [{ id: "s-stale" }] } });
+  await p1;
+  assert.equal(netBox.lastDigest, "d-new", "stale out-of-order reply must be dropped");
+  assert.equal((netBox.snapshot as { digest: string }).digest, "d-new");
 });

@@ -131,6 +131,7 @@ interface UiSettings {
 interface SnapshotData {
   mode?: string;
   view?: string;
+  bootTs?: number;
   lang?: string;
   digest?: string;
   unchanged?: boolean;
@@ -378,17 +379,39 @@ const K_ST = "settings", K_US = "ui_settings", K_ACT = "is_active", K_PG = "pend
 const K_CC2 = "currency_code", K_FX = "fx_rate", K_PI = "poll_interval_sec", K_BP = "bg_poll_interval_sec", K_CTH = "compact_threshold";
 const DEF_T: [number, number, number] = [30e4, 36e4, 43e4], thrs = (it: SessionItem): [number | undefined, number | undefined, number | undefined] => [it.min_compact_tokens, it[K_RCT], it.urgent_compact_tokens], TABS: readonly TrayTab[] = ["turns", K_HS, "advice"], FIDS: readonly FilterTab[] = ["active", "subs", K_AR];
 
-let viewMode: string = boot?.view === "handoff" ? HC : DB, snapshot: SnapshotData | null = boot?.mode === K_SN0 ? boot : null, lastDigest = boot?.[K_DIG] || "";
-let handoffCard: PendingGrant | null = null, handoffStatus = "pending", loadingInitial = !(boot?.mode === K_SN0);
-let refreshing = false, autoRefresh = true, filterTab: FilterTab = "active", allowAutoHandoff = boot?.[K_ST]?.[K_AAH] ?? true;
+let viewMode: string = boot?.view === "handoff" ? HC : DB;
+interface CachedSnap { v: number; savedAt: number; data: SnapshotData; }
+const K_SNAP_LS = "cr_snap_v1";
+const loadCachedSnap = (): CachedSnap | null => {
+  try {
+    const raw = typeof localStorage < "u" ? localStorage.getItem(K_SNAP_LS) : null;
+    if (!raw) return null;
+    const p = JSON.parse(raw) as Partial<CachedSnap>;
+    return p?.v === 1 && typeof p.savedAt === "number" && p.data && p.data.mode === K_SN0 ? (p as CachedSnap) : null;
+  } catch { return null; }
+};
+const saveCachedSnap = (snap: SnapshotData | null, ts = now()): void => {
+  if (viewMode !== DB || !snap || snap.mode !== K_SN0) return;
+  try {
+    if (typeof localStorage < "u") {
+      const { [K_PG]: _pg, ...rest } = snap;
+      localStorage.setItem(K_SNAP_LS, JSON.stringify({ v: 1, savedAt: ts, data: rest }));
+    }
+  } catch {}
+};
+const cachedBoot = viewMode === DB ? loadCachedSnap() : null;
+const bootOverridden = !!(viewMode === DB && cachedBoot && (!boot || boot.mode !== K_SN0 || cachedBoot.savedAt > (boot.bootTs ?? 0)));
+let snapshot: SnapshotData | null = bootOverridden ? cachedBoot!.data : boot?.mode === K_SN0 ? boot : null, lastDigest = snapshot?.[K_DIG] || "";
+let handoffCard: PendingGrant | null = null, handoffStatus = "pending", loadingInitial = viewMode === DB ? !snapshot : true;
+let refreshing = false, autoRefresh = true, filterTab: FilterTab = "active", allowAutoHandoff = snapshot?.[K_ST]?.[K_AAH] ?? true;
 let busyGrantId: string | null = null, errorText = "", canMessage = false, ownerCid = "", copiedId: string | null = null, confirmSendId: string | null = null, microMsg = "";
-let ewmaRttMs: number | null = null, serverMs: number | null = boot?.[K_SM] ?? null, pollMs = 1e3, unchangedHits = 0, pollErrors = 0;
-let lastSyncTs = boot?.mode === K_SN0 ? now() : 0, lastForceTs = 0, spinTimer: TimerHandle | null = null, showSpinner = false;
+let ewmaRttMs: number | null = null, serverMs: number | null = snapshot?.[K_SM] ?? null, pollMs = 1e3, unchangedHits = 0, pollErrors = 0;
+let lastSyncTs = !bootOverridden && boot?.mode === K_SN0 ? now() : 0, lastForceTs = 0, spinTimer: TimerHandle | null = null, showSpinner = false;
 let openRowId: string | null = null, loadingKey = "", subTrayRev = 0, bnrPri = false, mountedMode = "", ui: { he: HTMLElement | null } | null = null, lastHandoffSig = "";
 let settingsOpen = false, settingsSaving = false, settingsSig = "";
 const openTrays = new Map<string, TrayTab>(), cTurns = new Map<string, TurnsPayload>(), cHot = new Map<string, HotspotsPayload>(), cDist = new Map<string, DistillPayload>(), cAdv = new Map<string, AdvicePayload>(), attemptedGrants = new Set<string>(), rowNodes = new Map<string, RowEntry>(), pinNodes = new Map<string, RowEntry>(), heroChipNodes = new Map<string, HeroChipEntry>();
 const trayMap: Record<TrayTab, Map<string, unknown>> = { turns: cTurns, hotspots: cHot, advice: cAdv };
-let canCallTools = false, inFlightPoll = false, queuedForce = false, pollTimer: TimerHandle | null = null, microTimer: TimerHandle | null = null, copiedTimer: TimerHandle | null = null, autoCmpTimer: TimerHandle | null = null;
+let canCallTools = false, inFlightPoll = false, queuedForce = false, pollSeq = 0, inFlightSeq = 0, pollTimer: TimerHandle | null = null, microTimer: TimerHandle | null = null, copiedTimer: TimerHandle | null = null, autoCmpTimer: TimerHandle | null = null;
 let uDot!: HTMLElement, uSwp!: HTMLElement, uMi!: HTMLElement, uMt!: HTMLElement, uAb!: HTMLElement, uGear!: HTMLElement, uRb!: HTMLElement, uRi!: SVGSVGElement, uB!: BannerState, uSet!: HTMLElement, uH!: HeroState, uF!: FilterState, uPG!: HTMLElement, uPGh!: HTMLElement, uPLs!: HTMLElement, uRG!: HTMLElement, uRGh!: HTMLElement, uLs!: HTMLElement, uCap!: HTMLElement, uEm!: EmptyState, uHl!: HTMLElement;
 const pg = (): PendingGrant | undefined => snapshot?.[K_PG], cancelAutoCmp = (): void => { if (autoCmpTimer !== null) { ct(autoCmpTimer); autoCmpTimer = null; } };
 
@@ -837,32 +860,50 @@ function maybeAutoRelay(p: PendingGrant | null | undefined, isInline: boolean): 
   }, isInline ? 1500 : 2000);
 }
 
-function applySnapshot(snap: SnapshotData): void {
+function applySnapshot(snap: SnapshotData, persist = true): void {
   if (typeof snap[K_ST]?.[K_AAH] === "boolean") allowAutoHandoff = snap[K_ST][K_AAH];
   if (!langLocked && snap[K_ST]?.lang) { const p = parseLoc(snap[K_ST].lang); if (p) DE.lang = lang = p; }
   if (snap[K_DIG]) lastDigest = snap[K_DIG];
-  snapshot = snap; maybeAutoRelay(snap[K_PG], false);
+  snapshot = snap;
+  if (persist && viewMode === DB && snap.mode === K_SN0) {
+    try {
+      if (typeof localStorage < "u") {
+        const { [K_PG]: _pg, ...rest } = snap;
+        localStorage.setItem("cr_snap_v1", JSON.stringify({ v: 1, savedAt: now(), data: rest }));
+      }
+    } catch {}
+  }
+  maybeAutoRelay(snap[K_PG], false);
 }
 
 const nextPollMs = (): number => {
-  const u = snapshot?.[K_US], f = D.hidden ? u?.[K_BP] ?? 0 : num(u?.[K_PI]);
-  if (f < 0) return 0; if (f > 0) return f * 1e3;
-  const r = ewmaRttMs ?? 0, b = (D.hidden ? [12, 8, 4, 2] : [10, 5, 2.5, 1])[r > 800 ? 0 : r > 350 ? 1 : r > 150 ? 2 : 3] * 1e3;
+  if (D.hidden) return 0;
+  const f = num(snapshot?.[K_US]?.[K_PI]);
+  if (f > 0) return f * 1e3;
+  const baseMs = 1000;
+  const b = ewmaRttMs !== null ? M.max(baseMs, M.min(15_000, rd(ewmaRttMs * 3))) : baseMs;
   return pollErrors ? M.min(45e3, b << M.min(pollErrors, 3)) : b;
 };
 const cancelPoll = (): void => { if (pollTimer !== null) { ct(pollTimer); pollTimer = null; } };
-const scheduleNextPoll = (): void => { cancelPoll(); const nxt = viewMode === DB && autoRefresh && canCallTools ? nextPollMs() : 0; if (nxt) { pollMs = nxt; pollTimer = st(() => { pollTimer = null; void refreshSnapshot(false); }, pollMs); } };
+const scheduleNextPoll = (): number => {
+  cancelPoll();
+  if (D.hidden || viewMode !== DB || !autoRefresh || !canCallTools) return 0;
+  const nxt = nextPollMs();
+  if (nxt) { pollMs = nxt; pollTimer = st(() => { pollTimer = null; void refreshSnapshot(false); }, pollMs); }
+  return nxt;
+};
 
 async function refreshSnapshot(force = false, showSynced = false): Promise<void> {
   if (viewMode !== DB || !canCallTools) return;
   if (inFlightPoll) { if (force) queuedForce = true; return; }
-  cancelPoll(); inFlightPoll = true; ct(spinTimer);
+  cancelPoll(); inFlightPoll = true; const seq = ++pollSeq; inFlightSeq = seq; ct(spinTimer);
   if (force || !snapshot) { refreshing = true; spinTimer = st(() => { if (refreshing) { showSpinner = true; render(); } }, 150); }
   const t0 = performance.now();
   try {
     const isAr = filterTab === K_AR, args: Record<string, unknown> = { action: K_SN0, limit: isAr ? 50 : 25, show_history: filterTab === "subs", include_archived: isAr };
     if (force) args.fresh = true; else if (lastDigest) args.if_digest = lastDigest;
     const res = await callTool("context_radar_overview", args, { timeout: 15e3 });
+    if (seq !== pollSeq) return;
     const rz = (x: number): number => M.max(0, M.round(x)), sc = res?.[K_SC2] as SnapshotData | undefined, srvMs = rz(num(sc?.[K_SM])), netRtt = rz(performance.now() - t0 - srvMs);
     serverMs = srvMs; ewmaRttMs = ewmaRttMs === null ? netRtt : M.round(ewmaRttMs * .65 + netRtt * .35);
     pollErrors = 0; lastSyncTs = now(); ct(spinTimer); showSpinner = false;
@@ -871,11 +912,20 @@ async function refreshSnapshot(force = false, showSynced = false): Promise<void>
     else if (sc?.unchanged || (sc?.[K_DIG] && sc[K_DIG] === lastDigest && snapshot)) {
       const hadErr = !!errorText; unchangedHits += 1; errorText = "";
       if (sc?.[K_GA] && snapshot) snapshot[K_GA] = sc[K_GA];
+      if (viewMode === DB && snapshot?.mode === K_SN0) {
+        try {
+          if (typeof localStorage < "u") {
+            const { [K_PG]: _pg, ...rest } = snapshot;
+            localStorage.setItem("cr_snap_v1", JSON.stringify({ v: 1, savedAt: now(), data: rest }));
+          }
+        } catch {}
+      }
       if (refreshing) finish(); else if (hadErr) render();
     } else if (sc) { applySnapshot(sc); loadingInitial = false; errorText = ""; finish(); }
   } catch (err: unknown) {
+    if (seq !== pollSeq) return;
     pollErrors += 1; errorText = `${(err as { message?: unknown } | null)?.message || err}`; ct(spinTimer); showSpinner = false; refreshing = false; render();
-  } finally { inFlightPoll = false; queuedForce ? ((queuedForce = false), void refreshSnapshot(true, false)) : scheduleNextPoll(); }
+  } finally { if (inFlightSeq === seq) { inFlightPoll = false; queuedForce ? ((queuedForce = false), void refreshSnapshot(true, false)) : scheduleNextPoll(); } }
 }
 
 const ERT = { estimated_remaining_turns: 12 };
@@ -920,12 +970,12 @@ const saveSettings = async (): Promise<void> => {
     if (snapshot) Object.assign(snapshot, sc);
     allowAutoHandoff = !!sc[K_US][K_AAH];
     const nl = parseLoc(sc[K_US].lang); nl ? ((DE.lang = lang = nl), (langLocked = true), ls0(lang)) : (langLocked = false);
-    settingsOpen = false; lastDigest = ""; flashMicro(L(34)); scheduleNextPoll(); void refreshSnapshot(true, false);
+    settingsOpen = false; ++pollSeq; lastDigest = ""; flashMicro(L(34)); scheduleNextPoll(); void refreshSnapshot(true, false);
   } catch (e: unknown) { flashMicro((e as { message?: string } | null)?.message || L(35)); }
   finally { settingsSaving = false; settingsSig = ""; render(); }
 };
 const buildReminder = (it: SessionItem): string => `${L(28)} "${it.title}" ${fmtK(it[K_LCT])}/${fmtK(getLim(it))} (>${((num(it[K_RCT]) || 31e4) / 1e3) | 0}k); ${tr("Context nearly full — wrap up or run /compact.|上下文快满，请收尾或执行 /compact。")}`;
-const setFilterTab = (next: FilterTab, focus = false): void => { if (filterTab === next) return; filterTab = next; lastDigest = ""; render(); if (focus) D.querySelector<HTMLElement>(`[data-a="tab"][data-i="${next}"]`)?.focus(); void refreshSnapshot(true, false); };
+const setFilterTab = (next: FilterTab, focus = false): void => { if (filterTab === next) return; filterTab = next; ++pollSeq; lastDigest = ""; render(); if (focus) D.querySelector<HTMLElement>(`[data-a="tab"][data-i="${next}"]`)?.focus(); void refreshSnapshot(true, false); };
 
 const ACT: Record<string, (id: string, ev: MouseEvent) => unknown> = {
   ci: (id, ev) => { ev.preventDefault(); return copyCid(id); },
@@ -965,7 +1015,12 @@ onD("keydown", (ev) => {
 const canForceDb = (): boolean => !D.hidden && viewMode === DB && canCallTools;
 const forceNow = (): void => { const t = now(); if (t - lastForceTs < 250) return; lastForceTs = t; void refreshSnapshot(true, false); };
 const kickRelay = (): void => { if (viewMode === HC) { if (handoffCard && !handoffCard.blocked) maybeAutoRelay(handoffCard, true); } else if (pg()) maybeAutoRelay(pg(), false); };
-const syncNow = (): void => { if (!D.hidden) kickRelay(); if (viewMode === DB && canCallTools) !D.hidden ? forceNow() : autoRefresh && scheduleNextPoll(); render(); };
+const syncNow = (): number | void => {
+  if (D.hidden) { cancelPoll(); return 0; }
+  kickRelay();
+  if (viewMode === DB && canCallTools) { forceNow(); if (autoRefresh && pollTimer === null && !inFlightPoll) scheduleNextPoll(); }
+  render();
+};
 onD("visibilitychange", syncNow);
 onD("pointerenter", () => { if (canForceDb() && now() - lastSyncTs > 900) forceNow(); }, { passive: true });
 ["focus", "pageshow"].forEach((e) => window.addEventListener(e, () => canForceDb() && forceNow()));
@@ -995,7 +1050,7 @@ bridge.ontoolresult = (result) => {
     handoffStatus = m === HB ? "blocked" : sc[K_AAH] && sc.auto_fire !== false && !sc[K_RSC] && !sc.acp_proxy_active ? "pending" : "manual";
     loadingInitial = false; cancelPoll(); render(); if (m === HC) maybeAutoRelay(sc, true);
   } else if (sc && m === K_SN0) {
-    viewMode = DB; loadingInitial = false; errorText = ""; lastSyncTs = now();
+    viewMode = DB; loadingInitial = false; errorText = ""; lastSyncTs = now(); ++pollSeq;
     if (sc[K_SM] !== undefined) serverMs = M.max(0, rd(num(sc[K_SM])));
     scheduleNextPoll(); if (!(sc.unchanged || (sc[K_DIG] && sc[K_DIG] === lastDigest && snapshot))) { applySnapshot(sc); render(); }
   }
@@ -1017,4 +1072,11 @@ const ensureConnected = async (): Promise<boolean> => {
   } catch (err: unknown) { errorText = `${(err as { message?: unknown } | null)?.message || err}`; loadingInitial = false; render(); return false; }
 };
 
-void (async () => { setupRevealObservers(); if (snapshot) applySnapshot(snapshot); render(); if ((await ensureConnected()) && viewMode === DB) void refreshSnapshot(true, false); })();
+const shouldSkipBootRefresh = (): boolean => !bootOverridden && !!(boot && boot.mode === K_SN0 && typeof boot.bootTs === "number" && now() - boot.bootTs < 2500);
+void (async () => {
+  setupRevealObservers();
+  if (snapshot) applySnapshot(snapshot, false);
+  if (!bootOverridden && boot?.mode === K_SN0) saveCachedSnap(boot, typeof boot.bootTs === "number" ? boot.bootTs : now());
+  render();
+  if ((await ensureConnected()) && viewMode === DB && !shouldSkipBootRefresh()) void refreshSnapshot(true, false);
+})();

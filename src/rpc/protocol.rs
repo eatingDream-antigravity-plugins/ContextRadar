@@ -20,7 +20,8 @@ use crate::engine::grants::{
 };
 use crate::engine::pruner::distill_slice_with_lang;
 use crate::engine::telemetry::{
-    compute_snapshot_digest, now_epoch_sec, OverviewSnapshot, TelemetryEngine, UiSettingsSnapshot,
+    compute_snapshot_digest, now_epoch_ms, now_epoch_sec, OverviewSnapshot, TelemetryEngine,
+    UiSettingsSnapshot,
 };
 use crate::i18n::{parse_lang_tag, select_display_cost};
 use crate::rpc::tools::{
@@ -48,6 +49,8 @@ const BOOT_MARKER: &str = "/*__CONTEXT_RADAR_BOOT__*/";
 /// Short burst-coalescing TTL (paired with live disk-activity validation so any new LLM
 /// request invalidates the cache immediately without waiting for TTL expiry).
 pub const SWR_STALE_TTL: Duration = Duration::from_millis(150);
+// Rendered SSR panel HTML carries a `bootTs` timestamp; never serve a cached copy older than 250ms.
+const PANEL_BOOT_TTL: Duration = Duration::from_millis(250);
 // Conditional polls can reuse a snapshot until a known transition or this safety limit.
 const POLL_CACHE_MAX_AGE: Duration = Duration::from_secs(15);
 
@@ -102,6 +105,7 @@ struct RenderedPanelCache {
     size: u64,
     digest: String,
     stale: bool,
+    rendered_at: Instant,
     html: String,
 }
 
@@ -253,30 +257,16 @@ impl SwrHub {
             && c.size == size
             && c.digest == digest
             && c.stale == stale
+            && c.rendered_at.elapsed() < PANEL_BOOT_TTL
         {
             return Some(c.html.clone());
         }
         None
     }
 
-    fn put_rendered_panel(
-        &self,
-        path: PathBuf,
-        mtime_ns: i128,
-        size: u64,
-        digest: String,
-        stale: bool,
-        html: String,
-    ) {
+    fn put_rendered_panel(&self, entry: RenderedPanelCache) {
         if let Ok(mut g) = self.rendered_panel.write() {
-            *g = Some(RenderedPanelCache {
-                path,
-                mtime_ns,
-                size,
-                digest,
-                stale,
-                html,
-            });
+            *g = Some(entry);
         }
     }
 
@@ -473,6 +463,32 @@ fn inject_boot_html(template: &str, boot_val: &Value) -> String {
     }
 }
 
+fn render_and_cache_panel_boot(
+    hub: &SwrHub,
+    panel_path: PathBuf,
+    template: &str,
+    mtime_ns: i128,
+    size: u64,
+    snap: &OverviewSnapshot,
+) -> String {
+    let rendered_at = Instant::now();
+    let mut boot_val = serde_json::to_value(snap).unwrap_or(Value::Null);
+    if let Some(obj) = boot_val.as_object_mut() {
+        obj.insert("bootTs".to_string(), json!(now_epoch_ms()));
+    }
+    let rendered = inject_boot_html(template, &boot_val);
+    hub.put_rendered_panel(RenderedPanelCache {
+        path: panel_path,
+        mtime_ns,
+        size,
+        digest: snap.digest.clone(),
+        stale: false,
+        rendered_at,
+        html: rendered.clone(),
+    });
+    rendered
+}
+
 pub struct McpDaemon {
     pub engine: TelemetryEngine,
     pub grants: RelayGrantStore,
@@ -582,17 +598,9 @@ impl McpDaemon {
                 snap.stale = false;
 
                 if let Some((template, mtime_ns, size)) = html_loaded {
-                    if let Ok(val) = serde_json::to_value(&snap) {
-                        let rendered = inject_boot_html(&template, &val);
-                        hub.put_rendered_panel(
-                            panel_path,
-                            mtime_ns,
-                            size,
-                            snap.digest.clone(),
-                            false,
-                            rendered,
-                        );
-                    }
+                    let _ = render_and_cache_panel_boot(
+                        &hub, panel_path, &template, mtime_ns, size, &snap,
+                    );
                 }
                 hub.put_cached(Arc::new(snap), inputs, built_at);
 
@@ -1842,17 +1850,32 @@ impl McpDaemon {
         let panel_path = self.resolve_panel_path();
 
         let html = if uri == PANEL_URI {
-            // Opening the panel ALWAYS computes a live synchronous incremental snapshot (<1 ms warm)
-            // so initial SSR boot data never lags behind a just-completed LLM request.
+            // Reuse a fresh (<150ms) SWR snapshot if inputs are unchanged, or compute
+            // a live synchronous incremental snapshot (<1 ms warm).
             let built_at = Instant::now();
             let inputs = SnapshotInputs::capture(&mut self.engine, &self.grants);
-            let mut snap = self
-                .engine
-                .build_overview_snapshot(25, false, false, "", None);
-            self.attach_grant_and_rehash(&mut snap, None, None);
-            snap.stale = false;
-            let snap = Arc::new(snap);
-            self.swr.put_cached(Arc::clone(&snap), inputs, built_at);
+            let eff_ws = self.engine.effective_daemon_workspace().unwrap_or_default();
+            let cached_snap = self
+                .swr
+                .valid_snapshot(
+                    &inputs,
+                    self.engine.rates.get_lang().as_str(),
+                    SWR_STALE_TTL,
+                    now_epoch_sec(),
+                )
+                .filter(|s| s.daemon_workspace == eff_ws);
+            let snap = if let Some(s) = cached_snap {
+                s
+            } else {
+                let mut snap = self
+                    .engine
+                    .build_overview_snapshot(25, false, false, "", None);
+                self.attach_grant_and_rehash(&mut snap, None, None);
+                snap.stale = false;
+                let snap = Arc::new(snap);
+                self.swr.put_cached(Arc::clone(&snap), inputs, built_at);
+                snap
+            };
 
             let (template, mtime_ns, size) =
                 self.swr.load_html(&panel_path).map_err(|e| (-32603, e))?;
@@ -1863,17 +1886,14 @@ impl McpDaemon {
             {
                 cached_html
             } else {
-                let boot_val = serde_json::to_value(snap.as_ref()).unwrap_or(Value::Null);
-                let rendered = inject_boot_html(&template, &boot_val);
-                self.swr.put_rendered_panel(
+                render_and_cache_panel_boot(
+                    &self.swr,
                     panel_path,
+                    &template,
                     mtime_ns,
                     size,
-                    snap.digest.clone(),
-                    false,
-                    rendered.clone(),
-                );
-                rendered
+                    snap.as_ref(),
+                )
             }
         } else {
             let (template, _, _) = self.swr.load_html(&panel_path).map_err(|e| (-32603, e))?;
@@ -2499,5 +2519,105 @@ mod tests {
         let hub = SwrHub::new();
         let err = hub.load_html(&huge).unwrap_err();
         assert!(err.contains("10 MiB"), "unexpected error: {err}");
+    }
+
+    fn extract_boot_json(html: &str) -> Value {
+        let marker = "window.__CONTEXT_RADAR_BOOT__=";
+        let start = html.find(marker).expect("boot assignment missing") + marker.len();
+        serde_json::Deserializer::from_str(&html[start..])
+            .into_iter::<Value>()
+            .next()
+            .expect("boot json missing")
+            .expect("boot json must parse")
+    }
+
+    #[test]
+    fn panel_boot_ts_refreshes_after_250ms_and_if_hash_unchanged_is_under_100b() {
+        let root = tempfile::tempdir().unwrap();
+        let panel_html = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("panel")
+            .join("dist")
+            .join("panel.html");
+        let engine = TelemetryEngine::new(
+            Some(root.path().to_path_buf()),
+            Some(RateTable::new(
+                SettingsWatcher::new(Some("none".into())),
+                None,
+                None,
+            )),
+            Some(None),
+        );
+        let grants = RelayGrantStore::new(root.path().join("plugin/relay_grants.json"));
+        let mut server = McpDaemon::new(Some(engine), Some(grants), Some(panel_html));
+
+        let read_panel = |srv: &mut McpDaemon| -> String {
+            let res = srv
+                .handle_request(&json!({
+                    "jsonrpc": "2.0", "id": 100, "method": "resources/read",
+                    "params": { "uri": PANEL_URI }
+                }))
+                .unwrap();
+            res["result"]["contents"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+
+        let html1 = read_panel(&mut server);
+        let boot1 = extract_boot_json(&html1);
+        let ts1 = boot1["bootTs"]
+            .as_u64()
+            .expect("PANEL_URI must inject bootTs");
+        assert!(ts1 > 1_000_000_000_000, "bootTs must be epoch ms: {ts1}");
+
+        // Immediate second read within 250ms reuses rendered cache and stays warm (<5ms even in debug)
+        let html2 = read_panel(&mut server);
+        let boot2 = extract_boot_json(&html2);
+        assert_eq!(boot2["bootTs"].as_u64().unwrap(), ts1);
+
+        // Backdate rendered_panel past 250ms TTL -> must refresh bootTs
+        thread::sleep(Duration::from_millis(2));
+        if let Ok(mut g) = server.swr.rendered_panel.write() {
+            if let Some(ref mut c) = *g {
+                c.rendered_at = Instant::now() - Duration::from_millis(260);
+            }
+        }
+        let html3 = read_panel(&mut server);
+        let boot3 = extract_boot_json(&html3);
+        let ts3 = boot3["bootTs"].as_u64().unwrap();
+        assert!(
+            ts3 > ts1,
+            "stale >250ms rendered_panel must refresh bootTs ({ts3} > {ts1})"
+        );
+
+        // HANDOFF_URI stays lightweight without bootTs
+        let h_res = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 101, "method": "resources/read",
+                "params": { "uri": HANDOFF_URI }
+            }))
+            .unwrap();
+        let h_boot = extract_boot_json(h_res["result"]["contents"][0]["text"].as_str().unwrap());
+        assert_eq!(h_boot["view"], json!("handoff"));
+        assert!(h_boot.get("bootTs").is_none());
+
+        // if_hash alias returns compact <100 B unchanged payload
+        let digest = boot3["digest"].as_str().unwrap().to_string();
+        let poll = server
+            .handle_request(&json!({
+                "jsonrpc": "2.0", "id": 102, "method": "tools/call",
+                "params": { "name": "context_radar_overview", "arguments": { "if_hash": digest } }
+            }))
+            .unwrap();
+        let sc = &poll["result"]["structuredContent"];
+        assert_eq!(sc["mode"], json!("snapshot"));
+        assert_eq!(sc["unchanged"], json!(true));
+        assert_eq!(sc["digest"], json!(digest));
+        assert!(sc["server_ms"].is_u64());
+        let sc_bytes = serde_json::to_vec(sc).unwrap().len();
+        assert!(
+            sc_bytes < 100,
+            "unchanged structuredContent must be <100 B, got {sc_bytes} B"
+        );
     }
 }

@@ -241,6 +241,14 @@ pub fn now_epoch_sec() -> f64 {
 }
 
 #[inline]
+pub fn now_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[inline]
 fn round_dp(v: f64, decimals: i32) -> f64 {
     let f = 10f64.powi(decimals);
     (v * f).round() / f
