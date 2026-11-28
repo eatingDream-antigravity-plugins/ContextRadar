@@ -424,9 +424,6 @@ pub fn classify_cold_cache_turns_detailed(
         .unwrap_or_default();
     sorted_indices.dedup();
 
-    let has_t_steps = transcript_step_types
-        .map(|m| !m.is_empty())
-        .unwrap_or(false);
     let mut results = Vec::with_capacity(turns.len());
 
     for (i, t) in turns.iter().enumerate() {
@@ -461,6 +458,9 @@ pub fn classify_cold_cache_turns_detailed(
                 }
             }
         }
+        let transcript_covers_gap = sorted_indices
+            .last()
+            .is_some_and(|&max_idx| max_idx >= t.step_idx.saturating_sub(1));
 
         let ttl_sec = model_cache_ttl_sec(&t.model, &t.model_display);
         let start_dt = prev_t.and_then(|p| t.start_delta_sec(p));
@@ -497,7 +497,7 @@ pub fn classify_cold_cache_turns_detailed(
                 ColdCacheKind::TurnStart
             }
         } else if t.after_turn_start == Some(false)
-            || has_t_steps
+            || transcript_covers_gap
             || partial_cold
             || (idle_gap.is_some_and(|g| g < 60.0) && start_dt.is_some_and(|d| d >= ttl_sec))
         {
@@ -822,30 +822,119 @@ pub fn build_session_telemetry_with_probe(
     let (currency_code, currency_sym) = rates.get_currency();
 
     let latest = turns.last();
+    let latest_turn_step_idx = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
+    let mut sorted_t_indices: Vec<i64> = transcript_step_types
+        .map(|m| {
+            let mut ks: Vec<i64> = m.keys().copied().collect();
+            ks.sort_unstable();
+            ks
+        })
+        .unwrap_or_default();
+    sorted_t_indices.dedup();
+
+    let tmap_has_between = |lo_excl: i64, hi_excl: i64, pred: fn(&str) -> bool| -> bool {
+        let Some(tmap) = transcript_step_types else {
+            return false;
+        };
+        if sorted_t_indices.is_empty() || hi_excl <= lo_excl.saturating_add(1) {
+            return false;
+        }
+        let lo = sorted_t_indices.partition_point(|&x| x <= lo_excl);
+        let hi = sorted_t_indices.partition_point(|&x| x < hi_excl);
+        sorted_t_indices[lo..hi]
+            .iter()
+            .any(|idx| tmap.get(idx).is_some_and(|s| pred(s.as_str())))
+    };
+
     let mut checkpoint_count = 0usize;
     let mut last_ckpt_pos: Option<usize> = None;
+    let mut first_post_ckpt_turn_pos: Option<usize> = None;
+    let mut last_ckpt_pre_tokens: u64 = 0;
+
     for (i, t) in turns.iter().enumerate() {
+        let prev_is_ckpt = i > 0 && turns[i - 1].is_checkpoint;
+        let prev_step = if i > 0 { turns[i - 1].step_idx } else { -1 };
+        let implicit_ckpt_before = !t.is_checkpoint
+            && !prev_is_ckpt
+            && (t.after_checkpoint
+                || tmap_has_between(prev_step, t.step_idx, |s| s == "CHECKPOINT"));
+
+        if implicit_ckpt_before {
+            checkpoint_count += 1;
+            first_post_ckpt_turn_pos = Some(i);
+            last_ckpt_pre_tokens = turns[..i]
+                .iter()
+                .rev()
+                .find(|p| p.context_tokens() > 0)
+                .map(|p| p.context_tokens())
+                .unwrap_or(0);
+        }
         if t.is_checkpoint {
             checkpoint_count += 1;
             last_ckpt_pos = Some(i);
+            first_post_ckpt_turn_pos = Some(i + 1);
+            last_ckpt_pre_tokens = if t.context_tokens() > 0 {
+                t.context_tokens()
+            } else {
+                turns[..i]
+                    .iter()
+                    .rev()
+                    .find(|p| p.context_tokens() > 0)
+                    .map(|p| p.context_tokens())
+                    .unwrap_or(0)
+            };
         }
     }
-    let turns_since_compact = match last_ckpt_pos {
-        Some(pos) => turns.len().saturating_sub(1).saturating_sub(pos),
+
+    let is_compacting_now = live_probe.is_some_and(|p| p.live_phase == "compacting");
+    let trailing_implicit_ckpt = !is_compacting_now
+        && !latest.is_some_and(|t| t.is_checkpoint)
+        && transcript_step_types.is_some_and(|tmap| {
+            let lo = sorted_t_indices.partition_point(|&x| x <= latest_turn_step_idx);
+            sorted_t_indices[lo..]
+                .iter()
+                .any(|idx| tmap.get(idx).map(String::as_str) == Some("CHECKPOINT"))
+        });
+
+    if trailing_implicit_ckpt {
+        checkpoint_count += 1;
+        first_post_ckpt_turn_pos = Some(turns.len());
+        last_ckpt_pre_tokens = turns
+            .iter()
+            .rev()
+            .find(|p| p.context_tokens() > 0)
+            .map(|p| p.context_tokens())
+            .unwrap_or(0);
+    }
+
+    let turns_since_compact = match first_post_ckpt_turn_pos {
+        Some(first_pos) => turns.len().saturating_sub(first_pos),
         None => turns.len(),
     };
-    let just_compacted = latest.map(|t| t.is_checkpoint).unwrap_or(false);
+    let just_compacted = latest.is_some_and(|t| t.is_checkpoint) || trailing_implicit_ckpt;
 
+    let post_ckpt_slice = &turns[first_post_ckpt_turn_pos.unwrap_or(0).min(turns.len())..];
+    let latest_active_ctx_turn = post_ckpt_slice
+        .iter()
+        .rev()
+        .find(|t| !t.is_checkpoint && t.context_tokens() > 0);
+
+    let compact_summary_bytes = live_probe.map(|p| p.compact_summary_bytes).unwrap_or(0);
     let (pre_compact_tokens, latest_ctx) = if just_compacted {
-        let lt = latest.unwrap();
-        let est = cfg.context.est_post_compact_base + lt.output_tokens.clamp(2_500, 16_000);
-        (lt.context_tokens(), est)
+        let summary_tok_est = if let Some(lt) = latest.filter(|t| t.is_checkpoint) {
+            lt.output_tokens.clamp(2_500, 16_000)
+        } else if compact_summary_bytes > 0 {
+            ((compact_summary_bytes as u64) / 4).clamp(2_500, 16_000)
+        } else {
+            2_500
+        };
+        let est = cfg.context.est_post_compact_base + summary_tok_est;
+        (last_ckpt_pre_tokens, est)
     } else {
-        let pre = last_ckpt_pos
-            .map(|p| turns[p].context_tokens())
+        let cur = latest_active_ctx_turn
+            .map(|t| t.context_tokens())
             .unwrap_or(0);
-        let cur = latest.map(|t| t.context_tokens()).unwrap_or(0);
-        (pre, cur)
+        (last_ckpt_pre_tokens, cur)
     };
 
     let peak_ctx = turns.iter().map(|t| t.context_tokens()).max().unwrap_or(0);
@@ -926,36 +1015,56 @@ pub fn build_session_telemetry_with_probe(
         0.0
     };
 
-    let latest_non_ckpt = turns.iter().rev().find(|t| !t.is_checkpoint).or(latest);
-    let latest_ttft_ms = latest_non_ckpt.map(|t| t.ttft_ms).unwrap_or(0);
-    let latest_stream_tps = latest_non_ckpt
+    let latest_ttft_ms = turns
+        .iter()
+        .rev()
+        .find(|t| !t.is_checkpoint && t.ttft_ms > 0)
+        .map(|t| t.ttft_ms)
+        .unwrap_or(0);
+    let latest_stream_tps = turns
+        .iter()
+        .rev()
+        .find(|t| !t.is_checkpoint && t.stream_tps() > 0.0)
         .map(|t| round_dp(t.stream_tps(), 1))
         .unwrap_or(0.0);
 
-    // Current/latest agent loop rollup: walk backwards from latest non-checkpoint turn
-    // until hitting `after_turn_start == Some(true)` (inclusive) or a checkpoint boundary.
+    // Current/latest agent loop rollup: walk backwards from the active post-checkpoint window
+    // until hitting `after_turn_start == Some(true)` (inclusive) or a checkpoint/user boundary.
     let mut last_loop_steps = 0usize;
     let mut last_loop_output_tokens = 0u64;
     let mut last_loop_thinking_tokens = 0u64;
     let mut last_loop_cost_usd = 0.0f64;
-    if let Some(last_non_ckpt_idx) = turns.iter().rposition(|t| !t.is_checkpoint) {
-        for t in turns[..=last_non_ckpt_idx].iter().rev() {
-            if t.is_checkpoint {
-                break;
-            }
-            last_loop_steps += 1;
-            last_loop_output_tokens = last_loop_output_tokens.saturating_add(t.output_tokens);
-            last_loop_thinking_tokens = last_loop_thinking_tokens.saturating_add(t.thinking_tokens);
-            last_loop_cost_usd += rates.calculate_cost_usd(
-                &t.model,
-                t.input_tokens,
-                t.cache_read,
-                t.cache_write,
-                t.output_tokens,
-                &t.model_display,
-            );
-            if t.after_turn_start == Some(true) || t.after_checkpoint {
-                break;
+    if !just_compacted {
+        let active_start = first_post_ckpt_turn_pos.unwrap_or(0).min(turns.len());
+        if let Some(rel_last) = turns[active_start..].iter().rposition(|t| !t.is_checkpoint) {
+            let end_idx = active_start + rel_last;
+            for idx in (active_start..=end_idx).rev() {
+                let t = &turns[idx];
+                if t.is_checkpoint {
+                    break;
+                }
+                last_loop_steps += 1;
+                last_loop_output_tokens = last_loop_output_tokens.saturating_add(t.output_tokens);
+                last_loop_thinking_tokens =
+                    last_loop_thinking_tokens.saturating_add(t.thinking_tokens);
+                last_loop_cost_usd += rates.calculate_cost_usd(
+                    &t.model,
+                    t.input_tokens,
+                    t.cache_read,
+                    t.cache_write,
+                    t.output_tokens,
+                    &t.model_display,
+                );
+                let prev_step = if idx > 0 { turns[idx - 1].step_idx } else { -1 };
+                let saw_loop_start_in_transcript = tmap_has_between(prev_step, t.step_idx, |s| {
+                    matches!(s, "CHECKPOINT" | "USER_INPUT" | "SYSTEM_MESSAGE")
+                });
+                if t.after_turn_start == Some(true)
+                    || t.after_checkpoint
+                    || saw_loop_start_in_transcript
+                {
+                    break;
+                }
             }
         }
     }
@@ -989,8 +1098,8 @@ pub fn build_session_telemetry_with_probe(
         + cold_breakdown.mid_loop_cold
         + cold_breakdown.post_compact_cold;
 
-    let post_ckpt_start = match last_ckpt_pos {
-        Some(pos) => (pos + 2).min(turns.len()),
+    let post_ckpt_start = match first_post_ckpt_turn_pos {
+        Some(first_pos) => (first_pos + 1).min(turns.len()),
         None => 1.min(turns.len()),
     };
     let post_ckpt_turns = &turns[post_ckpt_start..];
@@ -1077,7 +1186,6 @@ pub fn build_session_telemetry_with_probe(
     };
     let last_iso = format_utc_iso(last_ts);
 
-    let latest_turn_step_idx = turns.iter().map(|t| t.step_idx).max().unwrap_or(-1);
     let is_active = if is_side_question {
         is_side_question_active(killed, eff_mtime, now_ts, live_probe, latest_turn_step_idx)
     } else if is_subagent {
@@ -1115,8 +1223,7 @@ pub fn build_session_telemetry_with_probe(
         live_probe.map(|p| p.live_phase.as_str()).unwrap_or("")
     };
     let cross_model_compact = if active_phase_str == "compacting" {
-        if just_compacted {
-            let ckpt_pos = last_ckpt_pos.unwrap();
+        if let Some(ckpt_pos) = last_ckpt_pos.filter(|_| just_compacted) {
             let mut ckpt_model =
                 canonical_model_key(&turns[ckpt_pos].model, &turns[ckpt_pos].model_display);
             if ckpt_model.is_empty() {
@@ -1143,8 +1250,7 @@ pub fn build_session_telemetry_with_probe(
                 .unwrap_or_default();
             !active_model.is_empty() && !prev_model.is_empty() && active_model != prev_model
         }
-    } else if just_compacted {
-        let ckpt_pos = last_ckpt_pos.unwrap();
+    } else if let Some(ckpt_pos) = last_ckpt_pos.filter(|_| just_compacted) {
         let ckpt_model =
             canonical_model_key(&turns[ckpt_pos].model, &turns[ckpt_pos].model_display);
         let prev_model = turns[..ckpt_pos]
@@ -1172,7 +1278,6 @@ pub fn build_session_telemetry_with_probe(
         now_ts,
     );
 
-    let compact_summary_bytes = live_probe.map(|p| p.compact_summary_bytes).unwrap_or(0);
     let compact_summary_kb = if compact_summary_bytes > 0 {
         round_dp((compact_summary_bytes as f64) / 1024.0, 1)
     } else {
@@ -1228,9 +1333,16 @@ pub fn build_session_telemetry_with_probe(
         suggest_compact,
         turns: turns.len(),
         cache_hit_rate: round_dp(cache_hit, 1),
-        latest_cache_hit_rate: latest
-            .map(|t| round_dp(t.cache_hit_rate(), 1))
-            .unwrap_or(0.0),
+        latest_cache_hit_rate: if just_compacted {
+            latest
+                .map(|t| round_dp(t.cache_hit_rate(), 1))
+                .unwrap_or(0.0)
+        } else {
+            latest_active_ctx_turn
+                .or(latest)
+                .map(|t| round_dp(t.cache_hit_rate(), 1))
+                .unwrap_or(0.0)
+        },
         cold_cache_count,
         turn_start_cold_count: cold_breakdown.turn_start_cold,
         mid_loop_cold_count: cold_breakdown.mid_loop_cold,
@@ -2879,5 +2991,152 @@ impl TelemetryEngine {
             mid_loop_breakdown: Some(mb),
             turns: rows,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_turn(
+        turn_index: usize,
+        step_idx: i64,
+        ts: f64,
+        in_tok: u64,
+        cr_tok: u64,
+        out_tok: u64,
+        is_checkpoint: bool,
+    ) -> TurnSample {
+        TurnSample {
+            turn_index,
+            step_idx,
+            timestamp: ts,
+            model: "gemini-4-neon-high".into(),
+            model_display: "Gemini 4 Standard (High)".into(),
+            input_tokens: in_tok,
+            cache_read: cr_tok,
+            cache_write: 0,
+            output_tokens: out_tok,
+            thinking_tokens: out_tok / 2,
+            response_tokens: out_tok - (out_tok / 2),
+            ttft_ms: if out_tok > 0 { 900 } else { 0 },
+            total_ms: if out_tok > 0 { 3_000 } else { 0 },
+            response_id: format!("r{turn_index}"),
+            step_type: if is_checkpoint { 23 } else { 15 },
+            is_checkpoint,
+            after_turn_start: None,
+            after_checkpoint: false,
+        }
+    }
+
+    #[test]
+    fn telemetry_handles_zero_post_checkpoint_turns_and_trailing_partial_turn() {
+        let mut rates = RateTable::new(SettingsWatcher::new(Some("none".into())), None, None);
+        let cid = "80000000-0000-0000-0000-000000000801";
+
+        // 1. Explicit checkpoint TurnSample at EOF -> 0 post-checkpoint turns and 0 last_loop_steps
+        let ckpt_turns = vec![
+            sample_turn(1, 10, 1_000.0, 20_000, 350_000, 1_200, false),
+            sample_turn(2, 11, 1_010.0, 5_000, 370_000, 4_000, true),
+        ];
+        let tel_ckpt = build_session_telemetry(
+            cid,
+            None,
+            &ckpt_turns,
+            1_010.0,
+            7.2,
+            &mut rates,
+            1_020.0,
+            None,
+        );
+        assert!(tel_ckpt.just_compacted);
+        assert_eq!(tel_ckpt.turns_since_compact, 0);
+        assert_eq!(tel_ckpt.last_loop_steps, 0);
+        assert_eq!(tel_ckpt.last_loop_output_tokens, 0);
+        assert!(!tel_ckpt.recent_cold_rebuild);
+
+        // 2. Transcript ends immediately after CHECKPOINT with 0 post-checkpoint turns in `turns`
+        let pre_turns = vec![sample_turn(1, 10, 1_000.0, 30_000, 360_000, 800, false)];
+        let mut tmap = HashMap::new();
+        tmap.insert(9, "USER_INPUT".to_string());
+        tmap.insert(10, "PLANNER_RESPONSE".to_string());
+        tmap.insert(11, "CHECKPOINT".to_string());
+
+        let probe = LiveStepProbe {
+            compact_summary_bytes: 16_000,
+            ..LiveStepProbe::default()
+        };
+        let tel_tckpt = build_session_telemetry_with_probe(
+            cid,
+            None,
+            &pre_turns,
+            1_015.0,
+            7.2,
+            &mut rates,
+            1_020.0,
+            Some(&tmap),
+            None,
+            Some(&probe),
+        );
+        assert!(tel_tckpt.just_compacted);
+        assert_eq!(tel_tckpt.checkpoint_count, 1);
+        assert_eq!(tel_tckpt.turns_since_compact, 0);
+        assert_eq!(tel_tckpt.pre_compact_tokens, 390_000);
+        assert!(tel_tckpt.latest_context_tokens < 40_000);
+        assert_eq!(tel_tckpt.level, "ok");
+        assert!(!tel_tckpt.suggest_compact);
+        assert_eq!(tel_tckpt.last_loop_steps, 0);
+
+        // Empty `turns` with trailing transcript CHECKPOINT must not panic
+        let tel_empty = build_session_telemetry_with_probe(
+            cid,
+            None,
+            &[],
+            1_015.0,
+            7.2,
+            &mut rates,
+            1_020.0,
+            Some(&tmap),
+            None,
+            Some(&probe),
+        );
+        assert!(tel_empty.just_compacted);
+        assert_eq!(tel_empty.turns_since_compact, 0);
+
+        // 3. Trailing partial/empty turn at EOF + lagging transcript_step_types
+        let mut partial_eof = sample_turn(2, 15, 1_600.0, 0, 0, 0, false);
+        partial_eof.ttft_ms = 0;
+        partial_eof.total_ms = 0;
+        let turns_with_partial = vec![
+            sample_turn(1, 10, 1_000.0, 20_000, 80_000, 600, false),
+            partial_eof,
+        ];
+        let tel_partial = build_session_telemetry(
+            cid,
+            None,
+            &turns_with_partial,
+            1_600.0,
+            7.2,
+            &mut rates,
+            1_605.0,
+            None,
+        );
+        assert_eq!(tel_partial.latest_context_tokens, 100_000);
+        assert!((tel_partial.latest_cache_hit_rate - 80.0).abs() < 0.1);
+        assert_eq!(tel_partial.latest_ttft_ms, 900);
+        assert!(tel_partial.latest_stream_tps > 0.0);
+
+        // Lagging transcript_step_types (only covers up to step 10, while turn 2 at step 15 ran 600s later)
+        // must fall back to TTL TurnStart rather than falsely assuming MidLoop!
+        let mut lagging_tmap = HashMap::new();
+        lagging_tmap.insert(9, "USER_INPUT".to_string());
+        lagging_tmap.insert(10, "PLANNER_RESPONSE".to_string());
+        let turns_after_ttl = vec![
+            sample_turn(1, 10, 1_000.0, 40_000, 0, 500, false),
+            sample_turn(2, 15, 1_600.0, 50_000, 0, 500, false),
+        ];
+        let classified =
+            classify_cold_cache_turns_detailed(&turns_after_ttl, Some(&lagging_tmap), None);
+        assert_eq!(classified[1].kind, ColdCacheKind::TurnStart);
     }
 }
