@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.1](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.6.0...v1.6.1) (2026-11-28)
+
+
+### Bug Fixes
+
+* harden installer, ACP namespace, bounded readers, and state permissions ([#40](https://github.com/eatingDream-antigravity-plugins/context-radar/issues/40)) ([3c80000](https://github.com/eatingDream-antigravity-plugins/context-radar/commit/3c800008c41d2bcbfd84e45aaeda80230ae9a5ee))
+
 ## [1.6.0](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.5.3...v1.6.0) (2026-11-27)
 
 
