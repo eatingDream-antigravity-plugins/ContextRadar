@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.4](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.6.3...v1.6.4) (2026-11-28)
+
+
+### Bug Fixes
+
+* eliminate Frame-0 white flash, keep idle SWR fresh, and polish EN/ZH copy ([#46](https://github.com/eatingDream-antigravity-plugins/context-radar/issues/46)) ([34b53d2](https://github.com/eatingDream-antigravity-plugins/context-radar/commit/34b53d27507f94a02b36c8a841306975719e2338))
+
 ## [1.6.3](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.6.2...v1.6.3) (2026-11-28)
 
 
