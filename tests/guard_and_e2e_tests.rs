@@ -772,3 +772,200 @@ fn test_check_sanitized_script_redacts_secrets_and_fails_closed_on_scanner_error
         String::from_utf8_lossy(&err.stderr)
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn test_install_script_hardening_semver_symlinks_and_curl_stdin() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let td = TempDir::new().unwrap();
+    let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let install_sh = repo_root.join("scripts/install.sh");
+
+    // Build a valid staged tarball + sha256 matching current OS/arch
+    let stage = td.path().join("stage_src");
+    fs::create_dir_all(stage.join("bin")).unwrap();
+    fs::create_dir_all(stage.join("panel/dist")).unwrap();
+    fs::create_dir_all(stage.join("rules")).unwrap();
+    fs::create_dir_all(stage.join("skills/context-radar")).unwrap();
+    fs::create_dir_all(stage.join("assets")).unwrap();
+    fs::write(
+        stage.join("bin/context-radar-mcp"),
+        "#!/bin/sh\necho v1.6.0\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        stage.join("bin/context-radar-mcp"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(stage.join("panel/dist/panel.html"), "<html></html>").unwrap();
+    fs::write(stage.join("rules/AGENTS.md"), "# rule").unwrap();
+    fs::write(stage.join("skills/context-radar/SKILL.md"), "# skill").unwrap();
+    fs::write(stage.join("assets/logo.svg"), "<svg/>").unwrap();
+    fs::write(stage.join("plugin.json"), "{}").unwrap();
+
+    let archive = td.path().join("pkg.tar.gz");
+    let tar_status = Command::new("tar")
+        .args([
+            "-czf",
+            archive.to_str().unwrap(),
+            "-C",
+            stage.to_str().unwrap(),
+            ".",
+        ])
+        .status()
+        .unwrap();
+    assert!(tar_status.success());
+
+    let sha_out = Command::new("shasum")
+        .args(["-a", "256", archive.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(sha_out.status.success());
+    let sha_line = String::from_utf8_lossy(&sha_out.stdout);
+    let sha_hex = sha_line.split_whitespace().next().unwrap();
+    let sha_file = td.path().join("pkg.tar.gz.sha256");
+    fs::write(&sha_file, format!("{sha_hex}  pkg.tar.gz\n")).unwrap();
+
+    // Mock curl that serves the archive/sha256 and logs argv + stdin on RefreshMcpServers
+    let mock_bin = td.path().join("mock_bin");
+    fs::create_dir_all(&mock_bin).unwrap();
+    let curl_argv_log = td.path().join("curl_argv.log");
+    let curl_stdin_log = td.path().join("curl_stdin.log");
+    let mock_curl = mock_bin.join("curl");
+    fs::write(
+        &mock_curl,
+        format!(
+            r#"#!/bin/sh
+out=""
+has_k=0
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  if [ "$prev" = "-K" ] && [ "$a" = "-" ]; then has_k=1; fi
+  prev="$a"
+done
+case "$*" in
+  *RefreshMcpServers*)
+    printf '%s\n' "$*" > "{}"
+    if [ "$has_k" -eq 1 ]; then
+      cat > "{}"
+    fi
+    exit 0
+    ;;
+  *.sha256*)
+    cp "{}" "$out"
+    exit 0
+    ;;
+  *.tar.gz*)
+    cp "{}" "$out"
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+            curl_argv_log.display(),
+            curl_stdin_log.display(),
+            sha_file.display(),
+            archive.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&mock_curl, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let path_env = format!(
+        "{}:{}",
+        mock_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let plugins_dir = td.path().join("plugins");
+    fs::create_dir_all(&plugins_dir).unwrap();
+
+    // 1. Invalid semver tag (including newline injection) is rejected
+    for bad_tag in ["v1.0.0/../../evil", "badtag", "v1.2", "v1.6.0\nevil"] {
+        let out = Command::new("sh")
+            .arg(&install_sh)
+            .env("PATH", &path_env)
+            .env("ANTIGRAVITY_PLUGINS_DIR", &plugins_dir)
+            .env("CONTEXT_RADAR_VERSION", bad_tag)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "tag should be rejected: {bad_tag}");
+    }
+
+    // 2. Symlink INSTALL_DIR is rejected
+    let evil_target = td.path().join("evil_target");
+    fs::create_dir_all(&evil_target).unwrap();
+    let symlink_install = plugins_dir.join("context-radar-mcp");
+    symlink(&evil_target, &symlink_install).unwrap();
+    let sym_out = Command::new("sh")
+        .arg(&install_sh)
+        .env("PATH", &path_env)
+        .env("ANTIGRAVITY_PLUGINS_DIR", &plugins_dir)
+        .env("CONTEXT_RADAR_VERSION", "v1.6.0")
+        .output()
+        .unwrap();
+    assert!(!sym_out.status.success());
+    fs::remove_file(&symlink_install).unwrap();
+
+    // 3. Non-loopback, out-of-range, or newline-injected ANTIGRAVITY_LS_ADDRESS & newline CSRF never invoke RefreshMcpServers
+    let secret_csrf = "csrf-secret-token-xyz";
+    for (bad_addr, tok) in [
+        ("evil.example.com:5387", secret_csrf),
+        ("127.0.0.1:0", secret_csrf),
+        ("127.0.0.1:99999", secret_csrf),
+        ("127.0.0.1:5387\nurl = \"https://evil\"", secret_csrf),
+        ("127.0.0.1:5387", "tok\nurl = \"https://evil\""),
+    ] {
+        let bad_addr_out = Command::new("sh")
+            .arg(&install_sh)
+            .env("PATH", &path_env)
+            .env("ANTIGRAVITY_PLUGINS_DIR", &plugins_dir)
+            .env("CONTEXT_RADAR_VERSION", "v1.6.0")
+            .env("ANTIGRAVITY_CSRF_TOKEN", tok)
+            .env("ANTIGRAVITY_LS_ADDRESS", bad_addr)
+            .output()
+            .unwrap();
+        assert!(bad_addr_out.status.success());
+        assert!(
+            !curl_argv_log.exists(),
+            "invalid LS_ADDRESS/CSRF must not invoke RefreshMcpServers: {bad_addr}"
+        );
+    }
+
+    // 4. Valid loopback ANTIGRAVITY_LS_ADDRESS sends CSRF header via `curl -K -` stdin only (never argv)
+    let ok_out = Command::new("sh")
+        .arg(&install_sh)
+        .env("PATH", &path_env)
+        .env("ANTIGRAVITY_PLUGINS_DIR", &plugins_dir)
+        .env("CONTEXT_RADAR_VERSION", "v1.6.0")
+        .env("ANTIGRAVITY_CSRF_TOKEN", secret_csrf)
+        .env("ANTIGRAVITY_LS_ADDRESS", "127.0.0.1:5387")
+        .output()
+        .unwrap();
+    assert!(
+        ok_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ok_out.stderr)
+    );
+    let recorded_argv = fs::read_to_string(&curl_argv_log).unwrap();
+    let recorded_stdin = fs::read_to_string(&curl_stdin_log).unwrap();
+    assert!(recorded_argv.contains("-K -"), "argv: {recorded_argv}");
+    assert!(
+        !recorded_argv.contains(secret_csrf),
+        "CSRF token leaked into curl argv: {recorded_argv}"
+    );
+    assert!(
+        recorded_stdin.contains(secret_csrf),
+        "CSRF token missing from -K - stdin: {recorded_stdin}"
+    );
+    assert_eq!(
+        fs::metadata(plugins_dir.join("context-radar-mcp/bin/context-radar-mcp"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o755
+    );
+}

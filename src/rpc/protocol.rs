@@ -1,8 +1,8 @@
 //! JSON-RPC 2.0 MCP stdio server with startup pre-warm, zero-block SWR cache, SSR boot-data injection, scoped relay grants, and digest deduplication.
 
 use std::env;
-use std::fs;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::fs::{self, File};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -14,8 +14,9 @@ use serde_json::{json, Map, Value};
 use crate::engine::budget::{evaluate_handoff_gate, prepare_handoff_plan};
 use crate::engine::grants::{
     default_grants_path_in, is_acp_proxy_active, paths_overlap,
-    sanitize_scratch_note_path_for_lang, workspaces_overlap, ClaimOutcome, GrantFileSignature,
-    PanelPrefs, RelayGrantStore,
+    sanitize_scratch_note_path_in_root_for_lang, workspaces_overlap, ClaimOutcome,
+    GrantFileSignature, PanelPrefs, RelayGrantStore, MAX_PRESERVE_POINTS_BYTES,
+    MAX_RESUME_TASK_BYTES,
 };
 use crate::engine::pruner::distill_slice_with_lang;
 use crate::engine::telemetry::{
@@ -27,7 +28,9 @@ use crate::rpc::tools::{
     HANDOFF_URI, PANEL_URI,
 };
 use crate::settings::{
-    abbreviate_home_path, expand_tilde, update_settings_file_atomic, SettingsPatch, PANEL_HTML_ENV,
+    abbreviate_home_path, expand_tilde, read_line_bounded, update_settings_file_atomic,
+    validate_pref_currency, validate_pref_lang, BoundedLine, SettingsPatch, MAX_LINE_BYTES,
+    PANEL_HTML_ENV,
 };
 
 pub const SERVER_NAME: &str = "context-radar-mcp";
@@ -280,8 +283,17 @@ impl SwrHub {
     fn load_html(&self, path: &Path) -> Result<(String, i128, u64), String> {
         let meta = fs::metadata(path)
             .map_err(|e| format!("Failed to stat panel HTML {}: {e}", path.display()))?;
+        if !meta.file_type().is_file() {
+            return Err(format!(
+                "panel.html is not a regular file: {}",
+                path.display()
+            ));
+        }
         let mtime_ns = (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128);
         let size = meta.size();
+        if size > MAX_HTML_BYTES as u64 {
+            return Err("panel.html exceeds 10 MiB MCP App resource limit".to_string());
+        }
         if let Ok(g) = self.html.read() {
             if let Some(ref c) = *g {
                 if c.path == path && c.mtime_ns == mtime_ns && c.size == size {
@@ -289,7 +301,11 @@ impl SwrHub {
                 }
             }
         }
-        let html = fs::read_to_string(path)
+        let file = File::open(path)
+            .map_err(|e| format!("Failed to read panel HTML {}: {e}", path.display()))?;
+        let mut html = String::new();
+        file.take((MAX_HTML_BYTES + 1) as u64)
+            .read_to_string(&mut html)
             .map_err(|e| format!("Failed to read panel HTML {}: {e}", path.display()))?;
         if html.len() > MAX_HTML_BYTES {
             return Err("panel.html exceeds 10 MiB MCP App resource limit".to_string());
@@ -707,11 +723,34 @@ impl McpDaemon {
         match act {
             "set_prefs" => {
                 let allow = args.get("allow_auto_handoff").and_then(Value::as_bool);
-                let lang_pref = args.get("lang").and_then(Value::as_str);
-                let currency_code = args
-                    .get("currency_code")
-                    .and_then(Value::as_str)
-                    .map(|s| s.trim().to_string());
+                let lang_pref = match args.get("lang").and_then(Value::as_str) {
+                    Some(raw) => match validate_pref_lang(raw) {
+                        Ok(None) => Some("auto".to_string()),
+                        Ok(Some(norm)) => Some(norm.to_string()),
+                        Err(err_msg) => {
+                            return json!({
+                                "content": [{ "type": "text", "text": err_msg }],
+                                "structuredContent": { "mode": "prefs", "error": "invalid_lang" },
+                                "isError": true
+                            });
+                        }
+                    },
+                    None => None,
+                };
+                let currency_code = match args.get("currency_code").and_then(Value::as_str) {
+                    Some(raw) => match validate_pref_currency(raw) {
+                        Ok(None) => Some("auto".to_string()),
+                        Ok(Some(norm)) => Some(norm.to_string()),
+                        Err(err_msg) => {
+                            return json!({
+                                "content": [{ "type": "text", "text": err_msg }],
+                                "structuredContent": { "mode": "prefs", "error": "invalid_currency_code" },
+                                "isError": true
+                            });
+                        }
+                    },
+                    None => None,
+                };
                 let fx_rate = args
                     .get("fx_rate")
                     .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)));
@@ -722,14 +761,14 @@ impl McpDaemon {
                 if (allow.is_some() || lang_pref.is_some())
                     && self
                         .grants
-                        .update_settings_with_lang(allow, lang_pref)
+                        .update_settings_with_lang(allow, lang_pref.as_deref())
                         .is_err()
                 {
                     return grant_storage_error(zh);
                 }
 
                 let patch = SettingsPatch {
-                    lang: lang_pref.map(|s| s.to_string()),
+                    lang: lang_pref,
                     currency_code,
                     fx_rate,
                     poll_interval_sec,
@@ -816,10 +855,15 @@ impl McpDaemon {
                 } else {
                     res.reason.clone().unwrap_or_else(|| "error".to_string())
                 };
+                let is_input_err = !res.ok
+                    && res
+                        .reason
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with("invalid_"));
                 json!({
                     "content": [{ "type": "text", "text": txt }],
                     "structuredContent": res,
-                    "isError": false
+                    "isError": is_input_err
                 })
             }
             "record_compact" => {
@@ -832,10 +876,15 @@ impl McpDaemon {
                 } else {
                     res.reason.clone().unwrap_or_else(|| "error".to_string())
                 };
+                let is_input_err = !res.ok
+                    && res
+                        .reason
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with("invalid_"));
                 json!({
                     "content": [{ "type": "text", "text": txt }],
                     "structuredContent": res,
-                    "isError": false
+                    "isError": is_input_err
                 })
             }
             "dismiss_grant" => {
@@ -942,6 +991,12 @@ impl McpDaemon {
     fn prepare_commit_handoff(&mut self, args: &Map<String, Value>, kind: &str) -> Value {
         let lang = self.engine.rates.get_lang();
         let zh = lang.is_zh();
+        if kind != "handoff" && kind != "compact" {
+            return json!({
+                "content": [{ "type": "text", "text": if zh { "无效的 kind 参数（仅支持 handoff 或 compact）。" } else { "Invalid kind; expected 'handoff' or 'compact'." } }],
+                "isError": true
+            });
+        }
         let preserve = str_arg(args, "preserve_points");
         if preserve.is_empty() {
             return json!({
@@ -949,8 +1004,38 @@ impl McpDaemon {
                 "isError": true
             });
         }
+        if preserve.len() > MAX_PRESERVE_POINTS_BYTES {
+            return json!({
+                "content": [{ "type": "text", "text": if zh { "preserve_points 过长（上限 8192 字节）。" } else { "preserve_points exceeds 8192-byte maximum." } }],
+                "isError": true
+            });
+        }
+        let resume_task = str_arg(args, "resume_task");
+        if resume_task.len() > MAX_RESUME_TASK_BYTES {
+            return json!({
+                "content": [{ "type": "text", "text": if zh { "resume_task 过长（上限 4096 字节）。" } else { "resume_task exceeds 4096-byte maximum." } }],
+                "isError": true
+            });
+        }
+
+        let auto_fire = bool_arg(args, "auto_fire", true);
+        let acp_env_active = is_acp_proxy_active();
+        let acp_strict_error = acp_env_active && kind == "compact" && auto_fire;
+
+        let cid_arg = str_arg(args, "conversation_id");
+        let target = self.engine.resolve_session_fast(&cid_arg, None);
+        let resolved_cid = target
+            .as_ref()
+            .map(|t| t.id.as_str())
+            .filter(|s| !s.is_empty());
+
         let raw_scratch = str_arg(args, "scratch_note_path");
-        let scratch_path = match sanitize_scratch_note_path_for_lang(&raw_scratch, lang) {
+        let scratch_path = match sanitize_scratch_note_path_in_root_for_lang(
+            &raw_scratch,
+            &self.engine.ledger.data_root,
+            resolved_cid,
+            lang,
+        ) {
             Ok(p) => p,
             Err(err) => {
                 return json!({
@@ -959,13 +1044,6 @@ impl McpDaemon {
                 });
             }
         };
-
-        let auto_fire = bool_arg(args, "auto_fire", true);
-        let acp_env_active = is_acp_proxy_active();
-        let acp_strict_error = acp_env_active && kind == "compact" && auto_fire;
-
-        let cid_arg = str_arg(args, "conversation_id");
-        let target = self.engine.resolve_session_fast(&cid_arg, None);
 
         // Guard against ambiguous multi-window `commit_handoff` when conversation_id was omitted
         // and >=2 main conversations are concurrently RUNNING in the same workspace scope.
@@ -1077,7 +1155,6 @@ impl McpDaemon {
             .as_ref()
             .map(|t| t.running_subagent_count)
             .unwrap_or(0);
-        let resume_task = str_arg(args, "resume_task");
 
         let Ok(grant) = self.grants.create_grant_scoped(
             &preserve,
@@ -1901,21 +1978,38 @@ pub fn run_stdio_daemon(
     let stdout = io::stdout();
     let mut reader = BufReader::new(stdin.lock());
     let mut writer = BufWriter::new(stdout.lock());
-    let mut line = String::with_capacity(4096);
+    let mut raw_line = Vec::with_capacity(4096);
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line)?;
-        if n == 0 {
-            break;
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let resp = match serde_json::from_str::<Value>(trimmed) {
-            Ok(msg) => daemon.handle_message(&msg),
-            Err(e) => Some(rpc_err(&Value::Null, -32700, &format!("Parse error: {e}"))),
+        let resp = match read_line_bounded(&mut reader, &mut raw_line, MAX_LINE_BYTES)? {
+            BoundedLine::Eof => break,
+            BoundedLine::Oversized(_) => {
+                raw_line.clear();
+                raw_line.shrink_to(4096);
+                Some(rpc_err(
+                    &Value::Null,
+                    -32600,
+                    "JSON-RPC frame exceeds 16 MiB limit",
+                ))
+            }
+            BoundedLine::Line(_) => {
+                let Ok(line_str) = std::str::from_utf8(&raw_line) else {
+                    raw_line.clear();
+                    let err = rpc_err(&Value::Null, -32700, "Parse error: invalid UTF-8");
+                    serde_json::to_writer(&mut writer, &err)?;
+                    writer.write_all(b"\n")?;
+                    writer.flush()?;
+                    continue;
+                };
+                let trimmed = line_str.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<Value>(trimmed) {
+                    Ok(msg) => daemon.handle_message(&msg),
+                    Err(e) => Some(rpc_err(&Value::Null, -32700, &format!("Parse error: {e}"))),
+                }
+            }
         };
         if let Some(reply) = resp {
             serde_json::to_writer(&mut writer, &reply)?;
@@ -2394,5 +2488,16 @@ mod tests {
             json!({"if_digest": next_digest, "fresh": true}),
         );
         assert_eq!(server.engine.overview_build_count, 5);
+    }
+
+    #[test]
+    fn load_html_rejects_oversized_before_reading() {
+        let td = tempfile::tempdir().unwrap();
+        let huge = td.path().join("huge.html");
+        let f = File::create(&huge).unwrap();
+        f.set_len((MAX_HTML_BYTES as u64) + 1024).unwrap();
+        let hub = SwrHub::new();
+        let err = hub.load_html(&huge).unwrap_err();
+        assert!(err.contains("10 MiB"), "unexpected error: {err}");
     }
 }

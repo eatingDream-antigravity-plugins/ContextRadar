@@ -14,17 +14,54 @@ use serde::{Deserialize, Serialize};
 pub use crate::i18n::{
     build_compact_command, build_compact_command_for_lang,
     build_compact_command_with_note_for_lang, sanitize_scratch_note_path,
-    sanitize_scratch_note_path_for_lang, sanitize_scratch_note_path_pure_for_lang,
+    sanitize_scratch_note_path_for_lang, sanitize_scratch_note_path_in_root_for_lang,
+    sanitize_scratch_note_path_pure_for_lang,
 };
 use crate::i18n::{parse_lang_tag, resolve_active_lang, Lang};
 use crate::settings::{
-    default_data_root, default_plugin_data_dir, expand_tilde, normalize_workspace_uri,
-    ACP_PROXY_ENV, GRANTS_PATH_ENV,
+    current_euid, default_data_root, default_plugin_data_dir, expand_tilde, is_safe_id,
+    normalize_workspace_uri, read_regular_file_bounded, ACP_PROXY_ENV, GRANTS_PATH_ENV,
+    MAX_CONFIG_BYTES,
 };
 
 pub const GRANT_TTL_SEC: f64 = 43_200.0;
 pub const GRANT_PRUNE_SEC: f64 = 86_400.0;
 pub const RELAY_DISPLAY_SEC: f64 = 600.0;
+pub const MAX_PRESERVE_POINTS_BYTES: usize = 8192;
+pub const MAX_RESUME_TASK_BYTES: usize = 4096;
+pub const MAX_TITLE_BYTES: usize = 512;
+pub const MAX_COMPACT_STATUS_BYTES: usize = 160;
+
+fn clip_utf8_bytes(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+fn sanitize_compact_status(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.len() > MAX_COMPACT_STATUS_BYTES
+        || trimmed.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return None;
+    }
+    let valid = matches!(
+        trimmed,
+        "sent" | "acp_compacted" | "skipped" | "fallback_copied"
+    ) || trimmed.starts_with("fallback_copied:")
+        || trimmed.starts_with("error:");
+    if valid {
+        Some(trimmed.to_string())
+    } else {
+        None
+    }
+}
 
 #[inline]
 pub fn is_acp_proxy_active() -> bool {
@@ -57,9 +94,31 @@ mod file_lock {
 
     impl GrantFileLock {
         pub fn acquire(store_path: &Path) -> io::Result<Self> {
+            let euid = current_euid();
             if let Some(parent) = store_path.parent() {
                 if !parent.as_os_str().is_empty() {
+                    if let Ok(meta) = fs::symlink_metadata(parent) {
+                        if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "grant directory must not be a symlink",
+                            ));
+                        }
+                    }
                     fs::create_dir_all(parent)?;
+                    let meta = fs::symlink_metadata(parent)?;
+                    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "grant directory must not be a symlink",
+                        ));
+                    }
+                    if meta.uid() != euid {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "grant directory has unexpected owner",
+                        ));
+                    }
                     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
                 }
             }
@@ -505,7 +564,7 @@ impl RelayGrantStore {
                 return Ok(cached.clone());
             }
         }
-        let raw = fs::read_to_string(&self.path).inspect_err(|_| {
+        let raw = read_regular_file_bounded(&self.path, MAX_CONFIG_BYTES).inspect_err(|_| {
             self.cache_sig = None;
             self.cache_data = None;
         })?;
@@ -664,18 +723,21 @@ impl RelayGrantStore {
             .retain(|_, g| (now - g.created_at) <= GRANT_PRUNE_SEC);
 
         let grant_id = random_hex_16();
+        let preserve_trimmed = clip_utf8_bytes(preserve_points.trim(), MAX_PRESERVE_POINTS_BYTES);
+        let resume_trimmed = clip_utf8_bytes(resume_task.trim(), MAX_RESUME_TASK_BYTES);
+        let title_trimmed = clip_utf8_bytes(title.trim(), MAX_TITLE_BYTES);
         let compact_command = build_compact_command_with_note_for_lang(
-            preserve_points,
-            resume_task,
+            &preserve_trimmed,
+            &resume_trimmed,
             scratch_note_path,
             lang,
         );
         let handoff_prompt = build_handoff_prompt_for_lang(
             conversation_id,
-            preserve_points,
-            resume_task,
+            &preserve_trimmed,
+            &resume_trimmed,
             scratch_note_path,
-            title,
+            &title_trimmed,
             lang,
         );
         let norm_kind = if kind == "handoff" || kind == "compact" {
@@ -697,7 +759,7 @@ impl RelayGrantStore {
             conversation_id: conversation_id.to_string(),
             workspace: norm_ws,
             workspaces: norm_all,
-            title: title.trim().to_string(),
+            title: title_trimmed,
             created_at: now,
             ttl_sec: GRANT_TTL_SEC,
             created_turns: turns_count,
@@ -706,8 +768,8 @@ impl RelayGrantStore {
             claimed: false,
             claimed_at: 0.0,
             dismissed: false,
-            preserve_points: preserve_points.trim().to_string(),
-            resume_task: resume_task.trim().to_string(),
+            preserve_points: preserve_trimmed,
+            resume_task: resume_trimmed,
             scratch_note_path: scratch_note_path.trim().to_string(),
             compact_command,
             handoff_prompt,
@@ -946,8 +1008,16 @@ impl RelayGrantStore {
     }
 
     pub fn record_relay(&mut self, grant_id: &str, handoff_cid: &str) -> ActionOutcome {
-        if grant_id.is_empty() {
+        let gid = grant_id.trim();
+        if gid.is_empty() {
             return ActionOutcome::failed("missing_grant_id");
+        }
+        if !is_safe_id(gid) {
+            return ActionOutcome::failed("invalid_grant_id");
+        }
+        let hcid = handoff_cid.trim();
+        if !hcid.is_empty() && !is_safe_id(hcid) {
+            return ActionOutcome::failed("invalid_conversation_id");
         }
         let Ok(_lock) = (self.storage.lock)(&self.path) else {
             return ActionOutcome::failed("lock_error");
@@ -955,11 +1025,11 @@ impl RelayGrantStore {
         let Ok(mut data) = self.load_checked() else {
             return ActionOutcome::failed("storage_error");
         };
-        let Some(rec) = data.grants.get_mut(grant_id) else {
+        let Some(rec) = data.grants.get_mut(gid) else {
             return ActionOutcome::failed("not_found");
         };
         rec.claimed = true;
-        rec.handoff_conversation_id = handoff_cid.trim().to_string();
+        rec.handoff_conversation_id = hcid.to_string();
         rec.handoff_at = now_sec();
         let saved_cid = rec.handoff_conversation_id.clone();
         if self.save(&data).is_err() {
@@ -968,45 +1038,55 @@ impl RelayGrantStore {
         ActionOutcome {
             ok: true,
             reason: None,
-            grant_id: Some(grant_id.to_string()),
+            grant_id: Some(gid.to_string()),
             handoff_conversation_id: Some(saved_cid),
         }
     }
 
     pub fn record_compact(&mut self, grant_id: &str, status: &str) -> ActionOutcome {
-        if grant_id.is_empty() {
+        let gid = grant_id.trim();
+        if gid.is_empty() {
             return ActionOutcome::failed("missing_grant_id");
         }
+        if !is_safe_id(gid) {
+            return ActionOutcome::failed("invalid_grant_id");
+        }
+        let Some(clean_status) = sanitize_compact_status(status) else {
+            return ActionOutcome::failed("invalid_status");
+        };
         let Ok(_lock) = (self.storage.lock)(&self.path) else {
             return ActionOutcome::failed("lock_error");
         };
         let Ok(mut data) = self.load_checked() else {
             return ActionOutcome::failed("storage_error");
         };
-        let Some(rec) = data.grants.get_mut(grant_id) else {
+        let Some(rec) = data.grants.get_mut(gid) else {
             return ActionOutcome::failed("not_found");
         };
         rec.claimed = true;
         if rec.claimed_at <= 0.0 {
             rec.claimed_at = now_sec();
         }
-        rec.compact_status = status.trim().to_string();
+        rec.compact_status = clean_status.clone();
         rec.compact_dispatched_at = now_sec();
-        let saved = rec.compact_status.clone();
         if self.save(&data).is_err() {
             return ActionOutcome::failed("storage_error");
         }
         ActionOutcome {
             ok: true,
-            reason: Some(saved),
-            grant_id: Some(grant_id.to_string()),
+            reason: Some(clean_status),
+            grant_id: Some(gid.to_string()),
             handoff_conversation_id: None,
         }
     }
 
     pub fn dismiss_grant(&mut self, grant_id: &str) -> ActionOutcome {
-        if grant_id.is_empty() {
+        let gid = grant_id.trim();
+        if gid.is_empty() {
             return ActionOutcome::failed("missing_grant_id");
+        }
+        if !is_safe_id(gid) {
+            return ActionOutcome::failed("invalid_grant_id");
         }
         let Ok(_lock) = (self.storage.lock)(&self.path) else {
             return ActionOutcome::failed("lock_error");
@@ -1014,7 +1094,7 @@ impl RelayGrantStore {
         let Ok(mut data) = self.load_checked() else {
             return ActionOutcome::failed("storage_error");
         };
-        let Some(rec) = data.grants.get_mut(grant_id) else {
+        let Some(rec) = data.grants.get_mut(gid) else {
             return ActionOutcome::failed("not_found");
         };
         rec.dismissed = true;
@@ -1024,7 +1104,7 @@ impl RelayGrantStore {
         ActionOutcome {
             ok: true,
             reason: None,
-            grant_id: Some(grant_id.to_string()),
+            grant_id: Some(gid.to_string()),
             handoff_conversation_id: None,
         }
     }

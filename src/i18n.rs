@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::process::Command;
 #[cfg(target_os = "macos")]
@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::settings::LANG_ENV;
+use crate::settings::{default_data_root, is_safe_id, LANG_ENV};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 pub enum Lang {
@@ -213,8 +213,109 @@ pub fn carbon_concurrency_warning_text(lang: Lang, active_carbon_count: usize) -
     }
 }
 
-/// Pure, zero-IO validation of an optional `scratch_note_path` to prevent path traversal
-/// or control-character injection into `/compact` and handoff prompts.
+fn normalize_macos_alias(p: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        for alias in ["/tmp", "/var"] {
+            if let Ok(rest) = p.strip_prefix(alias) {
+                return Path::new("/private").join(&alias[1..]).join(rest);
+            }
+        }
+    }
+    p.to_path_buf()
+}
+
+fn validate_brain_scratch_rel(
+    rel: &Path,
+    expected_cid: Option<&str>,
+    zh: bool,
+) -> Result<String, String> {
+    let mut comps = rel.components();
+    let Some(Component::Normal(b)) = comps.next() else {
+        return Err(if zh {
+            "scratch_note_path 必须位于 brain/<cid>/scratch/ 下".into()
+        } else {
+            "scratch_note_path must stay inside brain/<cid>/scratch/".into()
+        });
+    };
+    if b != "brain" {
+        return Err(if zh {
+            "scratch_note_path 必须位于 brain/<cid>/scratch/ 下".into()
+        } else {
+            "scratch_note_path must stay inside brain/<cid>/scratch/".into()
+        });
+    }
+    let Some(cid) = comps.next().and_then(|c| match c {
+        Component::Normal(s) => s.to_str(),
+        _ => None,
+    }) else {
+        return Err(if zh {
+            "scratch_note_path 缺少有效的会话目录".into()
+        } else {
+            "scratch_note_path is missing a valid conversation ID directory".into()
+        });
+    };
+    if !is_safe_id(cid) {
+        return Err(if zh {
+            "scratch_note_path 包含无效会话 ID".into()
+        } else {
+            "scratch_note_path contains an invalid conversation ID".into()
+        });
+    }
+    if let Some(ecid) = expected_cid.map(str::trim).filter(|s| !s.is_empty()) {
+        if cid != ecid {
+            return Err(if zh {
+                "scratch_note_path 必须属于当前会话的 scratch/ 目录".into()
+            } else {
+                "scratch_note_path must belong to the active conversation's scratch/ directory"
+                    .into()
+            });
+        }
+    }
+    let Some(Component::Normal(sc)) = comps.next() else {
+        return Err(if zh {
+            "scratch_note_path 必须位于 brain/<cid>/scratch/ 下".into()
+        } else {
+            "scratch_note_path must stay inside brain/<cid>/scratch/".into()
+        });
+    };
+    if sc != "scratch" {
+        return Err(if zh {
+            "scratch_note_path 必须位于 brain/<cid>/scratch/ 下".into()
+        } else {
+            "scratch_note_path must stay inside brain/<cid>/scratch/".into()
+        });
+    }
+    let rest: Vec<_> = comps.collect();
+    if rest.is_empty() || !rest.iter().all(|c| matches!(c, Component::Normal(_))) {
+        return Err(if zh {
+            "scratch_note_path 必须指向 scratch/ 下的有效文件".into()
+        } else {
+            "scratch_note_path must point to a valid file inside scratch/".into()
+        });
+    }
+    Ok(cid.to_string())
+}
+
+fn check_no_symlinks_under(base: &Path, rel: &Path, zh: bool) -> Result<(), String> {
+    let mut cur = base.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        if let Ok(meta) = fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                return Err(if zh {
+                    "scratch_note_path 禁止指向或经过符号链接".into()
+                } else {
+                    "scratch_note_path must not point to or traverse a symbolic link".into()
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Pure, zero-IO validation of an optional `scratch_note_path` to prevent path traversal,
+/// arbitrary filesystem references, or control-character injection into `/compact` and handoff prompts.
 pub fn sanitize_scratch_note_path_pure_for_lang(raw: &str, lang: Lang) -> Result<String, String> {
     let zh = lang.is_zh();
     let trimmed = raw.trim();
@@ -235,9 +336,24 @@ pub fn sanitize_scratch_note_path_pure_for_lang(raw: &str, lang: Lang) -> Result
             "scratch_note_path contains disallowed control characters".into()
         });
     }
+    if trimmed.contains('\\') {
+        return Err(if zh {
+            "scratch_note_path 禁止包含反斜杠 '\\'".into()
+        } else {
+            "scratch_note_path must not contain backslashes".into()
+        });
+    }
+    if trimmed == "~" || trimmed.starts_with("~/") {
+        return Err(if zh {
+            "scratch_note_path 必须位于 scratch/ 或 brain/<cid>/scratch/ 下".into()
+        } else {
+            "scratch_note_path must be under scratch/ or brain/<cid>/scratch/".into()
+        });
+    }
     let p = Path::new(trimmed);
-    for comp in p.components() {
-        if matches!(comp, std::path::Component::ParentDir) {
+    let comps: Vec<Component<'_>> = p.components().collect();
+    for comp in &comps {
+        if matches!(comp, Component::ParentDir | Component::Prefix(_)) {
             return Err(if zh {
                 "scratch_note_path 禁止包含路径穿越段 '..'".into()
             } else {
@@ -245,30 +361,121 @@ pub fn sanitize_scratch_note_path_pure_for_lang(raw: &str, lang: Lang) -> Result
             });
         }
     }
+
+    if !p.is_absolute() {
+        let valid_rel = comps.len() >= 2
+            && matches!(comps[0], Component::Normal(s) if s == "scratch")
+            && comps[1..].iter().all(|c| matches!(c, Component::Normal(_)));
+        if !valid_rel {
+            return Err(if zh {
+                "相对 scratch_note_path 必须位于 scratch/ 目录下".into()
+            } else {
+                "relative scratch_note_path must stay inside scratch/".into()
+            });
+        }
+        return Ok(trimmed.to_string());
+    }
+
+    // Absolute path must structurally end in .../brain/<safe_cid>/scratch/<file...>
+    let mut matched = false;
+    for i in 0..comps.len() {
+        if matches!(comps[i], Component::Normal(s) if s == "brain") && i + 3 < comps.len() {
+            let tail: PathBuf = comps[i..].iter().collect();
+            if validate_brain_scratch_rel(&tail, None, zh).is_ok() {
+                matched = true;
+                break;
+            }
+        }
+    }
+    if !matched {
+        return Err(if zh {
+            "绝对 scratch_note_path 必须位于 brain/<cid>/scratch/ 下".into()
+        } else {
+            "absolute scratch_note_path must be confined under brain/<cid>/scratch/".into()
+        });
+    }
     Ok(trimmed.to_string())
 }
 
-/// Validate and sanitize an optional `scratch_note_path` including local symlink rejection.
-pub fn sanitize_scratch_note_path(raw: &str) -> Result<String, String> {
-    sanitize_scratch_note_path_for_lang(raw, resolve_active_lang(""))
-}
-
-pub fn sanitize_scratch_note_path_for_lang(raw: &str, lang: Lang) -> Result<String, String> {
+/// Validate and sanitize an optional `scratch_note_path` strictly confined under
+/// `<data_root>/brain/<cid>/scratch/` (or relative `scratch/<file>`), rejecting symlinks.
+pub fn sanitize_scratch_note_path_in_root_for_lang(
+    raw: &str,
+    data_root: &Path,
+    expected_cid: Option<&str>,
+    lang: Lang,
+) -> Result<String, String> {
     let clean = sanitize_scratch_note_path_pure_for_lang(raw, lang)?;
     if clean.is_empty() {
         return Ok(clean);
     }
     let zh = lang.is_zh();
-    if let Ok(meta) = fs::symlink_metadata(Path::new(&clean)) {
-        if meta.file_type().is_symlink() {
+    let p = Path::new(&clean);
+
+    if !p.is_absolute() {
+        if let Some(ecid) = expected_cid.map(str::trim).filter(|s| !s.is_empty()) {
+            if is_safe_id(ecid) {
+                let rel_under_root = Path::new("brain").join(ecid).join(p);
+                check_no_symlinks_under(data_root, &rel_under_root, zh)?;
+            }
+        } else if let Ok(meta) = fs::symlink_metadata(p) {
+            if meta.file_type().is_symlink() {
+                return Err(if zh {
+                    "scratch_note_path 禁止指向符号链接".into()
+                } else {
+                    "scratch_note_path must not point to a symbolic link".into()
+                });
+            }
+        }
+        return Ok(clean);
+    }
+
+    let canon_root =
+        fs::canonicalize(data_root).unwrap_or_else(|_| normalize_macos_alias(data_root));
+    let norm_root = normalize_macos_alias(data_root);
+    let norm_p = normalize_macos_alias(p);
+
+    let (matched_base, rel) = if let Ok(r) = p.strip_prefix(data_root) {
+        (data_root.to_path_buf(), r.to_path_buf())
+    } else if let Ok(r) = norm_p.strip_prefix(&norm_root) {
+        (norm_root.clone(), r.to_path_buf())
+    } else if let Ok(r) = norm_p.strip_prefix(&canon_root) {
+        (canon_root.clone(), r.to_path_buf())
+    } else {
+        return Err(if zh {
+            "scratch_note_path 超出当前 data_root 的 brain/<cid>/scratch/ 范围".into()
+        } else {
+            "scratch_note_path is outside the allowed data_root/brain/<cid>/scratch/ directory"
+                .into()
+        });
+    };
+
+    let cid = validate_brain_scratch_rel(&rel, expected_cid, zh)?;
+    check_no_symlinks_under(&matched_base, &rel, zh)?;
+
+    // If the target or its scratch directory exists, verify canonical confinement too.
+    let expected_scratch = canon_root.join("brain").join(&cid).join("scratch");
+    if let Ok(canon_target) = fs::canonicalize(p) {
+        if !canon_target.starts_with(&expected_scratch) {
             return Err(if zh {
-                "scratch_note_path 禁止指向符号链接".into()
+                "scratch_note_path 规范化路径超出 scratch/ 目录".into()
             } else {
-                "scratch_note_path must not point to a symbolic link".into()
+                "canonical scratch_note_path escapes brain/<cid>/scratch/".into()
             });
         }
     }
+
     Ok(clean)
+}
+
+/// Validate and sanitize an optional `scratch_note_path` including local symlink rejection
+/// and confinement under the default `<data_root>/brain/<cid>/scratch/`.
+pub fn sanitize_scratch_note_path(raw: &str) -> Result<String, String> {
+    sanitize_scratch_note_path_for_lang(raw, resolve_active_lang(""))
+}
+
+pub fn sanitize_scratch_note_path_for_lang(raw: &str, lang: Lang) -> Result<String, String> {
+    sanitize_scratch_note_path_in_root_for_lang(raw, &default_data_root(), None, lang)
 }
 
 pub fn build_compact_command(preserve_points: &str, resume_task: &str) -> String {

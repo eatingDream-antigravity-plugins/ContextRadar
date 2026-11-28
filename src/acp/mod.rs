@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -32,10 +32,14 @@ use crate::i18n::{
     sanitize_scratch_note_path_pure_for_lang, Lang,
 };
 use crate::settings::{
-    expand_tilde, resolve_agy_bin, ACP_PROXY_ENV, AGY_AUTO_COMPACT_OVERRIDE_ENV,
+    expand_tilde, read_line_bounded, read_regular_file_bounded, resolve_agy_bin, BoundedLine,
+    ACP_PROXY_ENV, AGY_AUTO_COMPACT_OVERRIDE_ENV, MAX_CONFIG_BYTES, MAX_LINE_BYTES,
+    UNIX_O_NOFOLLOW, UNIX_O_NONBLOCK,
 };
 
 pub const DEFAULT_MAX_AUTO_COMPACTS: usize = 2;
+pub const MAX_COMPACT_COMMAND_BYTES: usize = 4096;
+const ACP_CHANNEL_BOUND: usize = 256;
 const CLIENT_NAME: &str = "context-radar-mcp";
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -174,16 +178,41 @@ pub fn prompt_starts_with_compact(params: &Value) -> bool {
     false
 }
 
-fn is_commit_handoff_tool_name(name: &str) -> bool {
+const CANONICAL_RADAR_SERVERS: &[&str] = &[
+    "context-radar-mcp",
+    "context-radar",
+    "context-radar-mcp_context-radar-mcp",
+    "context-radar_context-radar",
+    "context_radar_mcp",
+    "context_radar",
+];
+
+fn is_canonical_server_prefix(server: &str) -> bool {
+    let s = server.trim();
+    let stripped = s
+        .strip_prefix("mcp_")
+        .or_else(|| s.strip_prefix("mcp:"))
+        .or_else(|| s.strip_prefix("mcp/"))
+        .or_else(|| s.strip_prefix("mcp."))
+        .unwrap_or(s);
+    CANONICAL_RADAR_SERVERS.contains(&stripped)
+}
+
+pub fn is_commit_handoff_tool_name(name: &str) -> bool {
     let trimmed = name.trim();
-    ["radar_commit_handoff", "context_radar_commit_handoff"]
-        .iter()
-        .any(|target| {
-            trimmed == *target
-                || trimmed.ends_with(&format!("_{target}"))
-                || trimmed.ends_with(&format!(":{target}"))
-                || trimmed.ends_with(&format!("/{target}"))
-        })
+    for target in ["radar_commit_handoff", "context_radar_commit_handoff"] {
+        if trimmed == target {
+            return true;
+        }
+        if let Some(prefix) = trimmed.strip_suffix(target) {
+            if let Some(server_part) = prefix.strip_suffix(['_', ':', '/', '.']) {
+                if is_canonical_server_prefix(server_part) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn is_call_mcp_tool_wrapper(name: &str) -> bool {
@@ -229,6 +258,16 @@ fn extract_commit_handoff_args(name: &str, input: &Value) -> Option<Map<String, 
         if !is_commit_handoff_tool_name(target_tool) {
             return None;
         }
+        let server_name = wrapper
+            .get("ServerName")
+            .or_else(|| wrapper.get("server_name"))
+            .or_else(|| wrapper.get("serverName"))
+            .and_then(Value::as_str);
+        match server_name {
+            Some(srv) if !is_canonical_server_prefix(srv) => return None,
+            None if target_tool.trim() == "radar_commit_handoff" => return None,
+            _ => {}
+        }
         let inner = wrapper
             .get("Arguments")
             .or_else(|| wrapper.get("arguments"))
@@ -266,7 +305,41 @@ fn raw_output_is_blocked(upd: &Value) -> bool {
     false
 }
 
-fn extract_compact_command_from_output(upd: &Value) -> Option<String> {
+fn sanitize_single_line_compact_command(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > MAX_COMPACT_COMMAND_BYTES {
+        return None;
+    }
+    // Disallow multi-line prompt injection after `/compact`.
+    if trimmed.contains('\n') || trimmed.contains('\r') {
+        return None;
+    }
+    let mut clean = String::with_capacity(trimmed.len());
+    let mut prev_ws = false;
+    for ch in trimmed.chars() {
+        if ch == ' ' || ch == '\t' {
+            if !clean.is_empty() && !prev_ws {
+                clean.push(' ');
+                prev_ws = true;
+            }
+        } else if !ch.is_control() {
+            clean.push(ch);
+            prev_ws = false;
+        }
+    }
+    let clean = clean.trim();
+    if clean.is_empty() || clean.len() > MAX_COMPACT_COMMAND_BYTES {
+        return None;
+    }
+    let lower = clean.to_ascii_lowercase();
+    if lower == "/compact" || lower.starts_with("/compact ") {
+        Some(clean.to_string())
+    } else {
+        None
+    }
+}
+
+pub fn extract_compact_command_from_output(upd: &Value) -> Option<String> {
     let raw_out = upd.get("rawOutput")?;
     let obj = value_as_json_object(raw_out)?;
     let cmd = obj
@@ -274,21 +347,8 @@ fn extract_compact_command_from_output(upd: &Value) -> Option<String> {
         .and_then(Value::as_object)
         .and_then(|sc| sc.get("compact_command"))
         .or_else(|| obj.get("compact_command"))
-        .and_then(Value::as_str)?
-        .trim();
-    if cmd.is_empty() {
-        return None;
-    }
-    let lower = cmd.to_ascii_lowercase();
-    if lower == "/compact"
-        || lower.starts_with("/compact ")
-        || lower.starts_with("/compact\t")
-        || lower.starts_with("/compact\n")
-    {
-        Some(cmd.to_string())
-    } else {
-        None
-    }
+        .and_then(Value::as_str)?;
+    sanitize_single_line_compact_command(cmd)
 }
 
 impl ProxyCoordinator {
@@ -512,12 +572,22 @@ impl ProxyCoordinator {
                         .unwrap_or("");
                     let note = sanitize_scratch_note_path_pure_for_lang(raw_note, self.lang)
                         .unwrap_or_default();
-                    build_compact_command_with_note_for_lang(
+                    let built = build_compact_command_with_note_for_lang(
                         preserve_points,
                         resume_task,
                         &note,
                         self.lang,
-                    )
+                    );
+                    let capped = if built.len() <= MAX_COMPACT_COMMAND_BYTES {
+                        built
+                    } else {
+                        let mut end = MAX_COMPACT_COMMAND_BYTES;
+                        while end > 0 && !built.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        built[..end].to_string()
+                    };
+                    sanitize_single_line_compact_command(&capped).unwrap_or_default()
                 });
                 if !command.trim().is_empty() {
                     st.pending_compact = Some(PendingCompact {
@@ -814,9 +884,23 @@ pub fn append_proxy_log_line(path: &Path, line: &str) -> io::Result<()> {
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600)
-            .custom_flags(crate::settings::UNIX_O_NOFOLLOW);
+            .custom_flags(UNIX_O_NOFOLLOW | UNIX_O_NONBLOCK);
     }
     let mut f = opts.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = f.metadata()?;
+        if !meta.file_type().is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "proxy log path is not a regular file",
+            ));
+        }
+        if (meta.permissions().mode() & 0o777) != 0o600 {
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
     writeln!(f, "{line}")
 }
 
@@ -830,6 +914,20 @@ enum ProxyEvent {
     ClientEof,
     AgentMsg(Value),
     AgentEof,
+}
+
+fn spawn_stderr_forwarder(mut reader: std::process::ChildStderr) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        while let Ok(n) = reader.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let mut err_out = io::stderr().lock();
+            let _ = err_out.write_all(&buf[..n]);
+            let _ = err_out.flush();
+        }
+    })
 }
 
 /// Run transparent official ACP v1 pure-protocol proxy over stdio.
@@ -848,35 +946,38 @@ pub fn run_acp_proxy(cfg: AcpProxyConfig) -> io::Result<i32> {
         .take()
         .ok_or_else(|| io::Error::other("failed to open agy acp stderr"))?;
 
-    // Pump child stderr directly to proxy stderr.
-    let stderr_handle = thread::spawn(move || {
-        let mut reader = BufReader::new(child_stderr);
-        let mut err_out = io::stderr().lock();
-        let mut buf = String::new();
-        while let Ok(n) = reader.read_line(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            let _ = err_out.write_all(buf.as_bytes());
-            let _ = err_out.flush();
-            buf.clear();
-        }
-    });
+    // Pump child stderr directly to proxy stderr using fixed-size chunks without holding stderr lock across reads.
+    let stderr_handle = spawn_stderr_forwarder(child_stderr);
 
-    let (tx, rx) = mpsc::channel::<ProxyEvent>();
+    let (tx, rx) = mpsc::sync_channel::<ProxyEvent>(ACP_CHANNEL_BOUND);
     let tx_client = tx.clone();
     thread::spawn(move || {
         let stdin = io::stdin();
-        let reader = BufReader::new(stdin.lock());
-        for line in reader.lines() {
-            let Ok(raw) = line else { break };
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                if tx_client.send(ProxyEvent::ClientMsg(val)).is_err() {
-                    break;
+        let mut reader = BufReader::new(stdin.lock());
+        let mut raw = Vec::with_capacity(4096);
+        loop {
+            match read_line_bounded(&mut reader, &mut raw, MAX_LINE_BYTES) {
+                Ok(BoundedLine::Eof) | Err(_) => break,
+                Ok(BoundedLine::Oversized(_)) => {
+                    eprintln!(
+                        "[{CLIENT_NAME} acp] dropped oversized client JSON-RPC line (>16 MiB)"
+                    );
+                    raw.clear();
+                    raw.shrink_to(4096);
+                }
+                Ok(BoundedLine::Line(_)) => {
+                    let Ok(s) = std::str::from_utf8(&raw) else {
+                        continue;
+                    };
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                        if tx_client.send(ProxyEvent::ClientMsg(val)).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -885,16 +986,31 @@ pub fn run_acp_proxy(cfg: AcpProxyConfig) -> io::Result<i32> {
 
     let tx_agent = tx;
     thread::spawn(move || {
-        let reader = BufReader::new(child_stdout);
-        for line in reader.lines() {
-            let Ok(raw) = line else { break };
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                if tx_agent.send(ProxyEvent::AgentMsg(val)).is_err() {
-                    break;
+        let mut reader = BufReader::new(child_stdout);
+        let mut raw = Vec::with_capacity(4096);
+        loop {
+            match read_line_bounded(&mut reader, &mut raw, MAX_LINE_BYTES) {
+                Ok(BoundedLine::Eof) | Err(_) => break,
+                Ok(BoundedLine::Oversized(_)) => {
+                    eprintln!(
+                        "[{CLIENT_NAME} acp] dropped oversized agent JSON-RPC line (>16 MiB)"
+                    );
+                    raw.clear();
+                    raw.shrink_to(4096);
+                }
+                Ok(BoundedLine::Line(_)) => {
+                    let Ok(s) = std::str::from_utf8(&raw) else {
+                        continue;
+                    };
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() {
+                        continue;
+                    }
+                    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+                        if tx_agent.send(ProxyEvent::AgentMsg(val)).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -1021,17 +1137,7 @@ pub fn run_acp_headless(mut cfg: AcpRunConfig) -> io::Result<AcpRunReport> {
         .take()
         .ok_or_else(|| io::Error::other("failed to open agy acp stderr"))?;
 
-    let stderr_handle = thread::spawn(move || {
-        let mut reader = BufReader::new(child_stderr);
-        let mut buf = String::new();
-        while let Ok(n) = reader.read_line(&mut buf) {
-            if n == 0 {
-                break;
-            }
-            eprint!("{buf}");
-            buf.clear();
-        }
-    });
+    let stderr_handle = spawn_stderr_forwarder(child_stderr);
 
     let mut reader = BufReader::new(child_stdout);
     let mut next_id: u64 = 1;
@@ -1055,16 +1161,28 @@ pub fn run_acp_headless(mut cfg: AcpRunConfig) -> io::Result<AcpRunReport> {
                            stream_text: bool|
      -> io::Result<Value> {
         let target_key = id_key(&json!(target_id)).unwrap();
-        let mut line = String::new();
+        let mut raw_line = Vec::with_capacity(4096);
         loop {
-            line.clear();
-            let n = reader.read_line(&mut line)?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "agy acp closed stdout before replying",
-                ));
+            match read_line_bounded(&mut reader, &mut raw_line, MAX_LINE_BYTES)? {
+                BoundedLine::Eof => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "agy acp closed stdout before replying",
+                    ));
+                }
+                BoundedLine::Oversized(_) => {
+                    eprintln!(
+                        "[{CLIENT_NAME} acp] dropped oversized agent JSON-RPC line (>16 MiB)"
+                    );
+                    raw_line.clear();
+                    raw_line.shrink_to(4096);
+                    continue;
+                }
+                BoundedLine::Line(_) => {}
             }
+            let Ok(line) = std::str::from_utf8(&raw_line) else {
+                continue;
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -1404,10 +1522,25 @@ Options:\n  \
     run_acp_proxy(cfg)
 }
 
+fn read_prompt_from_stdin() -> io::Result<String> {
+    let mut out = String::new();
+    io::stdin()
+        .take((MAX_CONFIG_BYTES + 1) as u64)
+        .read_to_string(&mut out)?;
+    if out.len() > MAX_CONFIG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "prompt from stdin exceeds 4 MiB limit",
+        ));
+    }
+    Ok(out)
+}
+
 pub fn parse_and_run_acp_headless(args: &[String]) -> io::Result<i32> {
     let mut agy_bin: Option<String> = None;
     let mut cwd: Option<PathBuf> = None;
-    let mut prompt = String::new();
+    let mut prompt_arg: Option<String> = None;
+    let mut prompt_file: Option<String> = None;
     let mut session_id: Option<String> = None;
     let mut model: Option<String> = None;
     let mut mode: Option<String> = None;
@@ -1434,13 +1567,22 @@ pub fn parse_and_run_acp_headless(args: &[String]) -> io::Result<i32> {
             i += 1;
             continue;
         }
+        if let Some(val) = a.strip_prefix("--prompt-file=") {
+            prompt_file = Some(val.to_string());
+            i += 1;
+            continue;
+        }
         if is_compat_noop_flag_eq(a) {
             i += 1;
             continue;
         }
         match a {
             "-p" | "--prompt" if i + 1 < args.len() => {
-                prompt = args[i + 1].clone();
+                prompt_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--prompt-file" if i + 1 < args.len() => {
+                prompt_file = Some(args[i + 1].clone());
                 i += 2;
             }
             "--cwd" if i + 1 < args.len() => {
@@ -1500,9 +1642,10 @@ pub fn parse_and_run_acp_headless(args: &[String]) -> io::Result<i32> {
             }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: context-radar-mcp acp-run --prompt <text> [options] [-- <agy acp flags...>]\n\
+                    "Usage: context-radar-mcp acp-run (--prompt <text|-> | --prompt-file <path|->) [options] [-- <agy acp flags...>]\n\
 Options:\n  \
--p, --prompt <text>                 Prompt to send over official ACP v1\n  \
+-p, --prompt <text|->               Prompt to send over official ACP v1 ('-' reads stdin)\n  \
+--prompt-file <path|->              Read prompt from regular file or '-' for stdin (avoids argv exposure)\n  \
 --cwd <dir>                         Workspace directory (default: current dir)\n  \
 --session-id <id>                   Resume an existing ACP session via session/resume\n  \
 --model <slug>                      Optional model ID via session/set_model\n  \
@@ -1524,10 +1667,34 @@ Options:\n  \
         }
     }
 
+    let prompt = match (prompt_arg, prompt_file) {
+        (Some(_), Some(_)) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "specify only one of --prompt or --prompt-file",
+            ));
+        }
+        (Some(p), None) => {
+            if p == "-" {
+                read_prompt_from_stdin()?
+            } else {
+                p
+            }
+        }
+        (None, Some(pf)) => {
+            if pf == "-" {
+                read_prompt_from_stdin()?
+            } else {
+                read_regular_file_bounded(&PathBuf::from(expand_tilde(&pf)), MAX_CONFIG_BYTES)?
+            }
+        }
+        (None, None) => String::new(),
+    };
+
     if prompt.trim().is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "acp-run requires --prompt <text>",
+            "acp-run requires --prompt <text|-> or --prompt-file <path|->",
         ));
     }
 

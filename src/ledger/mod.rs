@@ -213,13 +213,5 @@ impl SummaryRecord {
 }
 
 pub fn is_safe_id(cid: &str) -> bool {
-    let b = cid.as_bytes();
-    if b.is_empty() || b.len() > 128 {
-        return false;
-    }
-    if b[0] == b'.' || cid.contains("..") {
-        return false;
-    }
-    b.iter()
-        .all(|&c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-')
+    crate::settings::is_safe_id(cid)
 }
