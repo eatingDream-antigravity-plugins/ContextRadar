@@ -120,6 +120,46 @@ pub(crate) enum BoundedLine {
     Oversized(usize),
 }
 
+/// Read one `\n`-terminated line up to `max_bytes`, also reporting whether a terminating `\n`
+/// was encountered (`true`) or EOF was reached before `\n` (`false`). If a line exceeds
+/// `max_bytes`, drains the remainder up to the next `\n` (or EOF) without buffering it in memory.
+pub(crate) fn read_line_bounded_with_term<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<(BoundedLine, bool)> {
+    buf.clear();
+    let n = reader
+        .by_ref()
+        .take((max_bytes + 1) as u64)
+        .read_until(b'\n', buf)?;
+    if n == 0 {
+        return Ok((BoundedLine::Eof, false));
+    }
+    if n <= max_bytes {
+        return Ok((BoundedLine::Line(n), buf.ends_with(b"\n")));
+    }
+    if buf.ends_with(b"\n") {
+        return Ok((BoundedLine::Oversized(n), true));
+    }
+    let mut total = n;
+    loop {
+        let chunk = reader.fill_buf()?;
+        if chunk.is_empty() {
+            return Ok((BoundedLine::Oversized(total), false));
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            let consume = pos + 1;
+            total = total.saturating_add(consume);
+            reader.consume(consume);
+            return Ok((BoundedLine::Oversized(total), true));
+        }
+        let len = chunk.len();
+        total = total.saturating_add(len);
+        reader.consume(len);
+    }
+}
+
 /// Read one `\n`-terminated line up to `max_bytes`. If a line exceeds `max_bytes`, drains the
 /// remainder up to the next `\n` (or EOF) without buffering it in memory.
 pub(crate) fn read_line_bounded<R: BufRead>(
@@ -127,36 +167,7 @@ pub(crate) fn read_line_bounded<R: BufRead>(
     buf: &mut Vec<u8>,
     max_bytes: usize,
 ) -> io::Result<BoundedLine> {
-    buf.clear();
-    let n = reader
-        .by_ref()
-        .take((max_bytes + 1) as u64)
-        .read_until(b'\n', buf)?;
-    if n == 0 {
-        return Ok(BoundedLine::Eof);
-    }
-    if n <= max_bytes {
-        return Ok(BoundedLine::Line(n));
-    }
-    let mut total = n;
-    if !buf.ends_with(b"\n") {
-        loop {
-            let chunk = reader.fill_buf()?;
-            if chunk.is_empty() {
-                break;
-            }
-            if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
-                let consume = pos + 1;
-                total = total.saturating_add(consume);
-                reader.consume(consume);
-                break;
-            }
-            let len = chunk.len();
-            total = total.saturating_add(len);
-            reader.consume(len);
-        }
-    }
-    Ok(BoundedLine::Oversized(total))
+    read_line_bounded_with_term(reader, buf, max_bytes).map(|(line, _)| line)
 }
 
 pub(crate) fn validate_pref_lang(raw: &str) -> Result<Option<&'static str>, String> {

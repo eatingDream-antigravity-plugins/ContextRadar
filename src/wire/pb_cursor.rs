@@ -39,11 +39,12 @@ impl<'a> PbCursor<'a> {
     #[inline]
     pub fn read_varint(&mut self) -> Option<u64> {
         let len = self.buf.len();
-        if self.pos >= len {
+        let start = self.pos;
+        if start >= len {
             return None;
         }
-        let b0 = self.buf[self.pos];
-        self.pos += 1;
+        let b0 = self.buf[start];
+        self.pos = start + 1;
         if b0 < 0x80 {
             return Some(b0 as u64);
         }
@@ -52,7 +53,8 @@ impl<'a> PbCursor<'a> {
         while self.pos < len {
             let b = self.buf[self.pos];
             self.pos += 1;
-            if shift >= 64 {
+            if shift >= 64 || (shift == 63 && b > 0x01) {
+                self.pos = start;
                 return None;
             }
             val |= ((b & 0x7F) as u64) << shift;
@@ -61,42 +63,45 @@ impl<'a> PbCursor<'a> {
             }
             shift += 7;
         }
+        self.pos = start;
         None
     }
 
     #[inline]
     pub fn skip_varint(&mut self) -> bool {
-        let len = self.buf.len();
-        let mut count = 0usize;
-        while self.pos < len {
-            let b = self.buf[self.pos];
-            self.pos += 1;
-            if b < 0x80 {
-                return true;
-            }
-            count += 1;
-            if count >= 10 {
-                return false;
-            }
-        }
-        false
+        self.read_varint().is_some()
     }
 
     #[inline]
     pub fn read_tag(&mut self) -> Option<(u32, u8)> {
+        let start = self.pos;
         let tag = self.read_varint()?;
-        let field_num = (tag >> 3) as u32;
-        if field_num == 0 {
+        let wtype = (tag & 0x07) as u8;
+        let Ok(field_num) = u32::try_from(tag >> 3) else {
+            self.pos = start;
+            return None;
+        };
+        if field_num == 0 || matches!(wtype, 3 | 4 | 6 | 7) {
+            self.pos = start;
             return None;
         }
-        Some((field_num, (tag & 0x07) as u8))
+        Some((field_num, wtype))
     }
 
     #[inline]
     pub fn read_bytes(&mut self) -> Option<&'a [u8]> {
-        let ln = self.read_varint()? as usize;
-        let end = self.pos.checked_add(ln)?;
+        let start = self.pos;
+        let raw_ln = self.read_varint()?;
+        let Ok(ln) = usize::try_from(raw_ln) else {
+            self.pos = start;
+            return None;
+        };
+        let Some(end) = self.pos.checked_add(ln) else {
+            self.pos = start;
+            return None;
+        };
         if end > self.buf.len() {
+            self.pos = start;
             return None;
         }
         let slice = &self.buf[self.pos..end];
@@ -132,31 +137,37 @@ impl<'a> PbCursor<'a> {
     }
 }
 
-/// Decode `google.protobuf.Timestamp` directly from a borrowed slice.
 #[inline]
-pub fn decode_timestamp(buf: &[u8]) -> f64 {
+fn decode_timestamp_checked(buf: &[u8]) -> Option<f64> {
     let mut cur = PbCursor::new(buf);
     let mut sec: u64 = 0;
     let mut nanos: u64 = 0;
     while !cur.is_eof() {
-        let Some((fnum, wtype)) = cur.read_tag() else {
-            break;
-        };
+        let (fnum, wtype) = cur.read_tag()?;
         if wtype == 0 {
-            let Some(v) = cur.read_varint() else { break };
+            let v = cur.read_varint()?;
             if fnum == 1 {
                 sec = v;
             } else if fnum == 2 {
                 nanos = v;
             }
         } else if !cur.skip_field(wtype) {
-            break;
+            return None;
         }
     }
-    if sec == 0 || sec > (1u64 << 40) || nanos >= 1_000_000_000 {
-        return 0.0;
+    if sec == 0 {
+        return if nanos == 0 { Some(0.0) } else { None };
     }
-    (sec as f64) + (nanos as f64) * 1e-9
+    if sec > (1u64 << 40) || nanos >= 1_000_000_000 {
+        return None;
+    }
+    Some((sec as f64) + (nanos as f64) * 1e-9)
+}
+
+/// Decode `google.protobuf.Timestamp` directly from a borrowed slice.
+#[inline]
+pub fn decode_timestamp(buf: &[u8]) -> f64 {
+    decode_timestamp_checked(buf).unwrap_or(0.0)
 }
 
 /// Extract `(canonical_model_id, display_name)` from `gen_metadata.data` with immediate early-exit.
@@ -168,18 +179,22 @@ pub fn extract_gen_model(buf: &[u8]) -> (String, String) {
     let mut outer = PbCursor::new(buf);
     while !outer.is_eof() {
         let Some((fnum, wtype)) = outer.read_tag() else {
-            break;
+            return (String::new(), String::new());
         };
         if wtype == 2 {
-            let Some(sub) = outer.read_bytes() else { break };
+            let Some(sub) = outer.read_bytes() else {
+                return (String::new(), String::new());
+            };
             if fnum == 1 && !sub.is_empty() {
                 let mut inner = PbCursor::new(sub);
                 while !inner.is_eof() {
                     let Some((fn2, wt2)) = inner.read_tag() else {
-                        break;
+                        return (String::new(), String::new());
                     };
                     if wt2 == 2 {
-                        let Some(val) = inner.read_bytes() else { break };
+                        let Some(val) = inner.read_bytes() else {
+                            return (String::new(), String::new());
+                        };
                         if val.len() <= 200 {
                             match fn2 {
                                 19 if f19.is_none() => {
@@ -210,7 +225,7 @@ pub fn extract_gen_model(buf: &[u8]) -> (String, String) {
                             }
                         }
                     } else if !inner.skip_field(wt2) {
-                        break;
+                        return (String::new(), String::new());
                     }
                 }
                 if let (Some(a), Some(b)) = (f19, f21) {
@@ -221,7 +236,7 @@ pub fn extract_gen_model(buf: &[u8]) -> (String, String) {
                 }
             }
         } else if !outer.skip_field(wtype) {
-            break;
+            return (String::new(), String::new());
         }
     }
 
@@ -281,30 +296,26 @@ pub fn decode_step_metadata(buf: &[u8]) -> Option<StepMetaDecoded> {
 
     let mut cur = PbCursor::new(buf);
     while !cur.is_eof() {
-        let Some((fnum, wtype)) = cur.read_tag() else {
-            break;
-        };
+        let (fnum, wtype) = cur.read_tag()?;
         if wtype == 2 {
-            let Some(sub) = cur.read_bytes() else { break };
+            let sub = cur.read_bytes()?;
             if !sub.is_empty() {
                 match fnum {
-                    1 => start_ts = decode_timestamp(sub),
-                    6 => first_ts = decode_timestamp(sub),
-                    7 => end_ts = decode_timestamp(sub),
+                    1 => start_ts = decode_timestamp_checked(sub)?,
+                    6 => first_ts = decode_timestamp_checked(sub)?,
+                    7 => end_ts = decode_timestamp_checked(sub)?,
                     9 => usage_slice = Some(sub),
                     20 => {
                         let mut inner = PbCursor::new(sub);
                         while !inner.is_eof() {
-                            let Some((fn2, wt2)) = inner.read_tag() else {
-                                break;
-                            };
+                            let (fn2, wt2) = inner.read_tag()?;
                             if wt2 == 0 {
-                                let Some(v2) = inner.read_varint() else { break };
+                                let v2 = inner.read_varint()?;
                                 if fn2 == 3 {
                                     gen_idx = v2 as i64;
                                 }
                             } else if !inner.skip_field(wt2) {
-                                break;
+                                return None;
                             }
                         }
                     }
@@ -312,7 +323,7 @@ pub fn decode_step_metadata(buf: &[u8]) -> Option<StepMetaDecoded> {
                 }
             }
         } else if !cur.skip_field(wtype) {
-            break;
+            return None;
         }
     }
 
@@ -331,12 +342,10 @@ pub fn decode_step_metadata(buf: &[u8]) -> Option<StepMetaDecoded> {
 
     let mut ucur = PbCursor::new(usage_buf);
     while !ucur.is_eof() {
-        let Some((fnum, wtype)) = ucur.read_tag() else {
-            break;
-        };
+        let (fnum, wtype) = ucur.read_tag()?;
         match wtype {
             0 => {
-                let Some(val) = ucur.read_varint() else { break };
+                let val = ucur.read_varint()?;
                 match fnum {
                     2 => in_tok = val,
                     3 => out_tok = val,
@@ -348,14 +357,14 @@ pub fn decode_step_metadata(buf: &[u8]) -> Option<StepMetaDecoded> {
                 }
             }
             2 => {
-                let Some(val) = ucur.read_bytes() else { break };
+                let val = ucur.read_bytes()?;
                 if fnum == 11 {
                     resp_bytes = val;
                 }
             }
             _ => {
                 if !ucur.skip_field(wtype) {
-                    break;
+                    return None;
                 }
             }
         }
@@ -639,4 +648,97 @@ pub fn extract_error_summary(error_details: &[u8]) -> String {
         }
     }
     String::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enc_varint(mut v: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let b = (v & 0x7F) as u8;
+            v >>= 7;
+            if v > 0 {
+                out.push(b | 0x80);
+            } else {
+                out.push(b);
+                return out;
+            }
+        }
+    }
+
+    fn pb_v(field: u32, v: u64) -> Vec<u8> {
+        let mut out = enc_varint((field as u64) << 3);
+        out.extend_from_slice(&enc_varint(v));
+        out
+    }
+
+    fn pb_b(field: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = enc_varint(((field as u64) << 3) | 2);
+        out.extend_from_slice(&enc_varint(data.len() as u64));
+        out.extend_from_slice(data);
+        out
+    }
+
+    #[test]
+    fn pb_cursor_rolls_back_and_rejects_truncated_eof_wire_tails() {
+        // Truncated multi-byte varint at EOF must roll pos back so is_eof() remains false
+        let mut cur = PbCursor::new(&[0x80, 0x81]);
+        assert_eq!(cur.read_varint(), None);
+        assert!(!cur.is_eof());
+
+        // 10th byte overflow (> 0x01 on byte index 9) must be rejected
+        let mut overflow_varint = [0x80u8; 10];
+        overflow_varint[9] = 0x02;
+        let mut cur_ov = PbCursor::new(&overflow_varint);
+        assert_eq!(cur_ov.read_varint(), None);
+        assert!(!cur_ov.is_eof());
+
+        // Max u64::MAX varint (9 bytes of 0xFF + 10th byte 0x01) succeeds
+        let mut max_varint = [0xFFu8; 10];
+        max_varint[9] = 0x01;
+        let mut cur_max = PbCursor::new(&max_varint);
+        assert_eq!(cur_max.read_varint(), Some(u64::MAX));
+        assert!(cur_max.is_eof());
+
+        // Truncated Timestamp nanos varint at EOF must reject instead of returning partial sec
+        let mut trunc_ts = pb_v(1, 1_750_000_000);
+        trunc_ts.extend_from_slice(&[0x10, 0x80]); // field 2 varint truncated at EOF
+        assert_eq!(decode_timestamp(&trunc_ts), 0.0);
+
+        // Truncated usage submessage at EOF (e.g. input_tokens read, cache_read varint cut off)
+        // must return None rather than fabricating a false cache_read=0 cold-cache turn!
+        let mut trunc_usage = pb_v(2, 12_000);
+        trunc_usage.extend_from_slice(&pb_v(3, 500));
+        let full_cr = pb_v(5, 180_000);
+        trunc_usage.extend_from_slice(&full_cr[..full_cr.len() - 1]); // drop final varint byte
+
+        let mut meta = pb_b(1, &pb_v(1, 1_750_000_000));
+        meta.extend_from_slice(&pb_b(9, &trunc_usage));
+        assert!(decode_step_metadata(&meta).is_none());
+
+        // Complete usage decodes cleanly, while trailing truncated field on outer metadata rejects
+        let mut ok_usage = pb_v(2, 12_000);
+        ok_usage.extend_from_slice(&pb_v(3, 500));
+        ok_usage.extend_from_slice(&full_cr);
+        let mut ok_meta = pb_b(1, &pb_v(1, 1_750_000_000));
+        ok_meta.extend_from_slice(&pb_b(9, &ok_usage));
+        let decoded = decode_step_metadata(&ok_meta).unwrap();
+        assert_eq!(decoded.input, 12_000);
+        assert_eq!(decoded.cache_read, 180_000);
+
+        let mut outer_trunc = ok_meta.clone();
+        outer_trunc.extend_from_slice(&[0xA2, 0x01, 0x08, 0x01]); // field 20 claims 8 bytes, only 1 left
+        assert!(decode_step_metadata(&outer_trunc).is_none());
+
+        // extract_gen_model rejects truncated f21 tail when f19 alone was seen
+        let mut inner_gen = pb_b(19, b"gemini-4-carbon-high");
+        inner_gen.extend_from_slice(&[0xAA, 0x01, 0x10, b'G']); // truncated f21
+        let outer_gen = pb_b(1, &inner_gen);
+        assert_eq!(
+            extract_gen_model(&outer_gen),
+            (String::new(), String::new())
+        );
+    }
 }
