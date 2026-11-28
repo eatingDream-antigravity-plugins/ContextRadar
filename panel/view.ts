@@ -334,7 +334,7 @@ Used|已用
 ✓ New chat opened|✓ 已开新会话
 ✓ /compact sent|✓ 已发送 /compact
 Ready to compact|可以压缩了
-Ready for a new chat|可以换新会话了
+Ready for a new chat|可开启新会话
 Error|出错
 Refresh|刷新
 Dismiss|关闭
@@ -496,10 +496,10 @@ const mkDetails = (raw: string): HTMLDetailsElement => h("details", "edet", 0, h
 const ERRS: Array<[RegExp, string]> = [
   [/^(Closed|Not con)/i, "Lost connection to Antigravity.|与 Antigravity 的连接已断开。"],
   [/^(Timeout:|ui\/|tools\/)/i, "Antigravity didn't respond. Try again.|Antigravity 没有响应，请重试。"],
-  [/^(Bad |Unsup|Parent |Init:)/i, "Couldn't start the panel. Reopen it.|面板没能启动，请重新打开。"],
+  [/^(Bad |Unsup|Parent |Init:)/i, "Couldn't start the panel. Reopen it.|面板启动失败，请重新打开。"],
   [/^No (server|tool)/i, "This panel can't run actions here.|当前环境不支持面板操作。"],
 ];
-const errTxt = (raw: unknown): string => tr(ERRS.find(([r]) => r.test(S(raw || "").trim()))?.[1] || "Something went wrong. Try again.|出了点问题，请重试。");
+const errTxt = (raw: unknown): string => tr(ERRS.find(([r]) => r.test(S(raw || "").trim()))?.[1] || "Something went wrong. Try again.|操作失败，请重试。");
 
 const buildSubTray = (it: SessionItem): HTMLDivElement | null => {
   const cid = it.id, tab = openTrays.get(cid), msg = (s: string): HTMLDivElement => dv("bx", dv("t2", s));
@@ -566,7 +566,7 @@ const patchDetailBlock = (d: DetailBlock, it: SessionItem, showId: boolean, isHe
   const c = getCold(it), cN = num(it.cold_cache_count), mid = c.m > 0 && (c.s || c.r || c.w) ? `(${c.s}/${c.r}/${c.w})` : "";
   const pW = (i: number, lb: string, v1: string, v2: string, cl0: string | 0, tp = ""): void => { const [el, l, a, b] = ws[i]; setTxt(l, lb); setTxt(a, v1); setTxt(b, v2); setCls(b, cl0 || "m s t2 e"); if (tp || el.title) el.title = tp; };
   pW(0, L(28), `${ck} · ${cpct}%`, `${tr("Peak|峰值")} ${fmtK(it.peak_context_tokens || ctx)}`, 0);
-  pW(1, tr("Cache|缓存"), `${cf}%`, cN ? `${cN}${tr(" miss| 次未命中")}${!isZh() && cN !== 1 ? "es" : ""}` : "0", `m s e${cN && c.m > 0 ? " er tc" : " t2"}`, cN ? `${c.t}/${c.m}${mid}/${c.p}` : "");
+  pW(1, tr("KV Cache|KV Cache"), `${cf}%`, cN ? `${cN}${tr(" miss| 次缓存失配")}${!isZh() && cN !== 1 ? "es" : ""}` : "0", `m s e${cN && c.m > 0 ? " er tc" : " t2"}`, cN ? `${c.t}/${c.m}${mid}/${c.p}` : "");
   pW(2, tr("Speed & Cost|速度与费用"), `TTFT ${fmtMs(ttft)} · ${spd}`, cost, 0, jDot(stps > 0 && etps > 0 ? `${tr("Output|输出")} ${s0} · ${tr("Overall|整体")} ${e0} tok/s` : "", ckc ? `C×${ckc}` : ""));
 
   const thk = num(it.total_thinking_tokens), outT = thk + num(it.total_response_tokens), ls = num(it.last_loop_steps), tp = rd(num(it.thinking_share_pct ?? (outT > 0 ? (thk / outT) * 100 : 0)));
@@ -680,8 +680,8 @@ const patchSettingsDrawer = (): void => {
     dv("jb", sp("wm", L(31)), bt("ib", "cfg", "×", "", al(L(21)))),
     serr ? dv("bnr wn wr", tr("settings.json has an error. Using your last good settings.|配置文件有误，暂时沿用上次的有效设置。")) : null,
     dv("sgr", ...sels.map(([k, l, o, c]) => fd(l, mkSel(k, o, c))),
-      fd("FX rate (1 USD)|汇率（1 美元）", numI(K_FX, u[K_FX] || 7.2, .01, .01, 1e3)),
-      fd("Suggest /compact (K)|建议压缩阈值（万）", numI(K_CTH, rd((u[K_CTH] || 36e4) / (z ? 1e4 : 1e3)), z ? 1 : 10, z ? 10 : 100, z ? 200 : 2e3))),
+      fd("FX rate (1 USD)|汇率（1 USD）", numI(K_FX, u[K_FX] || 7.2, .01, .01, 1e3)),
+      fd("Suggest /compact (K Tokens)|建议 /compact 阈值（万 Token）", numI(K_CTH, rd((u[K_CTH] || 36e4) / (z ? 1e4 : 1e3)), z ? 1 : 10, z ? 10 : 100, z ? 200 : 2e3))),
     h("label", "r", 0, h("input", "", { "data-s": K_AAH, type: "checkbox", ...((u[K_AAH] ?? allowAutoHandoff) ? { checked: 1 } : {}) }), sp("b", L(6)), sp("s t3", L(7))),
     dv("jb bt0 w", spath ? bt("id", "csp", spath, spath, { title: spath }) : sp(""), mkB("p", "svs", L(settingsSaving ? 33 : 32), "", { disabled: settingsSaving || !canCallTools })),
   ]);
@@ -727,7 +727,7 @@ const patchHeroSlot = (hero: SessionItem | null, heroSubs: SessionItem[] = [], c
   hd(he, 0); ar(he, "label", tr("Current session|当前会话")); setCls(he, `cd hero${lvlCls(lvl)}`);
   setCls(hDt, `dt ${getLiveDot(hero)}`); patchBdg(hPh, pb?.cls || "", pb?.text || ""); setTxt(hTt, hero.title); hTt.title = `${hero.title} (${cid})`;
   patchBdg(hMd, "t3", hero.model_short || hero.model_display);
-  patchBdg(hCw, "wn", showCw ? (isZh() ? `并行 ${cwN}` : `${cwN} in parallel`) : "", showCw ? tr("Running more than 2 large agents at once slows them all down.|同时跑超过 2 个大模型代理会互相拖慢。") : "");
+  patchBdg(hCw, "wn", showCw ? (isZh() ? `并行 ${cwN}` : `${cwN} in parallel`) : "", showCw ? tr("Running more than 2 large agents at once slows them all down.|同时运行超过 2 个大型 Agent 会互相拖慢。") : "");
   patchBdg(hVd, v.cls, v.text); patchId(hId, cid, true, false);
   patchDetailBlock(hBlk, hero, false, true); patchHeroDock(heroSubs);
 };
@@ -749,7 +749,7 @@ const patchHandoffView = (): void => {
 };
 
 const render = (): void => {
-  const root = D.getElementById("root"); if (!root) return;
+  const root = D.getElementById("app"); if (!root) return;
   if (viewMode === HC) { ensureHandoffMount(root); return patchHandoffView(); }
 
   ensureDashboardMount(root);
@@ -981,7 +981,7 @@ const saveSettings = async (): Promise<void> => {
   } catch (e: unknown) { flashMicro((e as { message?: string } | null)?.message || L(35)); }
   finally { settingsSaving = false; settingsSig = ""; render(); }
 };
-const buildReminder = (it: SessionItem): string => `${L(28)} "${it.title}" ${fmtK(it[K_LCT])}/${fmtK(getLim(it))} (>${((num(it[K_RCT]) || 31e4) / 1e3) | 0}k); ${tr("Context nearly full — wrap up or run /compact.|上下文快满，请收尾或执行 /compact。")}`;
+const buildReminder = (it: SessionItem): string => `${L(28)} "${it.title}" ${fmtK(it[K_LCT])}/${fmtK(getLim(it))} (>${((num(it[K_RCT]) || 31e4) / 1e3) | 0}k); ${tr("Context nearly full — wrap up or run /compact.|上下文接近上限，请收尾或执行 /compact。")}`;
 const setFilterTab = (next: FilterTab, focus = false): void => { if (filterTab === next) return; filterTab = next; ++pollSeq; lastDigest = ""; render(); if (focus) D.querySelector<HTMLElement>(`[data-a="tab"][data-i="${next}"]`)?.focus(); void refreshSnapshot(true, false); };
 
 const ACT: Record<string, (id: string, ev: MouseEvent) => unknown> = {
@@ -1005,7 +1005,7 @@ onD("click", async (ev) => {
   if (/^[cr][01]$/.test(a)) { const isIn = a[1] === "0", isCmp = a[0] === "c", g = isIn ? handoffCard : pg(); return g && executeDispatch(g, isCmp ? "manual_compact" : "manual_handoff", isIn, isCmp); }
   const it = findSession(id); if (!it) return;
   if (a === "crm") void copyText(buildReminder(it), L(8));
-  else if (a === "csr") void copyText(`${L(it.is_side_question ? 30 : 29)} ${it.agent_name || it.title} (${id}) ${fmtK(it[K_LCT])}: ${tr("Context nearly full — start a new chat with handoff note.|上下文快满，请带接续说明开新会话。")}`, L(1));
+  else if (a === "csr") void copyText(`${L(it.is_side_question ? 30 : 29)} ${it.agent_name || it.title} (${id}) ${fmtK(it[K_LCT])}: ${tr("Context nearly full — start a new chat with handoff note.|上下文接近上限，请携带接续说明开启新会话。")}`, L(1));
   else if (a === "yes" && !it[K_IS]) {
     confirmSendId = null; const msg = buildReminder(it);
     if (canDirectMsg(it)) try { if (!(await sendTxt(msg))?.[K_ERR]) return flashMicro(tr("✓ Sent|✓ 已发送")); } catch {}
@@ -1024,8 +1024,13 @@ const forceNow = (): void => { const t = now(); if (t - lastForceTs < 250) retur
 const kickRelay = (): void => { if (viewMode === HC) { if (handoffCard && !handoffCard.blocked) maybeAutoRelay(handoffCard, true); } else if (pg()) maybeAutoRelay(pg(), false); };
 const syncNow = (): number | void => {
   if (D.hidden) { cancelPoll(); return 0; }
+  pollErrors = 0;
   kickRelay();
-  if (viewMode === DB && canCallTools) { forceNow(); if (autoRefresh && pollTimer === null && !inFlightPoll) scheduleNextPoll(); }
+  if (viewMode === DB && canCallTools) {
+    pollMs = nextPollMs();
+    forceNow();
+    if (autoRefresh && pollTimer === null && !inFlightPoll) scheduleNextPoll();
+  }
   render();
 };
 onD("visibilitychange", syncNow);
