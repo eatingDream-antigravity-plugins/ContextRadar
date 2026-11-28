@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
@@ -1127,22 +1128,27 @@ impl RateTable {
             .clone()
             .unwrap_or_else(|| cfg.pricing.external_fxrate_path.clone());
         if !fx_path.is_empty() {
-            if let Ok(meta) = fs::metadata(&fx_path) {
-                let sig = (
-                    (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128),
-                    meta.size(),
-                );
-                if self.ext_fx_path != fx_path || self.ext_fx_sig != Some(sig) {
-                    self.ext_fx_rate = fs::read_to_string(&fx_path)
+            if let Ok(meta) = fs::symlink_metadata(&fx_path) {
+                if !meta.file_type().is_symlink() && meta.file_type().is_file() {
+                    let sig = (
+                        (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128),
+                        meta.size(),
+                    );
+                    if self.ext_fx_path != fx_path || self.ext_fx_sig != Some(sig) {
+                        self.ext_fx_rate = crate::settings::read_regular_file_bounded(
+                            Path::new(&fx_path),
+                            crate::settings::MAX_CONFIG_BYTES,
+                        )
                         .ok()
                         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                         .and_then(|v| v.get("rate").and_then(Value::as_f64))
                         .filter(|&r| r > 0.01 && r < 1000.0);
-                    self.ext_fx_path = fx_path;
-                    self.ext_fx_sig = Some(sig);
-                }
-                if let Some(rate) = self.ext_fx_rate {
-                    return (rate, "external-fx".to_string());
+                        self.ext_fx_path = fx_path;
+                        self.ext_fx_sig = Some(sig);
+                    }
+                    if let Some(rate) = self.ext_fx_rate {
+                        return (rate, "external-fx".to_string());
+                    }
                 }
             }
         }
@@ -1163,9 +1169,12 @@ impl RateTable {
             self.ext_models_sig = None;
             return;
         }
-        let Ok(meta) = fs::metadata(&mpath) else {
+        let Ok(meta) = fs::symlink_metadata(&mpath) else {
             return;
         };
+        if meta.file_type().is_symlink() || !meta.file_type().is_file() {
+            return;
+        }
         let sig = (
             (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128),
             meta.size(),
@@ -1173,7 +1182,10 @@ impl RateTable {
         if self.ext_models_path == mpath && self.ext_models_sig == Some(sig) {
             return;
         }
-        let Ok(raw_text) = fs::read_to_string(&mpath) else {
+        let Ok(raw_text) = crate::settings::read_regular_file_bounded(
+            Path::new(&mpath),
+            crate::settings::MAX_CONFIG_BYTES,
+        ) else {
             return;
         };
         let Ok(Value::Object(root)) = serde_json::from_str::<Value>(&raw_text) else {

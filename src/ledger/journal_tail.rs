@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -11,6 +11,7 @@ use regex::Regex;
 use serde_json::Value;
 
 use crate::ledger::is_safe_id;
+use crate::settings::{read_line_bounded, BoundedLine, MAX_LINE_BYTES};
 
 const BACKWARD_CHUNK: usize = 256 * 1024;
 const MAX_CACHED_JOURNALS: usize = 32;
@@ -587,10 +588,15 @@ impl JournalTailCache {
         let mut raw_line = Vec::with_capacity(4096);
 
         loop {
-            raw_line.clear();
-            let n = match reader.read_until(b'\n', &mut raw_line) {
-                Ok(0) => break,
-                Ok(n) => n,
+            let n = match read_line_bounded(&mut reader, &mut raw_line, MAX_LINE_BYTES) {
+                Ok(BoundedLine::Eof) => break,
+                Ok(BoundedLine::Line(n)) => n,
+                Ok(BoundedLine::Oversized(total)) => {
+                    pos += total as u64;
+                    raw_line.clear();
+                    raw_line.shrink_to(4096);
+                    continue;
+                }
                 Err(_) => break,
             };
             let is_complete = raw_line.ends_with(b"\n");
@@ -682,10 +688,14 @@ impl JournalTailCache {
         let mut raw_line = Vec::with_capacity(8192);
 
         while !needed.is_empty() {
-            raw_line.clear();
-            let n = match reader.read_until(b'\n', &mut raw_line) {
-                Ok(0) => break,
-                Ok(n) => n,
+            let n = match read_line_bounded(&mut reader, &mut raw_line, MAX_LINE_BYTES) {
+                Ok(BoundedLine::Eof) => break,
+                Ok(BoundedLine::Line(n)) => n,
+                Ok(BoundedLine::Oversized(_)) => {
+                    raw_line.clear();
+                    raw_line.shrink_to(8192);
+                    continue;
+                }
                 Err(_) => break,
             };
             if n == 0 {
@@ -789,10 +799,20 @@ impl JournalTailCache {
         let mut raw_line = Vec::with_capacity(4096);
 
         loop {
-            raw_line.clear();
-            let n = match reader.read_until(b'\n', &mut raw_line) {
-                Ok(0) => break,
-                Ok(n) => n,
+            let n = match read_line_bounded(&mut reader, &mut raw_line, MAX_LINE_BYTES) {
+                Ok(BoundedLine::Eof) => break,
+                Ok(BoundedLine::Line(n)) => n,
+                Ok(BoundedLine::Oversized(total)) => {
+                    let stripped = trim_ascii(&raw_line);
+                    let head_len = stripped.len().min(512);
+                    if let Some((sidx, stype)) = fast_extract_step_type(&stripped[..head_len]) {
+                        map.insert(sidx, stype);
+                    }
+                    pos += total as u64;
+                    raw_line.clear();
+                    raw_line.shrink_to(4096);
+                    continue;
+                }
                 Err(_) => break,
             };
             let is_complete = raw_line.ends_with(b"\n");
@@ -846,5 +866,48 @@ impl JournalTailCache {
         Self::touch_order(&mut self.step_types_order, &tpath);
         self.evict_step_types();
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn journal_tail_skips_oversized_jsonl_line_without_oom() {
+        let td = tempfile::tempdir().unwrap();
+        let cid = "70000000-0000-0000-0000-000000000777";
+        let tpath = transcript_path(td.path(), cid);
+        fs::create_dir_all(tpath.parent().unwrap()).unwrap();
+        {
+            let mut f = File::create(&tpath).unwrap();
+            writeln!(
+                f,
+                "{{\"step_index\":1,\"type\":\"USER_INPUT\",\"user_request\":\"before\"}}"
+            )
+            .unwrap();
+            f.write_all(b"{\"step_index\":2,\"type\":\"TOOL_OUTPUT\",\"payload\":\"")
+                .unwrap();
+            let chunk = vec![b'a'; 1024 * 1024];
+            for _ in 0..17 {
+                f.write_all(&chunk).unwrap();
+            }
+            f.write_all(b"\"}\n").unwrap();
+            writeln!(
+                f,
+                "{{\"step_index\":3,\"type\":\"PLANNER_RESPONSE\",\"response\":\"after\"}}"
+            )
+            .unwrap();
+        }
+        let mut cache = JournalTailCache::new(16);
+        let entries = cache.get_active_window(td.path(), cid);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].step_index, 1);
+        assert_eq!(entries[1].step_index, 3);
+        let stypes = cache.get_step_types(td.path(), cid);
+        assert_eq!(stypes.get(&1).map(String::as_str), Some("USER_INPUT"));
+        assert_eq!(stypes.get(&2).map(String::as_str), Some("TOOL_OUTPUT"));
+        assert_eq!(stypes.get(&3).map(String::as_str), Some("PLANNER_RESPONSE"));
     }
 }

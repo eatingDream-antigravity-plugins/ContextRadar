@@ -77,22 +77,39 @@ detect_target() {
   esac
 }
 
+is_ascii_single_line() {
+  [ -n "$1" ] && [ "$(printf '%s' "$1" | LC_ALL=C tr -d '\041-\176' | wc -c | tr -d ' ')" -eq 0 ]
+}
+
+validate_semver_tag() {
+  tag_val="$1"
+  is_ascii_single_line "$tag_val" || die "invalid release tag: ${tag_val}"
+  case "$tag_val" in
+    *..*)
+      die "invalid release tag: ${tag_val}"
+      ;;
+  esac
+  if ! printf '%s\n' "$tag_val" | LC_ALL=C grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$'; then
+    die "invalid release tag (expected vX.Y.Z): ${tag_val}"
+  fi
+}
+
 resolve_tag() {
   if [ -n "${CONTEXT_RADAR_VERSION:-}" ]; then
     case "$CONTEXT_RADAR_VERSION" in
-      v*) printf '%s\n' "$CONTEXT_RADAR_VERSION" ;;
-      *)  printf 'v%s\n' "$CONTEXT_RADAR_VERSION" ;;
+      v*) tag="$CONTEXT_RADAR_VERSION" ;;
+      *)  tag="v${CONTEXT_RADAR_VERSION}" ;;
     esac
+    validate_semver_tag "$tag"
+    printf '%s\n' "$tag"
     return
   fi
 
   effective_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest") \
     || die "failed to query latest release from https://github.com/${REPO}/releases/latest"
   tag=$(printf '%s' "$effective_url" | sed 's#.*/tag/##')
-  case "$tag" in
-    v*) printf '%s\n' "$tag" ;;
-    *)  die "could not resolve release tag from URL: $effective_url (set CONTEXT_RADAR_VERSION explicitly)" ;;
-  esac
+  validate_semver_tag "$tag"
+  printf '%s\n' "$tag"
 }
 
 verify_sha256() {
@@ -128,18 +145,46 @@ uninstall_plugin() {
   fi
 }
 
+validate_ls_addr() {
+  addr="$1"
+  is_ascii_single_line "$addr" || return 1
+  printf '%s\n' "$addr" | LC_ALL=C grep -Eq '^(localhost|127\.0\.0\.1|\[::1\]):[0-9]{1,5}$' || return 1
+  port="${addr##*:}"
+  [ "$port" -ge 1 ] && [ "$port" -le 65535 ] 2>/dev/null
+}
+
+install_file() {
+  src="$1"
+  dst="$2"
+  mode="$3"
+  [ -f "$src" ] && [ ! -L "$src" ] || die "staged asset missing or symlink: $src"
+  [ ! -L "$dst" ] || die "refusing to overwrite symlink destination: $dst"
+  tmp_dst="${dst}.new.$$"
+  rm -f "$tmp_dst"
+  cp "$src" "$tmp_dst"
+  chmod "$mode" "$tmp_dst"
+  mv -f "$tmp_dst" "$dst"
+}
+
 refresh_mcp_host() {
   if [ "$NO_RELOAD" -eq 1 ]; then
     return 0
   fi
   if [ -n "${ANTIGRAVITY_CSRF_TOKEN:-}" ]; then
     ls_addr="${ANTIGRAVITY_LS_ADDRESS:-localhost:5387}"
-    if curl -sf -H "Content-Type: application/json" \
-      -H "x-codeium-csrf-token: ${ANTIGRAVITY_CSRF_TOKEN}" \
-      -d "{\"serverName\":\"${MCP_SERVER_ID}\"}" \
-      "http://${ls_addr}/exa.language_server_pb.LanguageServerService/RefreshMcpServers" >/dev/null 2>&1; then
-      printf 'Reloaded MCP server %s in Antigravity (reopen any open Context Radar panel tab to see UI updates).\n' "$MCP_SERVER_ID"
-      return 0
+    if validate_ls_addr "$ls_addr"; then
+      if [ "$(printf '%s' "$ANTIGRAVITY_CSRF_TOKEN" | LC_ALL=C tr -d '\040-\176' | wc -c | tr -d ' ')" -eq 0 ]; then
+        esc_token=$(printf '%s' "$ANTIGRAVITY_CSRF_TOKEN" | sed 's/\\/\\\\/g; s/"/\\"/g')
+        if printf 'header = "Content-Type: application/json"\nheader = "x-codeium-csrf-token: %s"\n' "$esc_token" | \
+          curl -sfg --connect-timeout 2 --max-time 5 -K - \
+            -d "{\"serverName\":\"${MCP_SERVER_ID}\"}" \
+            "http://${ls_addr}/exa.language_server_pb.LanguageServerService/RefreshMcpServers" >/dev/null 2>&1; then
+          printf 'Reloaded MCP server %s in Antigravity (reopen any open Context Radar panel tab to see UI updates).\n' "$MCP_SERVER_ID"
+          return 0
+        fi
+      fi
+    else
+      printf 'warning: ignoring invalid ANTIGRAVITY_LS_ADDRESS (expected loopback host:port)\n' >&2
     fi
   fi
   if [ "$FORCE_RELOAD" -eq 1 ] && command -v agy >/dev/null 2>&1; then
@@ -182,26 +227,29 @@ main() {
   mkdir -p "$stage_dir"
   tar -xzf "${tmp_dir}/${archive}" -C "$stage_dir"
 
-  [ -f "${stage_dir}/bin/${PLUGIN_NAME}" ] || die "archive missing bin/${PLUGIN_NAME}"
-  [ -f "${stage_dir}/plugin.json" ] || die "archive missing plugin.json"
+  [ -f "${stage_dir}/bin/${PLUGIN_NAME}" ] && [ ! -L "${stage_dir}/bin/${PLUGIN_NAME}" ] || die "archive missing bin/${PLUGIN_NAME}"
+  [ -f "${stage_dir}/plugin.json" ] && [ ! -L "${stage_dir}/plugin.json" ] || die "archive missing plugin.json"
+
+  [ ! -L "$PLUGINS_DIR" ] || die "refusing symlink plugins directory: ${PLUGINS_DIR}"
+  [ ! -L "$INSTALL_DIR" ] || die "refusing symlink install directory: ${INSTALL_DIR}"
 
   mkdir -p "${INSTALL_DIR}/bin" "${INSTALL_DIR}/panel/dist" "${INSTALL_DIR}/rules" "${INSTALL_DIR}/skills/context-radar" "${INSTALL_DIR}/assets" "${INSTALL_DIR}/docs"
+  for d in bin panel panel/dist rules skills skills/context-radar assets docs; do
+    [ ! -L "${INSTALL_DIR}/${d}" ] || die "refusing symlink directory: ${INSTALL_DIR}/${d}"
+  done
 
-  # Atomic binary swap so an active daemon binary is never overwritten in place
-  cp "${stage_dir}/bin/${PLUGIN_NAME}" "${INSTALL_DIR}/bin/${PLUGIN_NAME}.new"
-  chmod 0755 "${INSTALL_DIR}/bin/${PLUGIN_NAME}.new"
-  mv -f "${INSTALL_DIR}/bin/${PLUGIN_NAME}.new" "${INSTALL_DIR}/bin/${PLUGIN_NAME}"
-
-  cp "${stage_dir}/panel/dist/panel.html" "${INSTALL_DIR}/panel/dist/panel.html"
-  cp "${stage_dir}/rules/AGENTS.md" "${INSTALL_DIR}/rules/AGENTS.md"
-  cp "${stage_dir}/skills/context-radar/SKILL.md" "${INSTALL_DIR}/skills/context-radar/SKILL.md"
-  cp "${stage_dir}/assets/logo.svg" "${INSTALL_DIR}/assets/logo.svg"
+  # Atomic binary & asset swaps so active files or symlinks are never overwritten in place
+  install_file "${stage_dir}/bin/${PLUGIN_NAME}" "${INSTALL_DIR}/bin/${PLUGIN_NAME}" 0755
+  install_file "${stage_dir}/panel/dist/panel.html" "${INSTALL_DIR}/panel/dist/panel.html" 0644
+  install_file "${stage_dir}/rules/AGENTS.md" "${INSTALL_DIR}/rules/AGENTS.md" 0644
+  install_file "${stage_dir}/skills/context-radar/SKILL.md" "${INSTALL_DIR}/skills/context-radar/SKILL.md" 0644
+  install_file "${stage_dir}/assets/logo.svg" "${INSTALL_DIR}/assets/logo.svg" 0644
   if [ -f "${stage_dir}/docs/ai-guide.md" ]; then
-    cp "${stage_dir}/docs/ai-guide.md" "${INSTALL_DIR}/docs/ai-guide.md"
+    install_file "${stage_dir}/docs/ai-guide.md" "${INSTALL_DIR}/docs/ai-guide.md" 0644
   fi
   for f in plugin.json mcp_config.json hooks.json LICENSE README.md llms.txt settings.example.json settings.schema.json; do
     if [ -f "${stage_dir}/${f}" ]; then
-      cp "${stage_dir}/${f}" "${INSTALL_DIR}/${f}"
+      install_file "${stage_dir}/${f}" "${INSTALL_DIR}/${f}" 0644
     fi
   done
 

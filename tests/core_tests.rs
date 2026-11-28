@@ -3578,3 +3578,180 @@ fn test_crit_line_matches_urgent_ctx_and_respects_explicit_override() {
     assert!(gate.urgent_bypass);
     assert_eq!(gate.profile.urgent_ctx, 380_000);
 }
+
+#[test]
+fn test_security_scratch_note_confinement_and_rpc_input_bounds() {
+    use context_radar_mcp::engine::grants::{
+        sanitize_scratch_note_path, sanitize_scratch_note_path_in_root_for_lang,
+    };
+
+    // 1) Pure/default scratch_note_path rejects arbitrary filesystem paths & tilde
+    for bad in [
+        "/etc/hosts",
+        "~/.ssh/config",
+        "~",
+        "/tmp/outside.md",
+        "etc/hosts",
+        "foo/bar.md",
+        "scratch",
+        "scratch\\slice.md",
+    ] {
+        assert!(
+            sanitize_scratch_note_path(bad).is_err(),
+            "expected rejected scratch_note_path: {bad}"
+        );
+    }
+    assert_eq!(
+        sanitize_scratch_note_path("scratch/slice_1_5.md").unwrap(),
+        "scratch/slice_1_5.md"
+    );
+
+    // 2) Root-confined scratch_note_path enforces <data_root>/brain/<cid>/scratch/
+    let root = TempDir::new().unwrap();
+    let other_root = TempDir::new().unwrap();
+    let cid = "70000000-0000-0000-0000-000000000099";
+    let scratch_dir = root.path().join("brain").join(cid).join("scratch");
+    fs::create_dir_all(&scratch_dir).unwrap();
+    let valid_note = scratch_dir.join("slice_1_8.md");
+    fs::write(&valid_note, "notes").unwrap();
+    assert_eq!(
+        sanitize_scratch_note_path_in_root_for_lang(
+            valid_note.to_str().unwrap(),
+            root.path(),
+            Some(cid),
+            Lang::En,
+        )
+        .unwrap(),
+        valid_note.to_string_lossy()
+    );
+
+    // Wrong cid or wrong data_root or symlink inside scratch/ is rejected
+    let other_cid_note = root
+        .path()
+        .join("brain")
+        .join("other-cid")
+        .join("scratch")
+        .join("slice_1_2.md");
+    assert!(sanitize_scratch_note_path_in_root_for_lang(
+        other_cid_note.to_str().unwrap(),
+        root.path(),
+        Some(cid),
+        Lang::En,
+    )
+    .is_err());
+
+    let wrong_root_note = other_root
+        .path()
+        .join("brain")
+        .join(cid)
+        .join("scratch")
+        .join("slice_1_2.md");
+    assert!(sanitize_scratch_note_path_in_root_for_lang(
+        wrong_root_note.to_str().unwrap(),
+        root.path(),
+        Some(cid),
+        Lang::En,
+    )
+    .is_err());
+
+    let outside_secret = other_root.path().join("secret.md");
+    fs::write(&outside_secret, "SECRET").unwrap();
+    let sym_note = scratch_dir.join("sym.md");
+    std::os::unix::fs::symlink(&outside_secret, &sym_note).unwrap();
+    assert!(sanitize_scratch_note_path_in_root_for_lang(
+        sym_note.to_str().unwrap(),
+        root.path(),
+        Some(cid),
+        Lang::En,
+    )
+    .is_err());
+
+    // 3) RPC input validation on set_prefs, record_relay, record_compact, and radar_commit_handoff
+    let cfg_path = root.path().join("settings.json");
+    fs::write(&cfg_path, "{}").unwrap();
+    let engine = TelemetryEngine::new(
+        Some(root.path().to_path_buf()),
+        Some(RateTable::new(
+            SettingsWatcher::new(Some(cfg_path.to_string_lossy().into_owned())),
+            None,
+            None,
+        )),
+        Some(None),
+    );
+    let grants = RelayGrantStore::new(root.path().join("plugin/relay_grants.json"));
+    let mut daemon = McpDaemon::new(Some(engine), Some(grants), None);
+    let _ = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": { "extensions": {
+                    "io.modelcontextprotocol/ui": { "mimeTypes": ["text/html;profile=mcp-app"] }
+                } }
+            }
+        }))
+        .unwrap();
+
+    let bad_lang = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "lang": "fr-FR" } }
+        }))
+        .unwrap();
+    assert_eq!(bad_lang["result"]["isError"], json!(true));
+
+    let bad_cc = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": { "name": "context_radar_ui_action", "arguments": { "action": "set_prefs", "currency_code": "DOGE" } }
+        }))
+        .unwrap();
+    assert_eq!(bad_cc["result"]["isError"], json!(true));
+
+    let g = daemon
+        .grants
+        .create_grant("Keep", "Next", true, cid, 0, 0, "handoff", "", "")
+        .unwrap();
+    let bad_relay = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "context_radar_ui_action", "arguments": { "action": "record_relay", "grant_id": g.grant_id, "handoff_conversation_id": "../evil" } }
+        }))
+        .unwrap();
+    assert_eq!(bad_relay["result"]["isError"], json!(true));
+    assert_eq!(
+        bad_relay["result"]["structuredContent"]["reason"],
+        json!("invalid_conversation_id")
+    );
+
+    let bad_status = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+            "params": { "name": "context_radar_ui_action", "arguments": { "action": "record_compact", "grant_id": g.grant_id, "status": "evil_arbitrary_status" } }
+        }))
+        .unwrap();
+    assert_eq!(bad_status["result"]["isError"], json!(true));
+    assert_eq!(
+        bad_status["result"]["structuredContent"]["reason"],
+        json!("invalid_status")
+    );
+
+    let big_preserve = "x".repeat(9000);
+    let too_big = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 5, "method": "tools/call",
+            "params": { "name": "radar_commit_handoff", "arguments": { "preserve_points": big_preserve } }
+        }))
+        .unwrap();
+    assert_eq!(too_big["result"]["isError"], json!(true));
+
+    let bad_scratch = daemon
+        .handle_request(&json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": { "name": "radar_commit_handoff", "arguments": { "preserve_points": "Keep", "scratch_note_path": "/etc/hosts" } }
+        }))
+        .unwrap();
+    assert_eq!(bad_scratch["result"]["isError"], json!(true));
+
+    daemon.close();
+}

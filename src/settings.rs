@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -43,6 +43,149 @@ pub(crate) const UNIX_O_NOFOLLOW: i32 = 0o100000;
     not(any(target_arch = "aarch64", target_arch = "arm"))
 ))]
 pub(crate) const UNIX_O_NOFOLLOW: i32 = 0o400000;
+
+#[cfg(all(
+    unix,
+    any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )
+))]
+pub(crate) const UNIX_O_NONBLOCK: i32 = 0x0004;
+#[cfg(target_os = "linux")]
+pub(crate) const UNIX_O_NONBLOCK: i32 = 0o4000;
+
+pub(crate) const MAX_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+#[cfg(unix)]
+pub(crate) fn current_euid() -> u32 {
+    extern "C" {
+        fn geteuid() -> u32;
+    }
+    unsafe { geteuid() }
+}
+
+pub(crate) fn is_safe_id(cid: &str) -> bool {
+    let b = cid.as_bytes();
+    if b.is_empty() || b.len() > 128 {
+        return false;
+    }
+    if b[0] == b'.' || cid.contains("..") {
+        return false;
+    }
+    b.iter()
+        .all(|&c| c.is_ascii_alphanumeric() || c == b'.' || c == b'_' || c == b'-')
+}
+
+/// Read a regular non-symlink file with `O_NOFOLLOW | O_NONBLOCK` and an upper byte bound.
+pub(crate) fn read_regular_file_bounded(path: &Path, max_bytes: usize) -> io::Result<String> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(UNIX_O_NOFOLLOW | UNIX_O_NONBLOCK);
+    let file = opts.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "path is not a regular file",
+        ));
+    }
+    if meta.len() > max_bytes as u64 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds maximum allowed size",
+        ));
+    }
+    let mut text = String::new();
+    file.take((max_bytes + 1) as u64)
+        .read_to_string(&mut text)?;
+    if text.len() > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds maximum allowed size",
+        ));
+    }
+    Ok(text)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BoundedLine {
+    Eof,
+    Line(usize),
+    Oversized(usize),
+}
+
+/// Read one `\n`-terminated line up to `max_bytes`. If a line exceeds `max_bytes`, drains the
+/// remainder up to the next `\n` (or EOF) without buffering it in memory.
+pub(crate) fn read_line_bounded<R: BufRead>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<BoundedLine> {
+    buf.clear();
+    let n = reader
+        .by_ref()
+        .take((max_bytes + 1) as u64)
+        .read_until(b'\n', buf)?;
+    if n == 0 {
+        return Ok(BoundedLine::Eof);
+    }
+    if n <= max_bytes {
+        return Ok(BoundedLine::Line(n));
+    }
+    let mut total = n;
+    if !buf.ends_with(b"\n") {
+        loop {
+            let chunk = reader.fill_buf()?;
+            if chunk.is_empty() {
+                break;
+            }
+            if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+                let consume = pos + 1;
+                total = total.saturating_add(consume);
+                reader.consume(consume);
+                break;
+            }
+            let len = chunk.len();
+            total = total.saturating_add(len);
+            reader.consume(len);
+        }
+    }
+    Ok(BoundedLine::Oversized(total))
+}
+
+pub(crate) fn validate_pref_lang(raw: &str) -> Result<Option<&'static str>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    if trimmed.eq_ignore_ascii_case("en") {
+        return Ok(Some("en"));
+    }
+    if trimmed.eq_ignore_ascii_case("zh-cn") {
+        return Ok(Some("zh-CN"));
+    }
+    Err("invalid lang preference; expected auto, en, or zh-CN".to_string())
+}
+
+pub(crate) fn validate_pref_currency(raw: &str) -> Result<Option<&'static str>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    if trimmed.eq_ignore_ascii_case("USD") {
+        return Ok(Some("USD"));
+    }
+    if trimmed.eq_ignore_ascii_case("CNY") {
+        return Ok(Some("CNY"));
+    }
+    Err("invalid currency_code; expected auto, USD, or CNY".to_string())
+}
 
 pub const DEFAULT_CONTEXT_LIMIT: u64 = 512_000;
 pub const DEFAULT_WARN_THRESHOLD: u64 = 300_000;
@@ -851,7 +994,7 @@ pub fn load_settings_once(explicit: Option<&str>) -> Settings {
     let Some(path) = resolve_settings_path(explicit) else {
         return Settings::default();
     };
-    let Ok(raw_text) = fs::read_to_string(&path) else {
+    let Ok(raw_text) = read_regular_file_bounded(&path, MAX_CONFIG_BYTES) else {
         return Settings::default();
     };
     let Ok(raw_val) = serde_json::from_str::<Value>(&raw_text) else {
@@ -935,7 +1078,8 @@ pub fn update_settings_file_atomic(target: &Path, patch: &SettingsPatch) -> Resu
     }
     let _lock = SettingsFileLock::acquire(target).map_err(|e| format!("lock failed: {e}"))?;
 
-    let mut root_obj: Map<String, Value> = match fs::read_to_string(target) {
+    let mut root_obj: Map<String, Value> = match read_regular_file_bounded(target, MAX_CONFIG_BYTES)
+    {
         Ok(raw) if !raw.trim().is_empty() => match serde_json::from_str::<Value>(&raw) {
             Ok(Value::Object(m)) => m,
             _ => return Err("invalid_json".into()),
@@ -946,11 +1090,13 @@ pub fn update_settings_file_atomic(target: &Path, patch: &SettingsPatch) -> Resu
     };
 
     if let Some(ref raw_lang) = patch.lang {
-        let trimmed = raw_lang.trim();
-        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
-            root_obj.remove("lang");
-        } else {
-            root_obj.insert("lang".into(), Value::String(trimmed.to_string()));
+        match validate_pref_lang(raw_lang)? {
+            None => {
+                root_obj.remove("lang");
+            }
+            Some(norm) => {
+                root_obj.insert("lang".into(), Value::String(norm.to_string()));
+            }
         }
     }
 
@@ -963,14 +1109,16 @@ pub fn update_settings_file_atomic(target: &Path, patch: &SettingsPatch) -> Resu
         }
         let pobj = pricing.as_object_mut().unwrap();
         if let Some(ref raw_cc) = patch.currency_code {
-            let up = raw_cc.trim().to_ascii_uppercase();
-            if up.is_empty() || up == "AUTO" {
-                pobj.remove("currency_code");
-                pobj.remove("currency_symbol");
-            } else {
-                let sym = crate::i18n::infer_currency_symbol(&up);
-                pobj.insert("currency_code".into(), Value::String(up));
-                pobj.insert("currency_symbol".into(), Value::String(sym.to_string()));
+            match validate_pref_currency(raw_cc)? {
+                None => {
+                    pobj.remove("currency_code");
+                    pobj.remove("currency_symbol");
+                }
+                Some(up) => {
+                    let sym = crate::i18n::infer_currency_symbol(up);
+                    pobj.insert("currency_code".into(), Value::String(up.to_string()));
+                    pobj.insert("currency_symbol".into(), Value::String(sym.to_string()));
+                }
             }
         }
         if let Some(fx) = patch.fx_rate {
@@ -1099,10 +1247,25 @@ impl SettingsWatcher {
             return Arc::clone(&self.cached);
         };
 
-        let sig = match fs::metadata(&path) {
-            Ok(meta) => {
+        let sig = match fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.file_type().is_symlink() && meta.file_type().is_file() => {
                 let mtime_ns = (meta.mtime() as i128) * 1_000_000_000 + (meta.mtime_nsec() as i128);
                 (mtime_ns, meta.size(), meta.ino())
+            }
+            Ok(_) => {
+                let mut kept = if self.last_sig.is_some() && self.last_path.as_ref() == Some(&path)
+                {
+                    (*self.cached).clone()
+                } else {
+                    Settings::default()
+                };
+                self.generation += 1;
+                self.last_path = Some(path.clone());
+                kept.generation = self.generation;
+                kept.source_path = path.to_string_lossy().into_owned();
+                kept.settings_error = Some("read_error".to_string());
+                self.cached = Arc::new(kept);
+                return Arc::clone(&self.cached);
             }
             Err(_) => {
                 if self.last_path.as_ref() != Some(&path) || self.last_sig.is_some() {
@@ -1129,7 +1292,7 @@ impl SettingsWatcher {
         self.last_path = Some(path.clone());
         self.last_sig = Some(sig);
 
-        let parsed = match fs::read_to_string(&path) {
+        let parsed = match read_regular_file_bounded(&path, MAX_CONFIG_BYTES) {
             Ok(txt) => match serde_json::from_str::<Value>(&txt) {
                 Ok(val) if val.is_object() => {
                     parse_settings_value(&val, &path.to_string_lossy(), self.generation)
@@ -1161,5 +1324,51 @@ impl SettingsWatcher {
         };
         self.cached = Arc::new(parsed);
         Arc::clone(&self.cached)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::BufReader;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn read_line_bounded_drains_oversized_without_oom_and_recovers() {
+        let big = format!("{}\n{{\"ok\":true}}\n", "x".repeat(256));
+        let mut reader = BufReader::new(big.as_bytes());
+        let mut buf = Vec::new();
+        match read_line_bounded(&mut reader, &mut buf, 64).unwrap() {
+            BoundedLine::Oversized(n) => assert_eq!(n, 257),
+            other => panic!("expected Oversized, got {other:?}"),
+        }
+        assert!(buf.len() <= 65);
+        match read_line_bounded(&mut reader, &mut buf, 64).unwrap() {
+            BoundedLine::Line(n) => {
+                assert_eq!(n, 12);
+                assert_eq!(&buf, b"{\"ok\":true}\n");
+            }
+            other => panic!("expected Line, got {other:?}"),
+        }
+        assert_eq!(
+            read_line_bounded(&mut reader, &mut buf, 64).unwrap(),
+            BoundedLine::Eof
+        );
+    }
+
+    #[test]
+    fn read_regular_file_bounded_rejects_symlinks_and_oversized() {
+        let td = tempfile::tempdir().unwrap();
+        let real = td.path().join("real.json");
+        fs::write(&real, "{\"a\":1}").unwrap();
+        assert_eq!(read_regular_file_bounded(&real, 64).unwrap(), "{\"a\":1}");
+
+        let link = td.path().join("link.json");
+        symlink(&real, &link).unwrap();
+        assert!(read_regular_file_bounded(&link, 64).is_err());
+
+        let big = td.path().join("big.json");
+        fs::write(&big, "x".repeat(128)).unwrap();
+        assert!(read_regular_file_bounded(&big, 64).is_err());
     }
 }
