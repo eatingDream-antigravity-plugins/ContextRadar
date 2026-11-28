@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.6.3](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.6.2...v1.6.3) (2026-11-28)
+
+
+### Performance Improvements
+
+* add 0ms localStorage SWR hydration, bootTs coalescing, and RTT-adaptive polling ([#44](https://github.com/eatingDream-antigravity-plugins/context-radar/issues/44)) ([6baf560](https://github.com/eatingDream-antigravity-plugins/context-radar/commit/6baf560726a406e590152261ee4fcf4a327d41ac))
+
 ## [1.6.2](https://github.com/eatingDream-antigravity-plugins/context-radar/compare/v1.6.1...v1.6.2) (2026-11-28)
 
 
